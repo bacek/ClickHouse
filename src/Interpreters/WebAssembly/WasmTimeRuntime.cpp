@@ -19,6 +19,8 @@
 #include <Interpreters/WebAssembly/WasmTypes.h>
 
 #include <wasmtime.hh>
+#include <wasmtime/wasi.hh>
+
 
 namespace ProfileEvents
 {
@@ -386,6 +388,9 @@ public:
     std::unique_ptr<WasmCompartment> instantiate(Config cfg) const override
     {
         wasmtime::Store store(engine);
+        wasmtime::WasiConfig wasi;
+        store.context().set_wasi(std::move(wasi)).unwrap();
+
         if (cfg.memory_limit)
             store.limiter(cfg.memory_limit, -1, -1, -1, -1);
 
@@ -396,6 +401,8 @@ public:
         }
 
         wasmtime::Linker linker(engine);
+        linker.define_wasi().unwrap();
+
         for (const auto & host_function : host_functions)
         {
             const auto & func_decl = host_function.getFunctionDeclaration();
