@@ -28,6 +28,22 @@ void wasmExportLog(WasmCompartment * compartment, WasmPtr wasm_ptr, WasmSizeT si
     LOG_TRACE(getLogger("WasmUdf"), "{}", std::string_view(reinterpret_cast<const char *>(data.data()), data.size()));
 }
 
+void wasmExportLog2(WasmCompartment * compartment, UInt32 level, WasmPtr wasm_ptr, WasmSizeT size)
+{
+    const auto * host_ptr = compartment->getMemory(wasm_ptr, size);
+    std::string_view message(reinterpret_cast<const char *>(host_ptr), size);
+
+    /// Map level to Poco::Message::Priority.
+    /// Poco priorities are 1 (FATAL) .. 8 (TRACE), matching the guest-visible contract.
+    /// Values outside this range are clamped to TRACE.
+    auto prio = (level >= Poco::Message::PRIO_FATAL && level <= static_cast<UInt32>(Poco::Message::PRIO_TRACE))
+        ? static_cast<Poco::Message::Priority>(level)
+        : Poco::Message::PRIO_TRACE;
+
+    auto logger = getLogger("WasmUdf");
+    logger->log(Poco::Message(logger->name(), std::string(message), prio));
+}
+
 Int64 wasmExportServerVer(WasmCompartment *)
 {
     return static_cast<UInt64>(VERSION_INTEGER);
@@ -123,6 +139,7 @@ WasmHostFunction getHostFunction(std::string_view function_name)
         makeHostFunction("clickhouse_server_version", wasmExportServerVer),
         makeHostFunction("clickhouse_throw", wasmExportThrow),
         makeHostFunction("clickhouse_log", wasmExportLog),
+        makeHostFunction("clickhouse_log2", wasmExportLog2),
         makeHostFunction("clickhouse_random", wasmExportRandom),
     };
 
