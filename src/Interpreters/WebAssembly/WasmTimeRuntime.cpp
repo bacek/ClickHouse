@@ -135,6 +135,7 @@ struct WasmTimeRuntime::Impl
         config.consume_fuel(true);
         config.epoch_interruption(true);
         config.signals_based_traps(false);
+        config.wasm_exceptions(true);
         return config;
     }
 
