@@ -37,7 +37,6 @@
 #include <fmt/ranges.h>
 #include <Poco/String.h>
 #include <Common/transformEndianness.h>
-#include <Columns/ColumnString.h>
 #include <base/extended_types.h>
 #include <base/arithmeticOverflow.h>
 
@@ -330,16 +329,6 @@ public:
         {
             ProfileEventTimeIncrement<Microseconds> timer_serialize(ProfileEvents::WasmSerializationMicroseconds);
             StringWithMemoryTracking input_data;
-
-            std::vector<const ColumnString *> string_columns;
-            for (const auto & col : block)
-            {
-                const auto * string_col = checkAndGetColumn<ColumnString>(col.column.get());
-                if (string_col && col.type->equals(DataTypeString()))
-                    string_columns.push_back(string_col);
-                else
-                    string_columns.clear();
-            }
 
             {
                 WriteBufferFromStringWithMemoryTracking buf(input_data);

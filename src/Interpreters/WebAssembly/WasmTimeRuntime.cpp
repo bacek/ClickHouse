@@ -180,7 +180,7 @@ public:
     std::span<uint8_t> getMemory(WasmPtr ptr, WasmSizeT size) override
     {
         auto memory_span = getMemory().data(store);
-        if (ptr + size >= memory_span.size())
+        if (size > memory_span.size() || ptr > memory_span.size() - size)
         {
             throw Exception(
                 ErrorCodes::WASM_ERROR,
