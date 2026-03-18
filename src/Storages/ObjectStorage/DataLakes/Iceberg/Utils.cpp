@@ -409,7 +409,8 @@ Poco::JSON::Object::Ptr getMetadataJSONObject(
     const ContextPtr & local_context,
     LoggerPtr log,
     CompressionMethod compression_method,
-    const std::optional<String> & table_uuid)
+    const std::optional<String> & table_uuid,
+    String & raw_json_out)
 {
     auto create_fn = [&]()
     {
@@ -440,9 +441,24 @@ Poco::JSON::Object::Ptr getMetadataJSONObject(
     else
         metadata_json_str = create_fn();
 
+    raw_json_out = metadata_json_str;
+
     Poco::JSON::Parser parser; /// For some reason base/base/JSON.h can not parse this json file
     Poco::Dynamic::Var json = parser.parse(metadata_json_str);
     return json.extract<Poco::JSON::Object::Ptr>();
+}
+
+Poco::JSON::Object::Ptr getMetadataJSONObject(
+    const String & metadata_file_path,
+    ObjectStoragePtr object_storage,
+    IcebergMetadataFilesCachePtr metadata_cache,
+    const ContextPtr & local_context,
+    LoggerPtr log,
+    CompressionMethod compression_method,
+    const std::optional<String> & table_uuid)
+{
+    String raw_json;
+    return getMetadataJSONObject(metadata_file_path, object_storage, metadata_cache, local_context, log, compression_method, table_uuid, raw_json);
 }
 
 /// Returns type and required
