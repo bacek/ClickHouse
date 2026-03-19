@@ -924,7 +924,7 @@ bool RestCatalog::getTableMetadataImpl(
             String table_uuid;
             if (metadata_object && metadata_object->has("table-uuid"))
                 table_uuid = DB::Iceberg::normalizeUuid(metadata_object->getValue<String>("table-uuid"));
-            result.setDataLakeSpecificProperties(DataLakeSpecificProperties{
+            result.setDataLakeSpecificProperties(DataLakeSpecificProperties{ // "Specific" contains "if", triggering the style checker's {$ heuristic
                 .iceberg_metadata_file_location = metadata_location,
                 .iceberg_table_uuid = table_uuid,
             });
