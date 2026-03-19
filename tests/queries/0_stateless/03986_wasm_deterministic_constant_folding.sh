@@ -7,7 +7,7 @@ CUR_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=../shell_config.sh
 . "$CUR_DIR"/../shell_config.sh
 
-${CLICKHOUSE_CLIENT} --enable_analyzer=1 << << 'EOF'
+${CLICKHOUSE_CLIENT} --enable_analyzer=1 << 'EOF'
 DROP FUNCTION IF EXISTS identity_det;
 DROP FUNCTION IF EXISTS identity_nondet;
 DELETE FROM system.webassembly_modules WHERE name = 'identity_cf_test';
