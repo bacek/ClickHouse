@@ -85,13 +85,15 @@ UserDefinedWebAssemblyFunction::UserDefinedWebAssemblyFunction(
     const Strings & argument_names_,
     const DataTypes & arguments_,
     const DataTypePtr & result_type_,
-    WebAssemblyFunctionSettings function_settings_)
+    WebAssemblyFunctionSettings function_settings_,
+    bool is_deterministic_)
     : function_name(function_name_)
     , argument_names(argument_names_)
     , arguments(arguments_)
     , result_type(result_type_)
     , wasm_module(wasm_module_)
     , settings(std::move(function_settings_))
+    , is_deterministic(is_deterministic_)
 {
 }
 
@@ -424,16 +426,17 @@ std::unique_ptr<UserDefinedWebAssemblyFunction> UserDefinedWebAssemblyFunction::
     const DataTypes & arguments_,
     const DataTypePtr & result_type_,
     WasmAbiVersion abi_type,
-    WebAssemblyFunctionSettings function_settings)
+    WebAssemblyFunctionSettings function_settings,
+    bool is_deterministic_)
 {
     switch (abi_type)
     {
         case WasmAbiVersion::RowDirect:
             return std::make_unique<UserDefinedWebAssemblyFunctionSimple>(
-                wasm_module_, function_name_, argument_names_, arguments_, result_type_, std::move(function_settings));
+                wasm_module_, function_name_, argument_names_, arguments_, result_type_, std::move(function_settings), is_deterministic_);
         case WasmAbiVersion::BufferedV1:
             return std::make_unique<UserDefinedWebAssemblyFunctionBufferedV1>(
-                wasm_module_, function_name_, argument_names_, arguments_, result_type_, std::move(function_settings));
+                wasm_module_, function_name_, argument_names_, arguments_, result_type_, std::move(function_settings), is_deterministic_);
     }
     throw Exception(
         ErrorCodes::LOGICAL_ERROR, "Unknown WebAssembly ABI version: {}", std::to_underlying(abi_type));
@@ -523,7 +526,7 @@ public:
 
     String getName() const override { return function_name; }
     bool isVariadic() const override { return false; }
-    bool isDeterministic() const override { return false; }
+    bool isDeterministic() const override { return user_defined_function->getIsDeterministic(); }
     bool isSuitableForShortCircuitArgumentsExecution(const DataTypesWithConstInfo & /* arguments */) const override { return false; }
     size_t getNumberOfArguments() const override { return user_defined_function->getArguments().size(); }
 
@@ -681,7 +684,8 @@ UserDefinedWebAssemblyFunctionFactory::addOrReplace(ASTPtr create_function_query
         function_def.argument_types,
         function_def.result_type,
         function_def.abi_version,
-        function_def.settings);
+        function_def.settings,
+        function_def.is_deterministic);
 
     std::unique_lock lock(registry_mutex);
     registry[function_def.function_name] = wasm_func;
