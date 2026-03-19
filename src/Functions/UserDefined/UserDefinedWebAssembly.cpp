@@ -563,10 +563,15 @@ public:
         return user_defined_function->getResultType();
     }
 
-    bool useDefaultImplementationForConstants() const override { return false; }
+    /// When the function is deterministic, returning true here causes the framework to
+    /// call executeImpl with a single-row block and wrap the result in ColumnConst.
+    /// That ColumnConst is then recognised by the Analyzer's constant-folding check
+    /// (isColumnConst(*column) in resolveFunction.cpp). Without this, executeImpl
+    /// returns a plain ColumnVector which the Analyzer does not fold.
+    bool useDefaultImplementationForConstants() const override { return user_defined_function->getIsDeterministic(); }
     ColumnNumbers getArgumentsThatAreAlwaysConstant() const override { return {}; }
 
-    bool isSuitableForConstantFolding() const override { return false; }
+    bool isSuitableForConstantFolding() const override { return user_defined_function->getIsDeterministic(); }
 
     ColumnPtr
     executeImpl(const ColumnsWithTypeAndName & arguments, const DataTypePtr & /* result_type */, size_t input_rows_count) const override
@@ -576,8 +581,13 @@ public:
         return execute(compartment_ptr, arguments, input_rows_count);
     }
 
-    ColumnPtr executeImplDryRun(const ColumnsWithTypeAndName &, const DataTypePtr &, size_t input_rows_count) const override
+    ColumnPtr executeImplDryRun(const ColumnsWithTypeAndName & arguments, const DataTypePtr & result_type, size_t input_rows_count) const override
     {
+        /// Deterministic functions must actually run during dry-run so the Analyzer can constant-fold them.
+        /// Non-deterministic functions return defaults to avoid WASM execution at query-analysis time.
+        if (user_defined_function->getIsDeterministic())
+            return executeImpl(arguments, result_type, input_rows_count);
+
         MutableColumnPtr result_column = user_defined_function->getResultType()->createColumn();
         result_column->insertManyDefaults(input_rows_count);
         return result_column;
