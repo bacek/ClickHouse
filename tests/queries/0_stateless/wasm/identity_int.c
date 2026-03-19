@@ -2,11 +2,12 @@
  * WASM UDF identity functions covering all ABIs and serialization formats.
  *
  * Exports:
- *   identity_raw            - ROW_DIRECT  Int32 identity  (i32 → i32)
- *   add                     - ROW_DIRECT  Int32 addition   (i32, i32 → i32)
- *   identity_msgpack_i32    - BUFFERED_V1 Int32 identity via MsgPack
- *   identity_msgpack_i64    - BUFFERED_V1 Int64 identity via MsgPack
- *   identity_tsv_i32        - BUFFERED_V1 Int32 identity via TSV (byte passthrough)
+ *   identity_raw             - ROW_DIRECT  Int32 identity  (i32 → i32)
+ *   add                      - ROW_DIRECT  Int32 addition   (i32, i32 → i32)
+ *   identity_msgpack_i32     - BUFFERED_V1 Int32 identity via MsgPack
+ *   identity_msgpack_i64     - BUFFERED_V1 Int64 identity via MsgPack
+ *   identity_tsv_i32         - BUFFERED_V1 Int32 identity via TSV (byte passthrough)
+ *   identity_rowbinary_i32   - BUFFERED_V1 Int32 identity via RowBinary (4-byte LE passthrough)
  *
  * Build via build.mk:
  *   make -f build.mk
@@ -147,5 +148,18 @@ Span * identity_tsv_i32(Span * input, uint32_t num_rows)
     for (uint32_t i = 0; i < input->size; i++)
         out->data[i] = input->data[i];
     out->size = input->size;
+    return out;
+}
+
+/* ---- BUFFERED_V1 RowBinary Int32 (4-byte LE passthrough) ---- */
+Span * identity_rowbinary_i32(Span * input, uint32_t num_rows)
+{
+    /* RowBinary serializes Int32 as 4 bytes little-endian — just copy the buffer. */
+    uint32_t size = num_rows * 4;
+    Span * out = clickhouse_create_buffer(size);
+    if (!out) return NULL;
+    for (uint32_t i = 0; i < size; i++)
+        out->data[i] = input->data[i];
+    out->size = size;
     return out;
 }
