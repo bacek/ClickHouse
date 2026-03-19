@@ -36,12 +36,19 @@ CREATE OR REPLACE FUNCTION identity_nondet
 SELECT identity_det(42);
 SELECT identity_nondet(42);
 
--- isConstant returns 1 only when the expression was constant-folded
+-- isConstant returns 1 only when the expression was constant-folded at planning time
 SELECT isConstant(identity_det(42));    -- expected: 1
 SELECT isConstant(identity_nondet(42)); -- expected: 0
 
--- Folded function should produce same result across many rows without being re-evaluated per row
-SELECT countIf(identity_det(7) != 7) AS wrong FROM numbers(1000); -- expected: 0
+-- Prove actual folding via fuel: budget enough for 1 WASM call, not 1000.
+-- If identity_det(1) is folded at planning time it burns fuel once and sum() sees 1000 constants.
+-- If not folded the 1000 WASM calls would exhaust fuel and throw.
+SET webassembly_udf_max_fuel = 10000;
+SELECT sum(identity_det(1)) FROM numbers(1000); -- expected: 1000
+
+-- Non-deterministic function must evaluate correctly for every row (not folded to a single value)
+SET webassembly_udf_max_fuel = 1000000;
+SELECT countIf(identity_nondet(number::Int32) != number::Int32) AS wrong FROM numbers(1000); -- expected: 0
 
 DROP FUNCTION IF EXISTS identity_det;
 DROP FUNCTION IF EXISTS identity_nondet;
