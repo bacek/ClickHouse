@@ -32,7 +32,7 @@ SELECT wasm_identity_rowbinary_i32(toUInt16(1000));
 SELECT wasm_identity_rowbinary_i32(toInt32(2147483647));
 SELECT wasm_identity_rowbinary_i32(toInt32(-2147483648));
 -- Multiple rows at once.
-SELECT wasm_identity_rowbinary_i32(toInt8(n)) FROM numbers(5);
+SELECT wasm_identity_rowbinary_i32(toInt8(number)) FROM numbers(5);
 
 DROP FUNCTION wasm_identity_rowbinary_i32;
 DELETE FROM system.webassembly_modules WHERE name = 'identity_int_rowbinary';
