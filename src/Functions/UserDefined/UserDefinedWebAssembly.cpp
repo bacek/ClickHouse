@@ -582,6 +582,11 @@ public:
     bool useDefaultImplementationForConstants() const override { return user_defined_function->getIsDeterministic(); }
     ColumnNumbers getArgumentsThatAreAlwaysConstant() const override { return {}; }
 
+    /// WASM UDFs declare typed signatures (String, UInt8, etc.) and cannot handle Variant
+    /// sub-type dispatch. Returning false prevents FunctionBaseVariantAdaptor from being
+    /// created, which would silently swallow type errors and return NULL for all rows.
+    bool useDefaultImplementationForVariant() const override { return false; }
+
     bool isSuitableForConstantFolding() const override { return user_defined_function->getIsDeterministic(); }
 
     ColumnPtr
