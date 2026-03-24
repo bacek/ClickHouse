@@ -496,6 +496,7 @@ void Reader::prefilterAndInitRowGroups(const std::optional<std::unordered_set<UI
         }
     }
 
+
     /// Populate row_groups. Skip row groups based on column chunk min/max statistics.
     size_t total_rows = 0;
     for (size_t row_group_idx = 0; row_group_idx < file_metadata.row_groups.size(); ++row_group_idx)
@@ -536,6 +537,7 @@ void Reader::prefilterAndInitRowGroups(const std::optional<std::unordered_set<UI
         if (!geostats_spatial_filters.empty()
             && rowGroupFailsSpatialFilters(*meta, primitive_columns, geostats_spatial_filters))
             continue;
+
 
         RowGroup & row_group = row_groups.emplace_back();
         row_group.meta = meta;

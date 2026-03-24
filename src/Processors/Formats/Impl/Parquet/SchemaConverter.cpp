@@ -118,7 +118,6 @@ void SchemaConverter::prepareForReading()
         missing_output.output_type = missing_output.input_type;
         missing_output.is_missing_column = true;
     }
-
 }
 
 NamesAndTypesList SchemaConverter::inferSchema()
