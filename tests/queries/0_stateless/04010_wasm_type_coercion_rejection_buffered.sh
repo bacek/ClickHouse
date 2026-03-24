@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Tags: no-fasttest, no-parallel, no-msan
 # Illegal coercions must be rejected in BUFFERED_V1 RowBinary:
-#   Float→Int and Float32→Float64 must throw ILLEGAL_TYPE_OF_ARGUMENT.
+#   Float→Int and Float64→Float32 must throw ILLEGAL_TYPE_OF_ARGUMENT.
 # (Int→Float and Int32→Int64 widening coercions are allowed and tested separately.)
 
 CUR_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
