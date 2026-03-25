@@ -47,6 +47,8 @@ SELECT wasm_raw_f32(toInt32(16));
 SELECT wasm_raw_f32(toUInt8(32));
 SELECT wasm_raw_f32(toUInt16(64));
 SELECT wasm_raw_f32(toUInt32(128));
+SELECT wasm_raw_f32(toUInt64(1024));
+SELECT wasm_raw_f32(toUInt64(2048));
 
 -- ROW_DIRECT: small int (i32) → Float64.
 SELECT wasm_raw_f64(toInt8(4));
