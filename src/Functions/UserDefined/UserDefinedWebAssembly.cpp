@@ -532,6 +532,10 @@ public:
     String getName() const override { return function_name; }
     bool isVariadic() const override { return false; }
     bool isDeterministic() const override { return user_defined_function->getIsDeterministic(); }
+    bool isSpatialPredicate() const override
+    {
+        return user_defined_function->getSettings().getValue("is_spatial_predicate").safeGet<UInt64>() != 0;
+    }
     bool isSuitableForShortCircuitArgumentsExecution(const DataTypesWithConstInfo & /* arguments */) const override { return false; }
     size_t getNumberOfArguments() const override { return user_defined_function->getArguments().size(); }
 
@@ -1020,7 +1024,7 @@ struct WebAssemblyFunctionSettingsConstraits : public IHints<>
                 [](std::string_view name, const Field & value)
                 {
                     if (value.getType() != Field::Types::UInt64 && value.getType() != Field::Types::Bool)
-                        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Expected Bool or UInt64, got '{}' for setting '{}'", value.getTypeName(), name);
+                        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Expected 0 or 1 for setting '{}'", name);
                 },
                 Field(static_cast<UInt64>(default_value)));
         }
@@ -1033,6 +1037,8 @@ struct WebAssemblyFunctionSettingsConstraits : public IHints<>
         /// ClickHouse accumulates argument rows per group and calls the WASM function once at finalize
         /// with Array-wrapped arguments (one Array per declared argument type).
         {"is_aggregate", SettingBool{}.withDefault(false)},
+        /// Whether bbox-disjoint pruning is safe for this function (see IFunctionBase::isSpatialPredicate).
+        {"is_spatial_predicate", SettingBool{}.withDefault(false)},
     };
 
     std::vector<String> getAllRegisteredNames() const override
