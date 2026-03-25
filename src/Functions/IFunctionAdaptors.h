@@ -76,6 +76,7 @@ public:
     }
 
     bool isStateful() const override { return function->isStateful(); }
+    bool isSpatialPredicate() const override { return function->isSpatialPredicate(); }
 
     bool isInjective(const ColumnsWithTypeAndName & sample_columns) const override { return function->isInjective(sample_columns); }
 

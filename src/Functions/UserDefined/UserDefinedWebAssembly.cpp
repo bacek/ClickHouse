@@ -527,6 +527,10 @@ public:
     String getName() const override { return function_name; }
     bool isVariadic() const override { return false; }
     bool isDeterministic() const override { return user_defined_function->getIsDeterministic(); }
+    bool isSpatialPredicate() const override
+    {
+        return user_defined_function->getSettings().getValue("is_spatial_predicate").safeGet<UInt64>() != 0;
+    }
     bool isSuitableForShortCircuitArgumentsExecution(const DataTypesWithConstInfo & /* arguments */) const override { return false; }
     size_t getNumberOfArguments() const override { return user_defined_function->getArguments().size(); }
 
@@ -777,9 +781,25 @@ struct WebAssemblyFunctionSettingsConstraits : public IHints<>
         std::unordered_set<String> values;
     };
 
+    struct SettingBool
+    {
+        SettingDefinition withDefault(bool default_value) const
+        {
+            return SettingDefinition(
+                [](std::string_view name, const Field & value)
+                {
+                    if (value.getType() != Field::Types::UInt64 && value.getType() != Field::Types::Bool)
+                        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Expected 0 or 1 for setting '{}'", name);
+                },
+                Field(static_cast<UInt64>(default_value)));
+        }
+    };
+
     const std::unordered_map<String, SettingDefinition> settings_def = {
         /// Serialization format for input/output data for ABI what uses serialization
         {"serialization_format", SettingStringFromSet{{"MsgPack", "JSONEachRow", "CSV", "TSV", "TSVRaw", "RowBinary"}}.withDefault("MsgPack")},
+        /// Whether bbox-disjoint pruning is safe for this function (see IFunctionBase::isSpatialPredicate).
+        {"is_spatial_predicate", SettingBool{}.withDefault(false)},
     };
 
     std::vector<String> getAllRegisteredNames() const override
