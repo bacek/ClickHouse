@@ -61,6 +61,8 @@ SELECT wasm_raw_f64(toUInt64(2048));
 SELECT wasm_rb_f32(toInt8(4));
 SELECT wasm_rb_f32(toInt32(16));
 SELECT wasm_rb_f32(toUInt32(128));
+SELECT wasm_rb_f32(toInt64(1024));
+SELECT wasm_rb_f32(toUInt64(2048));
 
 SELECT wasm_rb_f64(toInt8(4));
 SELECT wasm_rb_f64(toInt32(16));
