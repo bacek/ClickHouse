@@ -485,6 +485,10 @@ public:
     String getName() const override { return function_name; }
     bool isVariadic() const override { return false; }
     bool isDeterministic() const override { return user_defined_function->getIsDeterministic(); }
+    bool isSpatialPredicate() const override
+    {
+        return user_defined_function->getSettings().getValue("is_spatial_predicate").safeGet<UInt64>() != 0;
+    }
     bool isSuitableForShortCircuitArgumentsExecution(const DataTypesWithConstInfo & /* arguments */) const override { return false; }
     size_t getNumberOfArguments() const override { return user_defined_function->getArguments().size(); }
 
@@ -1031,6 +1035,8 @@ struct WebAssemblyFunctionSettingsConstraits : public IHints<>
         /// ClickHouse accumulates argument rows per group and calls the WASM function once at finalize
         /// with Array-wrapped arguments (one Array per declared argument type).
         {"is_aggregate", SettingBool{}.withDefault(false)},
+        /// Whether bbox-disjoint pruning is safe for this function (see IFunctionBase::isSpatialPredicate).
+        {"is_spatial_predicate", SettingBool{}.withDefault(false)},
     };
 
     Strings getAllRegisteredNames() const override
