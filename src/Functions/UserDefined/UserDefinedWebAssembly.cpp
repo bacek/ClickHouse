@@ -799,7 +799,7 @@ public:
             /// Pairs with different WASM kinds (e.g. Float64 vs Int32) are rejected.
             auto actual_kind = wasmKindForDataType(stripped.get());
             auto expected_kind = wasmKindForDataType(expected_arguments[i].get());
-            if (actual_kind && expected_kind && canCoerce(*actual_kind, *expected_kind))
+            if (actual_kind && expected_kind && *actual_kind == *expected_kind)
                 continue;
 
             /// Allow a geo type (or its constant-folded bare structural form) to satisfy a

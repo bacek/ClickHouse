@@ -216,6 +216,7 @@ public:
       */
     virtual int getSpatialExpandArg() const { return -1; }
 
+
     /** Should we evaluate this function while constant folding, if arguments are constants?
       * Usually this is true. Notable counterexample is function 'sleep'.
       * If we will call it during query analysis, we will sleep extra amount of time.
