@@ -130,7 +130,6 @@ bool tryExtractConstBbox(
     return true;
 }
 
-
 } // namespace
 
 std::vector<SpatialFilter> extractSpatialFilters(

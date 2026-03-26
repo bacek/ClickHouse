@@ -494,6 +494,10 @@ void Reader::prefilterAndInitRowGroups(const std::optional<std::unordered_set<UI
         {
             geostats_spatial_filters = std::move(all_spatial_filters);
         }
+        else
+        {
+            geostats_spatial_filters = std::move(all_spatial_filters);
+        }
     }
 
     /// Populate row_groups. Skip row groups based on column chunk min/max statistics.
