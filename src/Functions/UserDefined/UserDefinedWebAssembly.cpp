@@ -555,7 +555,6 @@ public:
                 continue;
 
             /// Allow implicit coercions: same kind, i32→i64, any int→any float, f32→f64.
-            /// Everything else (narrowing, float→int) is rejected.
             auto actual_kind = wasmKindForDataType(arguments[i].get());
             auto expected_kind = wasmKindForDataType(expected_arguments[i].get());
             if (actual_kind && expected_kind && canCoerce(*actual_kind, *expected_kind))
