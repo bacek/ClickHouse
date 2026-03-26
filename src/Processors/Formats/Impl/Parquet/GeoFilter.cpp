@@ -20,9 +20,6 @@
 #include <IO/ReadBufferFromMemory.h>
 #include <Storages/MergeTree/KeyCondition.h>
 
-#include <cmath>
-#include <cstring>
-
 namespace DB::Parquet
 {
 
