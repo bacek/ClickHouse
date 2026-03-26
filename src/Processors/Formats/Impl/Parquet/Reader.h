@@ -480,7 +480,8 @@ struct Reader
     /// are referenced by PrimitiveColumnInfo::column_index_condition.
     std::vector<std::pair<size_t, std::shared_ptr<KeyCondition>>> column_conditions;
 
-    /// Spatial KeyConditions built from covering.bbox columns, checked during row-group pruning.
+    /// KeyConditions built from GeoParquet covering.bbox spatial filters.
+    /// One per spatial predicate; checked against the hyperrectangle of bbox column stats.
     std::vector<std::shared_ptr<KeyCondition>> spatial_key_conditions;
 
     std::optional<KeyCondition> bloom_filter_condition;
