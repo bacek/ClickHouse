@@ -3,15 +3,20 @@
 
 #if USE_AVRO
 
+#include <Columns/ColumnConst.h>
 #include <Columns/ColumnNullable.h>
+#include <Columns/ColumnString.h>
 #include <Columns/ColumnsDateTime.h>
 #include <Common/DateLUTImpl.h>
+#include <Common/WKB.h>
 #include <DataTypes/DataTypeNullable.h>
 #include <Common/logger_useful.h>
+#include <Functions/IFunction.h>
 #include <Parsers/ASTFunction.h>
 #include <Parsers/ASTIdentifier.h>
 #include <Parsers/ASTExpressionList.h>
 #include <Parsers/ASTLiteral.h>
+#include <IO/ReadBufferFromMemory.h>
 #include <IO/ReadHelpers.h>
 #include <Common/quoteString.h>
 #include <fmt/ranges.h>
@@ -23,6 +28,134 @@
 #include <Storages/ObjectStorage/DataLakes/Iceberg/Utils.h>
 
 using namespace DB;
+
+namespace
+{
+
+struct IcebergBboxAccumulator
+{
+    double xmin = std::numeric_limits<double>::infinity();
+    double ymin = std::numeric_limits<double>::infinity();
+    double xmax = -std::numeric_limits<double>::infinity();
+    double ymax = -std::numeric_limits<double>::infinity();
+    bool found = false;
+
+    void add(double x, double y)
+    {
+        if (!std::isfinite(x) || !std::isfinite(y))
+            return;
+        xmin = std::min(xmin, x);
+        ymin = std::min(ymin, y);
+        xmax = std::max(xmax, x);
+        ymax = std::max(ymax, y);
+        found = true;
+    }
+
+    void addPoint(const DB::CartesianPoint & p)
+    {
+        add(p.x(), p.y());
+    }
+
+    template <typename Container>
+    void addAll(const Container & pts)
+    {
+        for (const auto & p : pts)
+            addPoint(p);
+    }
+};
+
+/// Try to extract the bounding box from a WKB-encoded constant column node.
+bool tryExtractWkbBboxForIceberg(
+    const DB::ActionsDAG::Node * node,
+    double & xmin, double & ymin,
+    double & xmax, double & ymax)
+{
+    if (!node->column || !node->is_deterministic_constant)
+        return false;
+
+    const DB::IColumn * raw = node->column.get();
+    if (const auto * const_col = typeid_cast<const DB::ColumnConst *>(raw))
+        raw = &const_col->getDataColumn();
+
+    const auto * str_col = typeid_cast<const DB::ColumnString *>(raw);
+    if (!str_col || str_col->size() == 0)
+        return false;
+
+    auto sv = str_col->getDataAt(0);
+    DB::ReadBufferFromMemory buf(sv.data(), sv.size());
+
+    IcebergBboxAccumulator acc;
+    try
+    {
+        auto geo = DB::parseWKBFormat(buf);
+        std::visit([&](const auto & g)
+        {
+            using T = std::decay_t<decltype(g)>;
+            if constexpr (std::is_same_v<T, DB::CartesianPoint>)
+                acc.addPoint(g);
+            else if constexpr (std::is_same_v<T, DB::LineString<DB::CartesianPoint>>)
+                acc.addAll(g);
+            else if constexpr (std::is_same_v<T, DB::Polygon<DB::CartesianPoint>>)
+                acc.addAll(g.outer());
+            else if constexpr (std::is_same_v<T, DB::MultiLineString<DB::CartesianPoint>>)
+                for (const auto & ls : g)
+                    acc.addAll(ls);
+            else if constexpr (std::is_same_v<T, DB::MultiPolygon<DB::CartesianPoint>>)
+                for (const auto & poly : g)
+                    acc.addAll(poly.outer());
+        }, geo);
+    }
+    catch (...) { return false; }
+
+    if (!acc.found)
+        return false;
+    xmin = acc.xmin;
+    ymin = acc.ymin;
+    xmax = acc.xmax;
+    ymax = acc.ymax;
+    return true;
+}
+
+/// Walk filter_dag for spatial predicates (isSpatialPredicate()==true) where one child
+/// is an INPUT column and the other is a constant WKB geometry. Returns pairs of
+/// (column_name, [xmin,ymin,xmax,ymax]).
+std::vector<std::pair<String, std::array<double, 4>>> extractSpatialPredicatesFromDag(
+    const DB::ActionsDAG & filter_dag)
+{
+    std::vector<std::pair<String, std::array<double, 4>>> result;
+    for (const auto & node : filter_dag.getNodes())
+    {
+        if (node.type != DB::ActionsDAG::ActionType::FUNCTION || !node.function_base)
+            continue;
+        if (!node.function_base->isSpatialPredicate() || node.children.size() < 2)
+            continue;
+
+        const DB::ActionsDAG::Node * col_node = nullptr;
+        const DB::ActionsDAG::Node * const_node = nullptr;
+        for (const auto * child : node.children)
+        {
+            if (child->type == DB::ActionsDAG::ActionType::INPUT && !col_node)
+                col_node = child;
+            else if (child->type == DB::ActionsDAG::ActionType::COLUMN && child->column
+                     && child->is_deterministic_constant && !const_node)
+                const_node = child;
+        }
+        if (!col_node || !const_node)
+            continue;
+
+        double xmin = 0;
+        double ymin = 0;
+        double xmax = 0;
+        double ymax = 0;
+        if (!tryExtractWkbBboxForIceberg(const_node, xmin, ymin, xmax, ymax))
+            continue;
+
+        result.push_back({col_node->result_name, {xmin, ymin, xmax, ymax}});
+    }
+    return result;
+}
+
+} // anonymous namespace
 
 namespace DB::Iceberg
 {
@@ -135,6 +268,37 @@ ManifestFilesPruner::ManifestFilesPruner(
         ActionsDAGWithInversionPushDown inverted_dag(transformed_dag->getOutputs().front(), context);
         min_max_key_conditions.emplace(used_column_id, KeyCondition(inverted_dag, context, {name_and_type->name}, expression));
     }
+
+    /// Spatial bbox pruning: for each spatial predicate in the filter DAG, try to find
+    /// covering.bbox columns in the Iceberg schema using the naming convention
+    /// {geo_col}_bbox.{xmin,ymin,xmax,ymax}. If found, register a SpatialBboxPruneInfo
+    /// that can cheaply prune files whose bbox is disjoint from the query bbox.
+    for (const auto & [geo_col_name, bbox] : extractSpatialPredicatesFromDag(*filter_dag))
+    {
+        String prefix = geo_col_name + "_bbox.";
+        auto xmin_id = schema_processor.tryGetColumnIDByName(current_schema_id, prefix + "xmin");
+        auto ymin_id = schema_processor.tryGetColumnIDByName(current_schema_id, prefix + "ymin");
+        auto xmax_id = schema_processor.tryGetColumnIDByName(current_schema_id, prefix + "xmax");
+        auto ymax_id = schema_processor.tryGetColumnIDByName(current_schema_id, prefix + "ymax");
+        if (!xmin_id || !ymin_id || !xmax_id || !ymax_id)
+            continue;
+        SpatialBboxPruneInfo pruner;
+        pruner.xmin_col_id = *xmin_id;
+        pruner.ymin_col_id = *ymin_id;
+        pruner.xmax_col_id = *xmax_id;
+        pruner.ymax_col_id = *ymax_id;
+        pruner.query_xmin = bbox[0];
+        pruner.query_ymin = bbox[1];
+        pruner.query_xmax = bbox[2];
+        pruner.query_ymax = bbox[3];
+        spatial_bbox_pruners.push_back(std::move(pruner));
+        LOG_DEBUG(
+            &Poco::Logger::get("ManifestFilesPruner"),
+            "Registered spatial bbox pruner for geometry column '{}': bbox=[{},{},{},{}], "
+            "Iceberg column IDs xmin={} ymin={} xmax={} ymax={}",
+            geo_col_name, bbox[0], bbox[1], bbox[2], bbox[3],
+            *xmin_id, *ymin_id, *xmax_id, *ymax_id);
+    }
 }
 
 PruningReturnStatus ManifestFilesPruner::canBePruned(
@@ -182,6 +346,46 @@ PruningReturnStatus ManifestFilesPruner::canBePruned(
         {
             return PruningReturnStatus::MIN_MAX_INDEX_PRUNED;
         }
+    }
+
+    /// Spatial bbox pruning via covering.bbox column bounds.
+    /// For each registered spatial pruner, derive the file's global bbox from the four
+    /// bbox scalar columns' min/max bounds, then prune if the query bbox is disjoint.
+    for (const auto & sp : spatial_bbox_pruners)
+    {
+        auto xmin_it = entry_hyperrectangles.find(sp.xmin_col_id);
+        auto ymin_it = entry_hyperrectangles.find(sp.ymin_col_id);
+        auto xmax_it = entry_hyperrectangles.find(sp.xmax_col_id);
+        auto ymax_it = entry_hyperrectangles.find(sp.ymax_col_id);
+        if (xmin_it == entry_hyperrectangles.end() || ymin_it == entry_hyperrectangles.end()
+            || xmax_it == entry_hyperrectangles.end() || ymax_it == entry_hyperrectangles.end())
+            continue;
+
+        /// Global file bbox:
+        ///   file_xmin = min(xmin_col) = xmin_range.left
+        ///   file_xmax = max(xmax_col) = xmax_range.right
+        ///   file_ymin = min(ymin_col) = ymin_range.left
+        ///   file_ymax = max(ymax_col) = ymax_range.right
+        const auto & xmin_range = xmin_it->second;
+        const auto & xmax_range = xmax_it->second;
+        const auto & ymin_range = ymin_it->second;
+        const auto & ymax_range = ymax_it->second;
+
+        if (xmin_range.left.getType() != Field::Types::Float64
+            || xmax_range.right.getType() != Field::Types::Float64
+            || ymin_range.left.getType() != Field::Types::Float64
+            || ymax_range.right.getType() != Field::Types::Float64)
+            continue;
+
+        double file_xmin = xmin_range.left.safeGet<double>();
+        double file_xmax = xmax_range.right.safeGet<double>();
+        double file_ymin = ymin_range.left.safeGet<double>();
+        double file_ymax = ymax_range.right.safeGet<double>();
+
+        bool disjoint = sp.query_xmax < file_xmin || sp.query_xmin > file_xmax
+            || sp.query_ymax < file_ymin || sp.query_ymin > file_ymax;
+        if (disjoint)
+            return PruningReturnStatus::MIN_MAX_INDEX_PRUNED;
     }
 
     return PruningReturnStatus::NOT_PRUNED;
