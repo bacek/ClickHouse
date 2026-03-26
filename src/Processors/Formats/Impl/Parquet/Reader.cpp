@@ -540,6 +540,32 @@ void Reader::prefilterAndInitRowGroups(const std::optional<std::unordered_set<UI
         }
     }
 
+    /// Page-level pruning for spatial bbox columns: extract per-column conditions from each
+    /// spatial KeyCondition (covering.bbox) and wire them to the bbox primitive columns.
+    /// Bbox columns are hidden auxiliaries — they have no output_columns entry, so we match
+    /// primitive_columns directly by idx_in_output_block.
+    if (options.format.parquet.page_filter_push_down && !spatial_key_conditions.empty())
+    {
+        std::vector<std::pair<size_t, std::shared_ptr<KeyCondition>>> spatial_col_conditions;
+        for (const auto & sc : spatial_key_conditions)
+        {
+            spatial_col_conditions.clear();
+            sc->extractSingleColumnConditions(spatial_col_conditions, nullptr);
+            for (const auto & [idx_in_output_block, key_condition] : spatial_col_conditions)
+            {
+                for (auto & pc : primitive_columns)
+                {
+                    if (pc.idx_in_output_block != idx_in_output_block)
+                        continue;
+                    if (!pc.decoder.allow_stats)
+                        break;
+                    pc.column_index_condition = key_condition.get();
+                    break;
+                }
+            }
+        }
+    }
+
     initializePrefetches();
 }
 
