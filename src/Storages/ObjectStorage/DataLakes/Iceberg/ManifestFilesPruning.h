@@ -32,6 +32,15 @@ class ManifestFileIterator;
 
 DB::ASTPtr getASTFromTransform(const String & transform_name_src, const String & column_name);
 
+/// Per-geometry-column spatial pruner built from covering.bbox column IDs.
+/// A file can be pruned if its bbox (from Iceberg lower/upper bounds on the
+/// four bbox scalar columns) is disjoint with the query bbox.
+struct SpatialBboxPruneInfo
+{
+    Int32 xmin_col_id, ymin_col_id, xmax_col_id, ymax_col_id;
+    double query_xmin, query_ymin, query_xmax, query_ymax;
+};
+
 /// Prune specific data files based on manifest content
 class ManifestFilesPruner
 {
@@ -43,6 +52,8 @@ private:
     std::optional<DB::KeyCondition> partition_key_condition;
 
     std::unordered_map<Int32, DB::KeyCondition> min_max_key_conditions;
+    std::vector<SpatialBboxPruneInfo> spatial_bbox_pruners;
+
     /// NOTE: tricky part to support RENAME column.
     /// Takes ActionDAG representation of user's WHERE expression and
     /// rename columns to the their origina numeric ID's in iceberg
