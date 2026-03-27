@@ -1,0 +1,14 @@
+=== all rows ===
+1
+2
+3
+4
+=== south filter ===
+1
+2
+=== north filter ===
+3
+4
+=== no match ===
+0
+pruning=ok (1 file(s) pruned)
