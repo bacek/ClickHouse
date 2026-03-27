@@ -40,36 +40,44 @@ CREATE FUNCTION wasm_rb_f64
     ARGUMENTS (x Float64) RETURNS Float64
     SETTINGS serialization_format = 'RowBinary';
 
--- ROW_DIRECT: small int (i32) → Float32.
+-- ROW_DIRECT: all integer types → Float32.
 SELECT wasm_raw_f32(toInt8(4));
 SELECT wasm_raw_f32(toInt16(8));
 SELECT wasm_raw_f32(toInt32(16));
+SELECT wasm_raw_f32(toInt64(1024));
 SELECT wasm_raw_f32(toUInt8(32));
 SELECT wasm_raw_f32(toUInt16(64));
 SELECT wasm_raw_f32(toUInt32(128));
-SELECT wasm_raw_f32(toUInt64(1024));
 SELECT wasm_raw_f32(toUInt64(2048));
 
--- ROW_DIRECT: small int (i32) → Float64.
+-- ROW_DIRECT: all integer types → Float64.
 SELECT wasm_raw_f64(toInt8(4));
+SELECT wasm_raw_f64(toInt16(8));
 SELECT wasm_raw_f64(toInt32(16));
-SELECT wasm_raw_f64(toUInt32(128));
-
--- ROW_DIRECT: Int64/UInt64 (i64) → Float64.
 SELECT wasm_raw_f64(toInt64(1024));
+SELECT wasm_raw_f64(toUInt8(32));
+SELECT wasm_raw_f64(toUInt16(64));
+SELECT wasm_raw_f64(toUInt32(128));
 SELECT wasm_raw_f64(toUInt64(2048));
 
--- BUFFERED_V1 RowBinary: small int → Float32/Float64 (getArgumentsBlock casts before serialization).
+-- BUFFERED_V1 RowBinary: all integer types → Float32.
 SELECT wasm_rb_f32(toInt8(4));
+SELECT wasm_rb_f32(toInt16(8));
 SELECT wasm_rb_f32(toInt32(16));
-SELECT wasm_rb_f32(toUInt32(128));
 SELECT wasm_rb_f32(toInt64(1024));
+SELECT wasm_rb_f32(toUInt8(32));
+SELECT wasm_rb_f32(toUInt16(64));
+SELECT wasm_rb_f32(toUInt32(128));
 SELECT wasm_rb_f32(toUInt64(2048));
 
+-- BUFFERED_V1 RowBinary: all integer types → Float64.
 SELECT wasm_rb_f64(toInt8(4));
+SELECT wasm_rb_f64(toInt16(8));
 SELECT wasm_rb_f64(toInt32(16));
-SELECT wasm_rb_f64(toUInt32(128));
 SELECT wasm_rb_f64(toInt64(1024));
+SELECT wasm_rb_f64(toUInt8(32));
+SELECT wasm_rb_f64(toUInt16(64));
+SELECT wasm_rb_f64(toUInt32(128));
 SELECT wasm_rb_f64(toUInt64(2048));
 
 -- Multiple rows: Int8 column → Float64 function.
