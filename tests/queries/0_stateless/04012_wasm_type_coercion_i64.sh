@@ -58,9 +58,11 @@ SELECT wasm_rb_i64(toInt64(0));
 SELECT wasm_rb_i64(toUInt64(42));
 
 -- BUFFERED_V1: small-int widening (i32 → i64): getArgumentsBlock() casts to Int64 before 8-byte LE serialization.
-SELECT wasm_rb_i64(toInt8(42));
-SELECT wasm_rb_i64(toInt8(-100));
-SELECT wasm_rb_i64(toInt32(-2147483648));
+SELECT wasm_rb_i64(toInt8(127));
+SELECT wasm_rb_i64(toInt16(-1000));
+SELECT wasm_rb_i64(toInt32(2147483647));
+SELECT wasm_rb_i64(toUInt8(255));
+SELECT wasm_rb_i64(toUInt16(65535));
 SELECT wasm_rb_i64(toUInt32(4294967295));
 
 -- Multiple rows.
