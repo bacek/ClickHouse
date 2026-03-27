@@ -243,7 +243,7 @@ std::shared_ptr<DB::KeyCondition> buildBboxKeyCondition(
     const auto & ymin_in = dag.addInput(ymin_col, float64);
     const auto & ymax_in = dag.addInput(ymax_col, float64);
 
-    auto make_const = [&](double v, const std::string & name) -> const DB::ActionsDAG::Node &
+    auto make_const = [&](double v, const String & name) -> const DB::ActionsDAG::Node &
     {
         return dag.addColumn(DB::ColumnWithTypeAndName{
             float64->createColumnConst(1, DB::Field(v)), float64, name});
