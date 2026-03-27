@@ -12,6 +12,7 @@
 #include <Columns/ColumnsNumber.h>
 #include <Common/DateLUTImpl.h>
 #include <Common/WKB.h>
+#include <Processors/Formats/Impl/Parquet/GeoFilter.h>
 #include <DataTypes/DataTypeNullable.h>
 #include <Common/logger_useful.h>
 #include <Functions/IFunction.h>
@@ -35,37 +36,6 @@ using namespace DB;
 namespace
 {
 
-struct IcebergBboxAccumulator
-{
-    double xmin = std::numeric_limits<double>::infinity();
-    double ymin = std::numeric_limits<double>::infinity();
-    double xmax = -std::numeric_limits<double>::infinity();
-    double ymax = -std::numeric_limits<double>::infinity();
-    bool found = false;
-
-    void add(double x, double y)
-    {
-        if (!std::isfinite(x) || !std::isfinite(y))
-            return;
-        xmin = std::min(xmin, x);
-        ymin = std::min(ymin, y);
-        xmax = std::max(xmax, x);
-        ymax = std::max(ymax, y);
-        found = true;
-    }
-
-    void addPoint(const DB::CartesianPoint & p)
-    {
-        add(p.x(), p.y());
-    }
-
-    template <typename Container>
-    void addAll(const Container & pts)
-    {
-        for (const auto & p : pts)
-            addPoint(p);
-    }
-};
 
 /// Try to extract the bounding box from a WKB-encoded constant column node.
 bool tryExtractWkbBboxForIceberg(
@@ -80,7 +50,7 @@ bool tryExtractWkbBboxForIceberg(
     if (const auto * const_col = typeid_cast<const DB::ColumnConst *>(raw))
         raw = &const_col->getDataColumn();
 
-    IcebergBboxAccumulator acc;
+    DB::BboxAccumulator acc;
 
     // Case 1: WKB-encoded String (used by st_intersects / WKB-based spatial functions)
     if (const auto * str_col = typeid_cast<const DB::ColumnString *>(raw))
@@ -92,11 +62,10 @@ bool tryExtractWkbBboxForIceberg(
         try
         {
             auto geo = DB::parseWKBFormat(buf);
-            std::visit([&](const auto & g)
+            std::visit([&]<typename T>(const T & g)
             {
-                using T = std::decay_t<decltype(g)>;
                 if constexpr (std::is_same_v<T, DB::CartesianPoint>)
-                    acc.addPoint(g);
+                    acc.add(g);
                 else if constexpr (std::is_same_v<T, DB::LineString<DB::CartesianPoint>>)
                     acc.addAll(g);
                 else if constexpr (std::is_same_v<T, DB::Polygon<DB::CartesianPoint>>)
@@ -107,6 +76,8 @@ bool tryExtractWkbBboxForIceberg(
                 else if constexpr (std::is_same_v<T, DB::MultiPolygon<DB::CartesianPoint>>)
                     for (const auto & poly : g)
                         acc.addAll(poly.outer());
+                else
+                    static_assert(!sizeof(T), "Unhandled geometry type — add a case here");
             }, geo);
         }
         catch (...) { return false; }
