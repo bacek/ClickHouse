@@ -337,10 +337,13 @@ void Reader::prefilterAndInitRowGroups(const std::optional<std::unordered_set<UI
 
             const auto & bbox_cov = *geo_it->second.covering_bbox;
 
+            const std::array bbox_col_names = {
+                std::cref(bbox_cov.xmin_column), std::cref(bbox_cov.ymin_column),
+                std::cref(bbox_cov.xmax_column), std::cref(bbox_cov.ymax_column)};
+
             /// Skip injection if parent struct column (e.g. "location_bbox") is already in block.
             bool conflict = false;
-            for (const auto & col_name : {bbox_cov.xmin_column, bbox_cov.ymin_column,
-                                           bbox_cov.xmax_column, bbox_cov.ymax_column})
+            for (const String & col_name : bbox_col_names)
             {
                 auto dot = col_name.find('.');
                 if (dot != String::npos && extended_sample_block.has(col_name.substr(0, dot)))
@@ -349,8 +352,7 @@ void Reader::prefilterAndInitRowGroups(const std::optional<std::unordered_set<UI
             if (conflict)
             { geostats_spatial_filters.push_back(sf); continue; }
 
-            for (const auto & col_name : {bbox_cov.xmin_column, bbox_cov.ymin_column,
-                                           bbox_cov.xmax_column, bbox_cov.ymax_column})
+            for (const String & col_name : bbox_col_names)
                 if (!extended_sample_block.has(col_name))
                     extended_sample_block.insert({float64->createColumn(), float64, col_name});
         }
@@ -428,8 +430,10 @@ void Reader::prefilterAndInitRowGroups(const std::optional<std::unordered_set<UI
                 spatial_key_conditions.push_back(sc);
 
                 /// Mark bbox primitives so getHyperrectangleForRowGroup reads their stats.
-                for (const auto & col_name : {bbox_cov.xmin_column, bbox_cov.ymin_column,
-                                               bbox_cov.xmax_column, bbox_cov.ymax_column})
+                const std::array bbox_col_names = {
+                    std::cref(bbox_cov.xmin_column), std::cref(bbox_cov.ymin_column),
+                    std::cref(bbox_cov.xmax_column), std::cref(bbox_cov.ymax_column)};
+                for (const String & col_name : bbox_col_names)
                     for (auto & pc : primitive_columns)
                         if (pc.name == col_name)
                             pc.used_by_key_condition = true;
