@@ -317,29 +317,30 @@ void Reader::prefilterAndInitRowGroups(const std::optional<std::unordered_set<UI
     /// idx_in_output_block and stats support.
     std::vector<SpatialFilter> all_spatial_filters;
     std::vector<SpatialFilter> geostats_spatial_filters;
+    std::unordered_map<String, DB::GeoColumnMetadata> geo_meta;
     if (options.format.parquet.spatial_filter_push_down && format_filter_info->filter_actions_dag)
     {
         all_spatial_filters = extractSpatialFilters(*format_filter_info->filter_actions_dag, extended_sample_block);
+
+        if (!all_spatial_filters.empty())
+        {
+            for (const auto & kv : file_metadata.key_value_metadata)
+                if (kv.key == "geo") { geo_meta = DB::parseGeoMetadataEncoding(&kv.value); break; }
+        }
+
         auto float64 = std::make_shared<DataTypeFloat64>();
         for (const auto & sf : all_spatial_filters)
         {
-            std::optional<DB::GeoColumnMetadata::BboxCovering> bbox_cov;
-            for (const auto & kv : file_metadata.key_value_metadata)
-            {
-                if (kv.key != "geo") continue;
-                auto geo_cols = DB::parseGeoMetadataEncoding(&kv.value);
-                auto it = geo_cols.find(sf.geometry_column_name);
-                if (it != geo_cols.end() && it->second.covering_bbox.has_value())
-                    bbox_cov = it->second.covering_bbox;
-                break;
-            }
-            if (!bbox_cov.has_value())
+            auto geo_it = geo_meta.find(sf.geometry_column_name);
+            if (geo_it == geo_meta.end() || !geo_it->second.covering_bbox.has_value())
             { geostats_spatial_filters.push_back(sf); continue; }
+
+            const auto & bbox_cov = *geo_it->second.covering_bbox;
 
             /// Skip injection if parent struct column (e.g. "location_bbox") is already in block.
             bool conflict = false;
-            for (const auto & col_name : {bbox_cov->xmin_column, bbox_cov->ymin_column,
-                                           bbox_cov->xmax_column, bbox_cov->ymax_column})
+            for (const auto & col_name : {bbox_cov.xmin_column, bbox_cov.ymin_column,
+                                           bbox_cov.xmax_column, bbox_cov.ymax_column})
             {
                 auto dot = col_name.find('.');
                 if (dot != String::npos && extended_sample_block.has(col_name.substr(0, dot)))
@@ -348,8 +349,8 @@ void Reader::prefilterAndInitRowGroups(const std::optional<std::unordered_set<UI
             if (conflict)
             { geostats_spatial_filters.push_back(sf); continue; }
 
-            for (const auto & col_name : {bbox_cov->xmin_column, bbox_cov->ymin_column,
-                                           bbox_cov->xmax_column, bbox_cov->ymax_column})
+            for (const auto & col_name : {bbox_cov.xmin_column, bbox_cov.ymin_column,
+                                           bbox_cov.xmax_column, bbox_cov.ymax_column})
                 if (!extended_sample_block.has(col_name))
                     extended_sample_block.insert({float64->createColumn(), float64, col_name});
         }
@@ -413,31 +414,22 @@ void Reader::prefilterAndInitRowGroups(const std::optional<std::unordered_set<UI
         {
             for (const auto & sf : all_spatial_filters)
             {
-                /// Re-parse to get bbox column names (same as Phase A).
-                std::optional<DB::GeoColumnMetadata::BboxCovering> bbox_cov;
-                for (const auto & kv : file_metadata.key_value_metadata)
-                {
-                    if (kv.key != "geo") continue;
-                    auto geo_cols = DB::parseGeoMetadataEncoding(&kv.value);
-                    auto it = geo_cols.find(sf.geometry_column_name);
-                    if (it != geo_cols.end() && it->second.covering_bbox.has_value())
-                        bbox_cov = it->second.covering_bbox;
-                    break;
-                }
-                if (!bbox_cov.has_value())
+                auto geo_it = geo_meta.find(sf.geometry_column_name);
+                if (geo_it == geo_meta.end() || !geo_it->second.covering_bbox.has_value())
                     continue; // already in geostats_spatial_filters
 
+                const auto & bbox_cov = *geo_it->second.covering_bbox;
                 auto sc = buildBboxKeyCondition(sf,
-                    bbox_cov->xmin_column, bbox_cov->ymin_column,
-                    bbox_cov->xmax_column, bbox_cov->ymax_column,
+                    bbox_cov.xmin_column, bbox_cov.ymin_column,
+                    bbox_cov.xmax_column, bbox_cov.ymax_column,
                     ctx, extended_sample_block);
                 if (!sc)
                     continue;
                 spatial_key_conditions.push_back(sc);
 
                 /// Mark bbox primitives so getHyperrectangleForRowGroup reads their stats.
-                for (const auto & col_name : {bbox_cov->xmin_column, bbox_cov->ymin_column,
-                                               bbox_cov->xmax_column, bbox_cov->ymax_column})
+                for (const auto & col_name : {bbox_cov.xmin_column, bbox_cov.ymin_column,
+                                               bbox_cov.xmax_column, bbox_cov.ymax_column})
                     for (auto & pc : primitive_columns)
                         if (pc.name == col_name)
                             pc.used_by_key_condition = true;
