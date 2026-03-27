@@ -503,7 +503,6 @@ struct Reader
     bool applyBloomAndDictionaryFilters(RowGroup & row_group);
 
     void applyColumnIndex(ColumnChunk & column, const PrimitiveColumnInfo & column_info, const RowGroup & row_group);
-    void applySpatialColumnIndex(ColumnChunk & column, const PrimitiveColumnInfo & column_info, const RowGroup & row_group);
     void intersectColumnIndexResultsAndInitSubgroups(RowGroup & row_group);
 
     void decodeOffsetIndex(ColumnChunk & column, const RowGroup & row_group);
