@@ -3,10 +3,13 @@
 
 #if USE_AVRO
 
+#include <Columns/ColumnArray.h>
 #include <Columns/ColumnConst.h>
 #include <Columns/ColumnNullable.h>
 #include <Columns/ColumnString.h>
+#include <Columns/ColumnTuple.h>
 #include <Columns/ColumnsDateTime.h>
+#include <Columns/ColumnsNumber.h>
 #include <Common/DateLUTImpl.h>
 #include <Common/WKB.h>
 #include <DataTypes/DataTypeNullable.h>
@@ -77,35 +80,52 @@ bool tryExtractWkbBboxForIceberg(
     if (const auto * const_col = typeid_cast<const DB::ColumnConst *>(raw))
         raw = &const_col->getDataColumn();
 
-    const auto * str_col = typeid_cast<const DB::ColumnString *>(raw);
-    if (!str_col || str_col->size() == 0)
-        return false;
-
-    auto sv = str_col->getDataAt(0);
-    DB::ReadBufferFromMemory buf(sv.data(), sv.size());
-
     IcebergBboxAccumulator acc;
-    try
+
+    // Case 1: WKB-encoded String (used by st_intersects / WKB-based spatial functions)
+    if (const auto * str_col = typeid_cast<const DB::ColumnString *>(raw))
     {
-        auto geo = DB::parseWKBFormat(buf);
-        std::visit([&](const auto & g)
+        if (str_col->size() == 0)
+            return false;
+        auto sv = str_col->getDataAt(0);
+        DB::ReadBufferFromMemory buf(sv.data(), sv.size());
+        try
         {
-            using T = std::decay_t<decltype(g)>;
-            if constexpr (std::is_same_v<T, DB::CartesianPoint>)
-                acc.addPoint(g);
-            else if constexpr (std::is_same_v<T, DB::LineString<DB::CartesianPoint>>)
-                acc.addAll(g);
-            else if constexpr (std::is_same_v<T, DB::Polygon<DB::CartesianPoint>>)
-                acc.addAll(g.outer());
-            else if constexpr (std::is_same_v<T, DB::MultiLineString<DB::CartesianPoint>>)
-                for (const auto & ls : g)
-                    acc.addAll(ls);
-            else if constexpr (std::is_same_v<T, DB::MultiPolygon<DB::CartesianPoint>>)
-                for (const auto & poly : g)
-                    acc.addAll(poly.outer());
-        }, geo);
+            auto geo = DB::parseWKBFormat(buf);
+            std::visit([&](const auto & g)
+            {
+                using T = std::decay_t<decltype(g)>;
+                if constexpr (std::is_same_v<T, DB::CartesianPoint>)
+                    acc.addPoint(g);
+                else if constexpr (std::is_same_v<T, DB::LineString<DB::CartesianPoint>>)
+                    acc.addAll(g);
+                else if constexpr (std::is_same_v<T, DB::Polygon<DB::CartesianPoint>>)
+                    acc.addAll(g.outer());
+                else if constexpr (std::is_same_v<T, DB::MultiLineString<DB::CartesianPoint>>)
+                    for (const auto & ls : g)
+                        acc.addAll(ls);
+                else if constexpr (std::is_same_v<T, DB::MultiPolygon<DB::CartesianPoint>>)
+                    for (const auto & poly : g)
+                        acc.addAll(poly.outer());
+            }, geo);
+        }
+        catch (...) { return false; }
     }
-    catch (...) { return false; }
+    // Case 2: Array(Tuple(Float64, Float64)) — used by pointInPolygon / polygonsIntersectCartesian
+    else if (const auto * arr_col = typeid_cast<const DB::ColumnArray *>(raw))
+    {
+        const auto * tuple_col = typeid_cast<const DB::ColumnTuple *>(&arr_col->getData());
+        if (!tuple_col || tuple_col->tupleSize() < 2)
+            return false;
+        const auto * xs = typeid_cast<const DB::ColumnFloat64 *>(&tuple_col->getColumn(0));
+        const auto * ys = typeid_cast<const DB::ColumnFloat64 *>(&tuple_col->getColumn(1));
+        if (!xs || !ys)
+            return false;
+        for (size_t i = 0; i < xs->size(); ++i)
+            acc.add(xs->getElement(i), ys->getElement(i));
+    }
+    else
+        return false;
 
     if (!acc.found)
         return false;
@@ -275,11 +295,23 @@ ManifestFilesPruner::ManifestFilesPruner(
     /// that can cheaply prune files whose bbox is disjoint from the query bbox.
     for (const auto & [geo_col_name, bbox] : extractSpatialPredicatesFromDag(*filter_dag))
     {
-        String prefix = geo_col_name + "_bbox.";
-        auto xmin_id = schema_processor.tryGetColumnIDByName(current_schema_id, prefix + "xmin");
-        auto ymin_id = schema_processor.tryGetColumnIDByName(current_schema_id, prefix + "ymin");
-        auto xmax_id = schema_processor.tryGetColumnIDByName(current_schema_id, prefix + "xmax");
-        auto ymax_id = schema_processor.tryGetColumnIDByName(current_schema_id, prefix + "ymax");
+        /// Try struct sub-field convention first: {geo_col}_bbox.{xmin,ymin,xmax,ymax}
+        /// (used by GeoParquet writers that store bbox as a Struct column).
+        auto xmin_id = schema_processor.tryGetColumnIDByName(current_schema_id, geo_col_name + "_bbox.xmin");
+        auto ymin_id = schema_processor.tryGetColumnIDByName(current_schema_id, geo_col_name + "_bbox.ymin");
+        auto xmax_id = schema_processor.tryGetColumnIDByName(current_schema_id, geo_col_name + "_bbox.xmax");
+        auto ymax_id = schema_processor.tryGetColumnIDByName(current_schema_id, geo_col_name + "_bbox.ymax");
+
+        /// Fall back to flat column convention: {geo_col}_bbox_{xmin,ymin,xmax,ymax}
+        /// (used when bbox columns are written as separate top-level Float64 columns).
+        if (!xmin_id)
+            xmin_id = schema_processor.tryGetColumnIDByName(current_schema_id, geo_col_name + "_bbox_xmin");
+        if (!ymin_id)
+            ymin_id = schema_processor.tryGetColumnIDByName(current_schema_id, geo_col_name + "_bbox_ymin");
+        if (!xmax_id)
+            xmax_id = schema_processor.tryGetColumnIDByName(current_schema_id, geo_col_name + "_bbox_xmax");
+        if (!ymax_id)
+            ymax_id = schema_processor.tryGetColumnIDByName(current_schema_id, geo_col_name + "_bbox_ymax");
         if (!xmin_id || !ymin_id || !xmax_id || !ymax_id)
             continue;
         SpatialBboxPruneInfo pruner;
