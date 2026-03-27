@@ -97,29 +97,20 @@ bool tryExtractWkbBbox(std::string_view wkb,
     try
     {
         auto geo = DB::parseWKBFormat(buf);
-        std::visit([&](const auto & g)
+        std::visit([&]<typename T>(const T & g)
         {
-            using T = std::decay_t<decltype(g)>;
             if constexpr (std::is_same_v<T, DB::CartesianPoint>)
-            {
                 acc.add(g);
-            }
             else if constexpr (std::is_same_v<T, DB::LineString<DB::CartesianPoint>>)
-            {
                 acc.addAll(g);
-            }
             else if constexpr (std::is_same_v<T, DB::Polygon<DB::CartesianPoint>>)
-            {
                 acc.addAll(g.outer());
-            }
             else if constexpr (std::is_same_v<T, DB::MultiLineString<DB::CartesianPoint>>)
-            {
                 for (const auto & ls : g) acc.addAll(ls);
-            }
             else if constexpr (std::is_same_v<T, DB::MultiPolygon<DB::CartesianPoint>>)
-            {
                 for (const auto & poly : g) acc.addAll(poly.outer());
-            }
+            else
+                static_assert(!sizeof(T), "Unhandled geometry type — add a case here");
         }, geo);
     }
     catch (...) { return false; }
