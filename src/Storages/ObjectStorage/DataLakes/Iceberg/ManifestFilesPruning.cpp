@@ -11,8 +11,8 @@
 #include <Columns/ColumnsDateTime.h>
 #include <Columns/ColumnsNumber.h>
 #include <Common/DateLUTImpl.h>
+#include <Common/GeoBbox.h>
 #include <Common/WKB.h>
-#include <Processors/Formats/Impl/Parquet/GeoFilter.h>
 #include <DataTypes/DataTypeNullable.h>
 #include <Common/logger_useful.h>
 #include <Functions/IFunction.h>
