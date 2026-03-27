@@ -130,6 +130,8 @@ bool canDumpIcebergStats(const Field & field, DataTypePtr type)
         case TypeIndex::Int64:
         case TypeIndex::DateTime64:
         case TypeIndex::String:
+        case TypeIndex::Float32:
+        case TypeIndex::Float64:
             return true;
         default:
             return false;
@@ -177,21 +179,20 @@ std::vector<uint8_t> dumpFieldToBytes(const Field & field, DataTypePtr type)
     }
 }
 
-bool canWriteStatistics(
-    const std::vector<std::pair<size_t, Field>> & statistics,
+/// Filter statistics to only writable (supported type) entries.
+/// Unsupported types (e.g. Tuple, Array) are silently skipped.
+std::vector<std::pair<size_t, Field>> filterWritableStatistics(
+    std::vector<std::pair<size_t, Field>> statistics,
     const std::unordered_map<size_t, size_t> & field_id_to_column_index,
     SharedHeader sample_block)
 {
-    if (statistics.empty())
-        return false;
-
-    for (const auto & [field_id, stat] : statistics)
+    auto it = std::remove_if(statistics.begin(), statistics.end(), [&](const auto & p)
     {
-        auto type = sample_block->getDataTypes()[field_id_to_column_index.at(field_id)];
-        if (!canDumpIcebergStats(stat, type))
-            return false;
-    }
-    return true;
+        auto type = sample_block->getDataTypes()[field_id_to_column_index.at(p.first)];
+        return !canDumpIcebergStats(p.second, type);
+    });
+    statistics.erase(it, statistics.end());
+    return statistics;
 }
 
 }
@@ -357,11 +358,13 @@ void generateManifestFile(
             auto dump_fields = [&](size_t field_id, Field value)
             { return dumpFieldToBytes(value, sample_block->getDataTypes()[field_id_to_column_index.at(field_id)]); };
 
-            auto lower_statistics = data_file_statistics->getLowerBounds();
-            if (canWriteStatistics(lower_statistics, field_id_to_column_index, sample_block))
+            auto lower_statistics = filterWritableStatistics(
+                data_file_statistics->getLowerBounds(), field_id_to_column_index, sample_block);
+            if (!lower_statistics.empty())
                 set_fields(lower_statistics, Iceberg::f_lower_bounds, dump_fields);
-            auto upper_statistics = data_file_statistics->getUpperBounds();
-            if (canWriteStatistics(upper_statistics, field_id_to_column_index, sample_block))
+            auto upper_statistics = filterWritableStatistics(
+                data_file_statistics->getUpperBounds(), field_id_to_column_index, sample_block);
+            if (!upper_statistics.empty())
                 set_fields(upper_statistics, Iceberg::f_upper_bounds, dump_fields);
         }
         auto summary = new_snapshot->getObject(Iceberg::f_summary);
