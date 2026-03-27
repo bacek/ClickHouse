@@ -18,82 +18,51 @@
 #include <IO/ReadBufferFromMemory.h>
 #include <Storages/MergeTree/KeyCondition.h>
 
-#include <cmath>
-#include <cstring>
-
 namespace DB::Parquet
 {
 
 namespace
 {
 
-
-/// Accumulates a bounding box from any geometry source: WKB GeometricObjects,
-/// CH native columns (ColumnConst / ColumnTuple / ColumnArray), or CartesianPoints.
-struct BboxAccumulator
+/// Recursively walk a CH column at the given row, adding all 2D points to acc.
+/// Handles: ColumnConst (unwrap), ColumnTuple(Float64,Float64) (point),
+/// ColumnArray (recurse into elements).
+void addFromColumn(DB::BboxAccumulator & acc, const DB::IColumn & col, size_t row)
 {
-    double xmin = std::numeric_limits<double>::infinity();
-    double ymin = std::numeric_limits<double>::infinity();
-    double xmax = -std::numeric_limits<double>::infinity();
-    double ymax = -std::numeric_limits<double>::infinity();
-    bool found = false;
-
-    void add(double x, double y)
+    if (const auto * const_col = typeid_cast<const DB::ColumnConst *>(&col))
     {
-        if (!std::isfinite(x) || !std::isfinite(y)) return;
-        xmin = std::min(xmin, x);
-        ymin = std::min(ymin, y);
-        xmax = std::max(xmax, x);
-        ymax = std::max(ymax, y);
-        found = true;
+        addFromColumn(acc, const_col->getDataColumn(), 0);
+        return;
     }
-
-    void add(const DB::CartesianPoint & p) { add(p.x(), p.y()); }
-
-    template <typename Container>
-    void addAll(const Container & pts) { for (const auto & p : pts) add(p); }
-
-    /// Recursively walk a column at the given row. Handles:
-    ///   ColumnConst   — unwrap and recurse at row 0
-    ///   ColumnTuple(ColumnFloat64, ColumnFloat64) — a 2D point
-    ///   ColumnArray(…) — iterate elements
-    void addFromColumn(const DB::IColumn & col, size_t row)
+    if (const auto * tuple_col = typeid_cast<const DB::ColumnTuple *>(&col))
     {
-        if (const auto * const_col = typeid_cast<const DB::ColumnConst *>(&col))
-        {
-            addFromColumn(const_col->getDataColumn(), 0);
+        if (tuple_col->tupleSize() < 2 || row >= tuple_col->size())
             return;
-        }
-        if (const auto * tuple_col = typeid_cast<const DB::ColumnTuple *>(&col))
-        {
-            if (tuple_col->tupleSize() < 2 || row >= tuple_col->size())
-                return;
-            const auto * x_col = typeid_cast<const DB::ColumnFloat64 *>(&tuple_col->getColumn(0));
-            const auto * y_col = typeid_cast<const DB::ColumnFloat64 *>(&tuple_col->getColumn(1));
-            if (!x_col || !y_col)
-                return;
-            add(x_col->getData()[row], y_col->getData()[row]);
+        const auto * x_col = typeid_cast<const DB::ColumnFloat64 *>(&tuple_col->getColumn(0));
+        const auto * y_col = typeid_cast<const DB::ColumnFloat64 *>(&tuple_col->getColumn(1));
+        if (!x_col || !y_col)
             return;
-        }
-        if (const auto * array_col = typeid_cast<const DB::ColumnArray *>(&col))
-        {
-            if (row >= array_col->size())
-                return;
-            const auto & offsets = array_col->getOffsets();
-            const size_t start = row > 0 ? offsets[row - 1] : 0;
-            const size_t end = offsets[row];
-            for (size_t i = start; i < end; ++i)
-                addFromColumn(array_col->getData(), i);
-        }
+        acc.add(x_col->getData()[row], y_col->getData()[row]);
+        return;
     }
-};
+    if (const auto * array_col = typeid_cast<const DB::ColumnArray *>(&col))
+    {
+        if (row >= array_col->size())
+            return;
+        const auto & offsets = array_col->getOffsets();
+        const size_t start = row > 0 ? offsets[row - 1] : 0;
+        const size_t end = offsets[row];
+        for (size_t i = start; i < end; ++i)
+            addFromColumn(acc, array_col->getData(), i);
+    }
+}
 
 bool tryExtractWkbBbox(std::string_view wkb,
                        double & xmin, double & ymin,
                        double & xmax, double & ymax)
 {
     DB::ReadBufferFromMemory buf(wkb);
-    BboxAccumulator acc;
+    DB::BboxAccumulator acc;
     try
     {
         auto geo = DB::parseWKBFormat(buf);
@@ -144,8 +113,8 @@ bool tryExtractConstBbox(
     }
 
     /// CH native geometry (Tuple of floats, Array of Tuples, etc.).
-    BboxAccumulator acc;
-    acc.addFromColumn(*raw, 0);
+    DB::BboxAccumulator acc;
+    addFromColumn(acc, *raw, 0);
     if (!acc.found) return false;
     xmin = acc.xmin; ymin = acc.ymin;
     xmax = acc.xmax; ymax = acc.ymax;
@@ -237,7 +206,9 @@ bool rowGroupFailsSpatialFilters(
 
         /// Only check geospatial_statistics.bbox baked into the geometry column's ColumnMetaData.
         /// covering.bbox is handled via the standard KeyCondition hyperrectangle path.
-        const auto & col_meta = rg_meta.columns.at(geo_col->column_idx).meta_data;
+        if (geo_col->column_idx >= rg_meta.columns.size())
+            continue;
+        const auto & col_meta = rg_meta.columns[geo_col->column_idx].meta_data;
         if (!col_meta.__isset.geospatial_statistics || !col_meta.geospatial_statistics.__isset.bbox)
             continue;
 
