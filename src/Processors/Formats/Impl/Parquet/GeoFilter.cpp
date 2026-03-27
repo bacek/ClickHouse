@@ -255,8 +255,8 @@ bool rowGroupFailsSpatialFilters(
 
 std::shared_ptr<DB::KeyCondition> buildBboxKeyCondition(
     const SpatialFilter & filter,
-    const std::string & xmin_col, const std::string & ymin_col,
-    const std::string & xmax_col, const std::string & ymax_col,
+    const String & xmin_col, const String & ymin_col,
+    const String & xmax_col, const String & ymax_col,
     const DB::ContextPtr & context,
     const DB::Block & extended_sample_block)
 {
@@ -298,14 +298,9 @@ std::shared_ptr<DB::KeyCondition> buildBboxKeyCondition(
     const auto & and3 = dag.addFunction(and_fn, {&and2, &cmp4}, "");
     dag.getOutputs() = {&and3};
 
-    DB::Names names;
-    names.reserve(extended_sample_block.columns());
-    for (size_t i = 0; i < extended_sample_block.columns(); ++i)
-        names.push_back(extended_sample_block.getByPosition(i).name);
-
     DB::ActionsDAGWithInversionPushDown inverted(dag.getOutputs().front(), context);
     return std::make_shared<DB::KeyCondition>(
-        inverted, context, names,
+        inverted, context, extended_sample_block.getNames(),
         std::make_shared<DB::ExpressionActions>(
             DB::ActionsDAG(extended_sample_block.getColumnsWithTypeAndName())));
 }
