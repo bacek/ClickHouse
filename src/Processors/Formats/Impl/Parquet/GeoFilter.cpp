@@ -28,54 +28,8 @@ namespace
 {
 
 
-/// Recursively walk a constant column (ColumnConst / ColumnTuple / ColumnArray) at the
-/// given row index and accumulate min/max x/y. Handles:
-///   • ColumnConst   — unwrap and recurse at row 0
-///   • ColumnTuple(ColumnFloat64, ColumnFloat64)  — a 2D point
-///   • ColumnArray(…) — iterate elements
-void accumulateBboxFromColumn(
-    const DB::IColumn & col, size_t row,
-    double & xmin, double & ymin,
-    double & xmax, double & ymax,
-    bool & found)
-{
-    if (const auto * const_col = typeid_cast<const DB::ColumnConst *>(&col))
-    {
-        accumulateBboxFromColumn(const_col->getDataColumn(), 0, xmin, ymin, xmax, ymax, found);
-        return;
-    }
-    if (const auto * tuple_col = typeid_cast<const DB::ColumnTuple *>(&col))
-    {
-        if (tuple_col->tupleSize() < 2 || row >= tuple_col->size())
-            return;
-        const auto * x_col = typeid_cast<const DB::ColumnFloat64 *>(&tuple_col->getColumn(0));
-        const auto * y_col = typeid_cast<const DB::ColumnFloat64 *>(&tuple_col->getColumn(1));
-        if (!x_col || !y_col)
-            return;
-        double x = x_col->getData()[row];
-        double y = y_col->getData()[row];
-        if (!std::isfinite(x) || !std::isfinite(y))
-            return;
-        xmin = std::min(xmin, x);
-        ymin = std::min(ymin, y);
-        xmax = std::max(xmax, x);
-        ymax = std::max(ymax, y);
-        found = true;
-        return;
-    }
-    if (const auto * array_col = typeid_cast<const DB::ColumnArray *>(&col))
-    {
-        if (row >= array_col->size())
-            return;
-        const auto & offsets = array_col->getOffsets();
-        const size_t start = row > 0 ? offsets[row - 1] : 0;
-        const size_t end = offsets[row];
-        for (size_t i = start; i < end; ++i)
-            accumulateBboxFromColumn(array_col->getData(), i, xmin, ymin, xmax, ymax, found);
-    }
-}
-
-/// Accumulate bounding box from a CH-native GeometricObject (CartesianPoint / LineString / Polygon / …).
+/// Accumulates a bounding box from any geometry source: WKB GeometricObjects,
+/// CH native columns (ColumnConst / ColumnTuple / ColumnArray), or CartesianPoints.
 struct BboxAccumulator
 {
     double xmin = std::numeric_limits<double>::infinity();
@@ -98,6 +52,40 @@ struct BboxAccumulator
 
     template <typename Container>
     void addAll(const Container & pts) { for (const auto & p : pts) add(p); }
+
+    /// Recursively walk a column at the given row. Handles:
+    ///   ColumnConst   — unwrap and recurse at row 0
+    ///   ColumnTuple(ColumnFloat64, ColumnFloat64) — a 2D point
+    ///   ColumnArray(…) — iterate elements
+    void addFromColumn(const DB::IColumn & col, size_t row)
+    {
+        if (const auto * const_col = typeid_cast<const DB::ColumnConst *>(&col))
+        {
+            addFromColumn(const_col->getDataColumn(), 0);
+            return;
+        }
+        if (const auto * tuple_col = typeid_cast<const DB::ColumnTuple *>(&col))
+        {
+            if (tuple_col->tupleSize() < 2 || row >= tuple_col->size())
+                return;
+            const auto * x_col = typeid_cast<const DB::ColumnFloat64 *>(&tuple_col->getColumn(0));
+            const auto * y_col = typeid_cast<const DB::ColumnFloat64 *>(&tuple_col->getColumn(1));
+            if (!x_col || !y_col)
+                return;
+            add(x_col->getData()[row], y_col->getData()[row]);
+            return;
+        }
+        if (const auto * array_col = typeid_cast<const DB::ColumnArray *>(&col))
+        {
+            if (row >= array_col->size())
+                return;
+            const auto & offsets = array_col->getOffsets();
+            const size_t start = row > 0 ? offsets[row - 1] : 0;
+            const size_t end = offsets[row];
+            for (size_t i = start; i < end; ++i)
+                addFromColumn(array_col->getData(), i);
+        }
+    }
 };
 
 bool tryExtractWkbBbox(std::string_view wkb,
@@ -165,13 +153,12 @@ bool tryExtractConstBbox(
     }
 
     /// CH native geometry (Tuple of floats, Array of Tuples, etc.).
-    xmin = std::numeric_limits<double>::infinity();
-    ymin = std::numeric_limits<double>::infinity();
-    xmax = -std::numeric_limits<double>::infinity();
-    ymax = -std::numeric_limits<double>::infinity();
-    bool found = false;
-    accumulateBboxFromColumn(*raw, 0, xmin, ymin, xmax, ymax, found);
-    return found;
+    BboxAccumulator acc;
+    acc.addFromColumn(*raw, 0);
+    if (!acc.found) return false;
+    xmin = acc.xmin; ymin = acc.ymin;
+    xmax = acc.xmax; ymax = acc.ymax;
+    return true;
 }
 
 
