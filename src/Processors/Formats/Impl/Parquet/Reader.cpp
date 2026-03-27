@@ -312,21 +312,25 @@ void Reader::prefilterAndInitRowGroups(const std::optional<std::unordered_set<UI
     for (const auto & col : format_filter_info->additional_columns)
         extended_sample_block.insert(col);
 
-    /// Phase A: pre-parse GeoParquet metadata and inject covering.bbox sub-columns into
-    /// extended_sample_block BEFORE SchemaConverter runs, so the bbox primitives get proper
-    /// idx_in_output_block and stats support.
+    /// Parse GeoParquet metadata once. Used by both Phase A (covering.bbox column injection)
+    /// and SchemaConverter (geo type resolution). Parsing here avoids a redundant second parse
+    /// in the SchemaConverter constructor when both allow_geoparquet_parser and
+    /// spatial_filter_push_down are on.
+    std::unordered_map<String, DB::GeoColumnMetadata> geo_meta;
+    if (options.format.parquet.allow_geoparquet_parser
+        || options.format.parquet.spatial_filter_push_down)
+    {
+        for (const auto & kv : file_metadata.key_value_metadata)
+            if (kv.key == "geo") { geo_meta = DB::parseGeoMetadataEncoding(&kv.value); break; }
+    }
+
+    /// Phase A: inject covering.bbox sub-columns into extended_sample_block BEFORE
+    /// SchemaConverter runs, so the bbox primitives get proper idx_in_output_block and stats support.
     std::vector<SpatialFilter> all_spatial_filters;
     std::vector<SpatialFilter> geostats_spatial_filters;
-    std::unordered_map<String, DB::GeoColumnMetadata> geo_meta;
     if (options.format.parquet.spatial_filter_push_down && format_filter_info->filter_actions_dag)
     {
         all_spatial_filters = extractSpatialFilters(*format_filter_info->filter_actions_dag, extended_sample_block);
-
-        if (!all_spatial_filters.empty())
-        {
-            for (const auto & kv : file_metadata.key_value_metadata)
-                if (kv.key == "geo") { geo_meta = DB::parseGeoMetadataEncoding(&kv.value); break; }
-        }
 
         auto float64 = std::make_shared<DataTypeFloat64>();
         for (const auto & sf : all_spatial_filters)
@@ -337,24 +341,24 @@ void Reader::prefilterAndInitRowGroups(const std::optional<std::unordered_set<UI
 
             const auto & bbox_cov = *geo_it->second.covering_bbox;
 
-            const std::array bbox_col_names = {
-                std::cref(bbox_cov.xmin_column), std::cref(bbox_cov.ymin_column),
-                std::cref(bbox_cov.xmax_column), std::cref(bbox_cov.ymax_column)};
+            const std::array<const String *, 4> bbox_col_ptrs = {
+                &bbox_cov.xmin_column, &bbox_cov.ymin_column,
+                &bbox_cov.xmax_column, &bbox_cov.ymax_column};
 
             /// Skip injection if parent struct column (e.g. "location_bbox") is already in block.
             bool conflict = false;
-            for (const String & col_name : bbox_col_names)
+            for (const String * col : bbox_col_ptrs)
             {
-                auto dot = col_name.find('.');
-                if (dot != String::npos && extended_sample_block.has(col_name.substr(0, dot)))
+                auto dot = col->find('.');
+                if (dot != String::npos && extended_sample_block.has(col->substr(0, dot)))
                 { conflict = true; break; }
             }
             if (conflict)
             { geostats_spatial_filters.push_back(sf); continue; }
 
-            for (const String & col_name : bbox_col_names)
-                if (!extended_sample_block.has(col_name))
-                    extended_sample_block.insert({float64->createColumn(), float64, col_name});
+            for (const String * col : bbox_col_ptrs)
+                if (!extended_sample_block.has(*col))
+                    extended_sample_block.insert({float64->createColumn(), float64, *col});
         }
     }
 
@@ -362,8 +366,8 @@ void Reader::prefilterAndInitRowGroups(const std::optional<std::unordered_set<UI
     const auto & row_level_filter = format_filter_info->row_level_filter;
     const auto & prewhere_info = format_filter_info->prewhere_info;
 
-    /// Process schema.
-    SchemaConverter schemer(file_metadata, options, &extended_sample_block);
+    /// Process schema. Pass pre-parsed geo_meta so SchemaConverter skips a redundant JSON parse.
+    SchemaConverter schemer(file_metadata, options, &extended_sample_block, std::move(geo_meta));
     auto add_prewhere_outputs = [&](const ActionsDAG & actions)
     {
         for (const auto * node : actions.getOutputs())
@@ -416,8 +420,8 @@ void Reader::prefilterAndInitRowGroups(const std::optional<std::unordered_set<UI
         {
             for (const auto & sf : all_spatial_filters)
             {
-                auto geo_it = geo_meta.find(sf.geometry_column_name);
-                if (geo_it == geo_meta.end() || !geo_it->second.covering_bbox.has_value())
+                auto geo_it = schemer.geo_columns.find(sf.geometry_column_name);
+                if (geo_it == schemer.geo_columns.end() || !geo_it->second.covering_bbox.has_value())
                     continue; // already in geostats_spatial_filters
 
                 const auto & bbox_cov = *geo_it->second.covering_bbox;
@@ -430,12 +434,12 @@ void Reader::prefilterAndInitRowGroups(const std::optional<std::unordered_set<UI
                 spatial_key_conditions.push_back(sc);
 
                 /// Mark bbox primitives so getHyperrectangleForRowGroup reads their stats.
-                const std::array bbox_col_names = {
-                    std::cref(bbox_cov.xmin_column), std::cref(bbox_cov.ymin_column),
-                    std::cref(bbox_cov.xmax_column), std::cref(bbox_cov.ymax_column)};
-                for (const String & col_name : bbox_col_names)
+                const std::array<const String *, 4> bbox_col_ptrs = {
+                    &bbox_cov.xmin_column, &bbox_cov.ymin_column,
+                    &bbox_cov.xmax_column, &bbox_cov.ymax_column};
+                for (const String * col : bbox_col_ptrs)
                     for (auto & pc : primitive_columns)
-                        if (pc.name == col_name)
+                        if (pc.name == *col)
                             pc.used_by_key_condition = true;
             }
         }
