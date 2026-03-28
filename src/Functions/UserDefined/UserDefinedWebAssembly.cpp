@@ -746,6 +746,7 @@ VectorWithMemoryTracking<UserDefinedWebAssemblyFunctionFactory::RegisteredFuncti
     return result;
 }
 
+
 UserDefinedWebAssemblyFunctionFactory & UserDefinedWebAssemblyFunctionFactory::instance()
 {
     static UserDefinedWebAssemblyFunctionFactory factory;

@@ -117,6 +117,7 @@ public:
     /// Returns all registered WASM functions with their metadata for introspection (e.g. system.functions).
     VectorWithMemoryTracking<RegisteredFunction> getAllFunctions() const;
 
+
     static UserDefinedWebAssemblyFunctionFactory & instance();
 private:
     struct RegistryEntry
