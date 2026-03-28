@@ -1,14 +1,13 @@
 #pragma once
 
+#include <algorithm>
 #include <cmath>
 #include <limits>
-
-#include <Functions/geometryConverters.h>
 
 namespace DB
 {
 
-/// Accumulates a bounding box from CartesianPoints or GeometricObjects.
+/// Accumulates a bounding box from (x, y) coordinate pairs.
 /// Check `found` before using xmin/ymin/xmax/ymax.
 struct BboxAccumulator
 {
@@ -28,10 +27,9 @@ struct BboxAccumulator
         found = true;
     }
 
-    void add(const CartesianPoint & p) { add(p.x(), p.y()); }
-
+    /// Iterate over a container whose elements have .x() and .y() methods (e.g. CartesianPoint).
     template <typename Container>
-    void addAll(const Container & pts) { for (const auto & p : pts) add(p); }
+    void addAll(const Container & pts) { for (const auto & p : pts) add(p.x(), p.y()); }
 };
 
 }
