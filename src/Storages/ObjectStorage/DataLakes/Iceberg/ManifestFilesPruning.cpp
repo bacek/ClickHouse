@@ -300,7 +300,7 @@ ManifestFilesPruner::ManifestFilesPruner(
         pruner.query_ymax = bbox[3];
         spatial_bbox_pruners.push_back(std::move(pruner));
         LOG_DEBUG(
-            &Poco::Logger::get("ManifestFilesPruner"),
+            getLogger("ManifestFilesPruner"),
             "Registered spatial bbox pruner for geometry column '{}': bbox=[{},{},{},{}], "
             "Iceberg column IDs xmin={} ymin={} xmax={} ymax={}",
             geo_col_name, bbox[0], bbox[1], bbox[2], bbox[3],
