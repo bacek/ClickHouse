@@ -1,6 +1,8 @@
 #include <Processors/Formats/Impl/Parquet/GeoFilter.h>
 #include <Processors/Formats/Impl/Parquet/ThriftUtil.h>
 
+#include <Common/logger_useful.h>
+
 #include <Columns/ColumnArray.h>
 #include <Columns/ColumnConst.h>
 #include <Columns/ColumnString.h>
@@ -82,7 +84,11 @@ bool tryExtractWkbBbox(std::string_view wkb,
                 static_assert(!sizeof(T), "Unhandled geometry type — add a case here");
         }, geo);
     }
-    catch (...) { return false; }
+    catch (...)
+    {
+        LOG_TRACE(getLogger("GeoFilter"), "Failed to parse WKB geometry for bbox extraction: {}", getCurrentExceptionMessage(false));
+        return false;
+    }
 
     if (!acc.found) return false;
     xmin = acc.xmin; ymin = acc.ymin;
