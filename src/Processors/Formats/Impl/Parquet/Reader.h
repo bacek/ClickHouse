@@ -484,6 +484,12 @@ struct Reader
     /// One per spatial predicate; checked against the hyperrectangle of bbox column stats.
     std::vector<std::shared_ptr<KeyCondition>> spatial_key_conditions;
 
+    /// Per-column KeyConditions extracted from spatial_key_conditions for page-level
+    /// spatial bbox pruning. Stored here (not as a local variable) to keep the shared_ptrs
+    /// alive, since raw pointers from them are referenced by
+    /// PrimitiveColumnInfo::column_index_condition.
+    std::vector<std::pair<size_t, std::shared_ptr<KeyCondition>>> spatial_column_conditions;
+
     std::optional<KeyCondition> bloom_filter_condition;
 
     /// These methods are listed in the order in which they're used, matching ReadStage order.
