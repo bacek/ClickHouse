@@ -1,3 +1,4 @@
+#include <Common/logger_useful.h>
 #include <Common/ProfileEvents.h>
 #include <Columns/ColumnArray.h>
 #include <DataTypes/DataTypesNumber.h>
@@ -321,7 +322,19 @@ void Reader::prefilterAndInitRowGroups(const std::optional<std::unordered_set<UI
         || options.format.parquet.spatial_filter_push_down)
     {
         for (const auto & kv : file_metadata.key_value_metadata)
-            if (kv.key == "geo") { geo_meta = DB::parseGeoMetadataEncoding(&kv.value); break; }
+        {
+            if (kv.key != "geo")
+                continue;
+            try
+            {
+                geo_meta = DB::parseGeoMetadataEncoding(&kv.value);
+            }
+            catch (...)
+            {
+                LOG_WARNING(getLogger("ParquetReader"), "Failed to parse GeoParquet metadata, spatial pruning and geo type resolution disabled: {}", getCurrentExceptionMessage(false));
+            }
+            break;
+        }
     }
 
     /// Phase A: inject covering.bbox sub-columns into extended_sample_block BEFORE
