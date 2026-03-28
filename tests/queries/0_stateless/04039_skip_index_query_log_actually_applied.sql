@@ -37,7 +37,7 @@ INSERT INTO t_skip_applied SELECT 100 + number, number FROM numbers(10);
 
 -- Both idx_a and idx_b appear: idx_a dropped part2's granule, idx_b dropped part1's granule.
 -- use_skip_indexes_on_data_read=0 forces mark-selection path so indices actually drop granules here.
-SELECT count() FROM t_skip_applied WHERE a = 5 AND b = 5 SETTINGS log_queries = 1, use_skip_indexes_on_data_read = 0;
+SELECT count() FROM t_skip_applied WHERE a = 5 AND b = 5 SETTINGS log_queries = 1, use_skip_indexes_on_data_read = 0, use_query_condition_cache = 0;
 
 SYSTEM FLUSH LOGS query_log;
 
@@ -54,7 +54,7 @@ LIMIT 1;
 
 -- Only idx_a appears: idx_a (minmax, always runs first due to priority) filters all granules for both parts
 -- (50 not in [0,9] and 50 not in [100,109]), so idx_b never gets to run and is NOT logged.
-SELECT count() FROM t_skip_applied WHERE a = 50 AND b = 50 SETTINGS log_queries = 1, use_skip_indexes_on_data_read = 0;
+SELECT count() FROM t_skip_applied WHERE a = 50 AND b = 50 SETTINGS log_queries = 1, use_skip_indexes_on_data_read = 0, use_query_condition_cache = 0;
 
 SYSTEM FLUSH LOGS query_log;
 
