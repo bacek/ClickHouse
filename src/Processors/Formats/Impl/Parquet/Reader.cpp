@@ -559,13 +559,13 @@ void Reader::prefilterAndInitRowGroups(const std::optional<std::unordered_set<UI
     /// primitive_columns directly by idx_in_output_block.
     if (options.format.parquet.page_filter_push_down && !spatial_key_conditions.empty())
     {
-        std::vector<std::pair<size_t, std::shared_ptr<KeyCondition>>> spatial_col_conditions;
         for (const auto & sc : spatial_key_conditions)
         {
-            spatial_col_conditions.clear();
-            sc->extractSingleColumnConditions(spatial_col_conditions, nullptr);
-            for (const auto & [idx_in_output_block, key_condition] : spatial_col_conditions)
+            const size_t prev_size = spatial_column_conditions.size();
+            sc->extractSingleColumnConditions(spatial_column_conditions, nullptr);
+            for (size_t i = prev_size; i < spatial_column_conditions.size(); ++i)
             {
+                const auto & [idx_in_output_block, key_condition] = spatial_column_conditions[i];
                 for (auto & pc : primitive_columns)
                 {
                     if (pc.idx_in_output_block != idx_in_output_block)
