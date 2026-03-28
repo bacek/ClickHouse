@@ -80,7 +80,11 @@ bool tryExtractWkbBboxForIceberg(
                     static_assert(!sizeof(T), "Unhandled geometry type — add a case here");
             }, geo);
         }
-        catch (...) { return false; }
+        catch (...)
+        {
+            LOG_TRACE(getLogger("ManifestFilesPruner"), "Failed to parse WKB geometry for bbox extraction: {}", getCurrentExceptionMessage(false));
+            return false;
+        }
     }
     // Case 2: Array(Tuple(Float64, Float64)) — used by pointInPolygon / polygonsIntersectCartesian
     else if (const auto * arr_col = typeid_cast<const DB::ColumnArray *>(raw))
