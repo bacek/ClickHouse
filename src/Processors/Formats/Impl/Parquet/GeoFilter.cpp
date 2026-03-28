@@ -69,7 +69,7 @@ bool tryExtractWkbBbox(std::string_view wkb,
         std::visit([&]<typename T>(const T & g)
         {
             if constexpr (std::is_same_v<T, DB::CartesianPoint>)
-                acc.add(g);
+                acc.add(g.x(), g.y());
             else if constexpr (std::is_same_v<T, DB::LineString<DB::CartesianPoint>>)
                 acc.addAll(g);
             else if constexpr (std::is_same_v<T, DB::Polygon<DB::CartesianPoint>>)
