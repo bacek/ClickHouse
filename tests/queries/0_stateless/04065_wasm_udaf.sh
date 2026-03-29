@@ -116,6 +116,13 @@ ORDER BY key;
 SELECT wasm_udaf_sum_msgpack(x)
 FROM (SELECT arrayJoin([1.5, 2.5, 3.0, -1.0]::Array(Float64)) AS x);
 
+-- >15 elements per group: exercises the array16 (0xdc) MsgPack path in read_msgpack_array_len
+SELECT wasm_udaf_sum_msgpack(x)
+FROM (SELECT toFloat64(number + 1) AS x FROM numbers(20));
+
+SELECT wasm_udaf_count_msgpack(x)
+FROM (SELECT toFloat64(number) AS x FROM numbers(20));
+
 DROP FUNCTION wasm_udaf_sum_msgpack;
 DROP FUNCTION wasm_udaf_count_msgpack;
 DELETE FROM system.webassembly_modules WHERE name = 'udaf_msgpack_test';
