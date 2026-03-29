@@ -1231,6 +1231,14 @@ ProjectionNames QueryAnalyzer::resolveFunction(QueryTreeNodePtr & node, Identifi
         if (const auto * create_function_query = typeid_cast<const ASTCreateWasmFunctionQuery *>(user_defined_function.get()))
         {
             UNUSED(create_function_query);
+            if (UserDefinedWebAssemblyFunctionFactory::instance().isAggregate(function_name))
+            {
+                /// Resolve as aggregate: ClickHouse accumulates rows per group and calls WASM once at finalize.
+                auto aggregate_function = UserDefinedWebAssemblyFunctionFactory::instance().getAggregate(
+                    function_name, argument_types, scope.context);
+                function_node.resolveAsAggregateFunction(std::move(aggregate_function));
+                return result_projection_names;
+            }
             function = UserDefinedWebAssemblyFunctionFactory::instance().get(function_name, scope.context);
         }
     }
