@@ -72,3 +72,51 @@ DELETE FROM system.webassembly_modules WHERE name = 'udaf_test';
 -- After DROP, functions must no longer appear
 SELECT count() FROM system.functions WHERE name IN ('wasm_udaf_sum', 'wasm_udaf_count');
 EOF
+
+# ---- MsgPack serialization format ----
+cat "${CUR_DIR}/wasm/udaf_sum.wasm" | ${CLICKHOUSE_CLIENT} \
+    --query "INSERT INTO system.webassembly_modules (name, code) SELECT 'udaf_msgpack_test', code FROM input('code String') FORMAT RawBlob"
+
+${CLICKHOUSE_CLIENT} --allow_experimental_analyzer=1 << 'EOF'
+
+CREATE FUNCTION wasm_udaf_sum_msgpack
+    LANGUAGE WASM ABI BUFFERED_V1 FROM 'udaf_msgpack_test' :: 'sum_f64_msgpack'
+    ARGUMENTS (x Float64) RETURNS Float64
+    SETTINGS is_aggregate = 1, serialization_format = 'MsgPack';
+
+CREATE FUNCTION wasm_udaf_count_msgpack
+    LANGUAGE WASM ABI BUFFERED_V1 FROM 'udaf_msgpack_test' :: 'count_f64_msgpack'
+    ARGUMENTS (x Float64) RETURNS Float64
+    SETTINGS is_aggregate = 1, serialization_format = 'MsgPack';
+
+-- Basic aggregation over all rows (MsgPack)
+SELECT wasm_udaf_sum_msgpack(x) FROM (SELECT arrayJoin([1.0, 2.0, 3.0]::Array(Float64)) AS x);
+
+-- GROUP BY: each group is accumulated separately (MsgPack)
+SELECT key, wasm_udaf_sum_msgpack(x)
+FROM (
+    SELECT 1 AS key, arrayJoin([10.0, 20.0]::Array(Float64)) AS x
+    UNION ALL
+    SELECT 2, arrayJoin([100.0, 200.0, 300.0]::Array(Float64))
+)
+GROUP BY key
+ORDER BY key;
+
+-- Count function via MsgPack
+SELECT key, wasm_udaf_count_msgpack(x)
+FROM (
+    SELECT 1 AS key, arrayJoin([1.1, 2.2]::Array(Float64)) AS x
+    UNION ALL
+    SELECT 2, arrayJoin([1.1, 2.2, 3.3]::Array(Float64))
+)
+GROUP BY key
+ORDER BY key;
+
+-- Negative values and mixed signs
+SELECT wasm_udaf_sum_msgpack(x)
+FROM (SELECT arrayJoin([1.5, 2.5, 3.0, -1.0]::Array(Float64)) AS x);
+
+DROP FUNCTION wasm_udaf_sum_msgpack;
+DROP FUNCTION wasm_udaf_count_msgpack;
+DELETE FROM system.webassembly_modules WHERE name = 'udaf_msgpack_test';
+EOF

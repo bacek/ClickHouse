@@ -6,3 +6,9 @@
 wasm_udaf_count	1	WasmUserDefined
 wasm_udaf_sum	1	WasmUserDefined
 0
+6
+1	30
+2	600
+1	2
+2	3
+6
