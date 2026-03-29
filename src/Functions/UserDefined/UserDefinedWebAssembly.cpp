@@ -700,9 +700,19 @@ public:
     {
         auto * state = new (place) State();
         state->columns = new MutableColumns();
-        state->columns->reserve(original_arg_types.size());
-        for (const auto & type : original_arg_types)
-            state->columns->push_back(type->createColumn());
+        try
+        {
+            state->columns->reserve(original_arg_types.size());
+            for (const auto & type : original_arg_types)
+                state->columns->push_back(type->createColumn());
+        }
+        catch (...)
+        {
+            /// destroy() is NOT called when create() throws, so clean up manually.
+            delete state->columns;
+            state->columns = nullptr;
+            throw;
+        }
     }
 
     void destroy(AggregateDataPtr __restrict place) const noexcept override
