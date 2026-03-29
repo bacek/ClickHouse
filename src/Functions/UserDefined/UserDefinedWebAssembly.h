@@ -10,6 +10,7 @@
 
 #include <Common/SharedMutex.h>
 #include <Common/StopToken.h>
+#include <AggregateFunctions/IAggregateFunction_fwd.h>
 #include <Common/UnorderedMapWithMemoryTracking.h>
 #include <Common/UnorderedSetWithMemoryTracking.h>
 #include <Common/VectorWithMemoryTracking.h>
@@ -37,6 +38,7 @@ public:
     Field getValue(const String & name) const;
     bool isFuelEnabled() const;
     WebAssembly::FuelMode getFuelMode() const;
+    bool isAggregate() const;
 
 private:
     UnorderedMapWithMemoryTracking<String, Field> settings;
@@ -98,7 +100,9 @@ public:
     {
         String sql_name;
         std::shared_ptr<UserDefinedWebAssemblyFunction> function;
+        DataTypes original_arg_types; /// declared types before Array wrapping for aggregates
         ASTPtr create_query;
+        bool is_aggregate = false;
     };
 
     RegisteredFunction prepareFunction(ASTPtr create_function_query, WasmModuleManager & module_manager) const;
@@ -110,6 +114,13 @@ public:
     FunctionOverloadResolverPtr get(const String & function_name, ContextPtr context);
     /// Returns nullptr if the function is not registered. Useful for non-throwing rewrite-candidate checks.
     FunctionOverloadResolverPtr tryGet(const String & function_name, ContextPtr context);
+
+    /// Returns true if the function is an aggregate function (is_aggregate=1).
+    bool isAggregate(const String & function_name) const;
+
+    /// Returns an AggregateFunctionPtr for use in the query analyzer.
+    /// arg_types must match the declared (non-Array) argument types.
+    AggregateFunctionPtr getAggregate(const String & function_name, const DataTypes & arg_types, ContextPtr context) const;
 
     /// Returns true if function was removed
     bool dropIfExists(const String & function_name);
@@ -123,7 +134,9 @@ private:
     struct RegistryEntry
     {
         std::shared_ptr<UserDefinedWebAssemblyFunction> function;
+        DataTypes original_arg_types; /// declared types before Array wrapping for aggregates
         ASTPtr create_query;
+        bool is_aggregate = false;
     };
 
     mutable DB::SharedMutex registry_mutex;
