@@ -729,6 +729,33 @@ public:
         ++state->num_rows;
     }
 
+    void addBatchSinglePlace(
+        size_t row_begin, size_t row_end,
+        AggregateDataPtr __restrict place,
+        const IColumn ** columns,
+        Arena *,
+        ssize_t if_argument_pos) const override
+    {
+        auto * state = reinterpret_cast<State *>(place);
+        if (if_argument_pos >= 0)
+        {
+            const auto & filter = assert_cast<const ColumnUInt8 &>(*columns[if_argument_pos]);
+            for (size_t row = row_begin; row < row_end; ++row)
+            {
+                if (filter.getElement(row))
+                {
+                    for (size_t i = 0; i < state->columns->size(); ++i)
+                        (*state->columns)[i]->insertFrom(*columns[i], row);
+                    ++state->num_rows;
+                }
+            }
+            return;
+        }
+        for (size_t i = 0; i < state->columns->size(); ++i)
+            (*state->columns)[i]->insertRangeFrom(*columns[i], row_begin, row_end - row_begin);
+        state->num_rows += row_end - row_begin;
+    }
+
     void merge(AggregateDataPtr __restrict place, ConstAggregateDataPtr rhs, Arena *) const override
     {
         auto * state = reinterpret_cast<State *>(place);
