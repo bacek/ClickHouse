@@ -863,6 +863,12 @@ UserDefinedWebAssemblyFunctionFactory::addOrReplace(ASTPtr create_function_query
 
     const bool is_aggregate = function_def.settings.isAggregate();
 
+    if (is_aggregate && function_def.abi_version == WasmAbiVersion::RowDirect)
+        throw Exception(
+            ErrorCodes::BAD_ARGUMENTS,
+            "SETTINGS is_aggregate = 1 is not supported with ABI ROW_DIRECT: array arguments "
+            "cannot be passed as scalar WASM values. Use ABI BUFFERED_V1 instead.");
+
     /// For aggregate functions, the WASM export receives Array(T) arguments — one array per declared
     /// argument type containing all accumulated rows for the group.
     /// Wrap the declared argument types before creating the WASM function so signature validation
