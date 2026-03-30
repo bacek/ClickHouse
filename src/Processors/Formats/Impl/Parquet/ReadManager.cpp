@@ -27,6 +27,7 @@ namespace ProfileEvents
     extern const Event ParquetDecodingTaskBatches;
     extern const Event ParquetReadRowGroups;
     extern const Event ParquetPrunedRowGroups;
+    extern const Event ParquetPrunedRowGroupsByBloomFilter;
 }
 
 namespace DB::Parquet
@@ -117,7 +118,10 @@ void ReadManager::finishRowGroupStage(size_t row_group_idx, ReadStage stage, Mem
     if (stage == ReadStage::BloomFilterBlocksOrDictionary)
     {
         if (!reader.applyBloomAndDictionaryFilters(row_group))
+        {
             stage = ReadStage::Deliver; // skip the row group
+            ProfileEvents::increment(ProfileEvents::ParquetPrunedRowGroupsByBloomFilter);
+        }
         for (auto & c : row_group.columns)
         {
             c.bloom_filter_header_prefetch.reset(&diff);
