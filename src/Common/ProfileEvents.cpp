@@ -1334,8 +1334,11 @@ The server successfully detected this situation and will download merged part fr
     M(WasmMemoryAllocated, "Total memory allocated for WebAssembly compartments", ValueType::Bytes) \
     \
     M(ParquetReadRowGroups, "The total number of row groups read from parquet data", ValueType::Number) \
-    M(ParquetPrunedRowGroups, "The total number of row groups pruned from parquet data", ValueType::Number) \
-    M(ParquetPrunedPages, "The total number of pages pruned via spatial column index from parquet data", ValueType::Number) \
+    M(ParquetPrunedRowGroups, "The total number of row groups pruned via min/max statistics from parquet data", ValueType::Number) \
+    M(ParquetPrunedRowGroupsByBloomFilter, "The total number of row groups pruned via bloom filter from parquet data", ValueType::Number) \
+    M(ParquetReadPages, "The total number of pages read from parquet data (after column index pruning)", ValueType::Number) \
+    M(ParquetPrunedPages, "The total number of pages pruned via column index from parquet data", ValueType::Number) \
+    M(ParquetPrunedRowsByColumnIndex, "The total number of rows pruned via column index from parquet data", ValueType::Number) \
     M(ParquetDecodingTasks, "Tasks issued by parquet reader", ValueType::Number) \
     M(ParquetDecodingTaskBatches, "Task groups sent to a thread pool by parquet reader", ValueType::Number) \
     M(ParquetPrefetcherReadRandomRead, "The total number of reads with ReadMode::RandomRead by DB::Parquet::Prefetcher", ValueType::Number) \

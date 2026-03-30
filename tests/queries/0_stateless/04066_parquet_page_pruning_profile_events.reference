@@ -1,0 +1,11 @@
+=== column index pruning enabled ===
+ParquetReadPages: present
+ParquetPrunedPages: present
+ParquetPrunedRowsByColumnIndex: present
+=== column index pruning disabled ===
+ParquetPrunedPages: absent
+ParquetPrunedRowsByColumnIndex: absent
+=== bloom filter pruning enabled ===
+ParquetPrunedRowGroupsByBloomFilter: present
+=== bloom filter pruning disabled ===
+ParquetPrunedRowGroupsByBloomFilter: absent
