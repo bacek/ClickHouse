@@ -46,6 +46,8 @@ namespace ProfileEvents
     extern const Event ParquetRowsFilterExpression;
     extern const Event ParquetColumnsFilterExpression;
     extern const Event ParquetPrunedPages;
+    extern const Event ParquetReadPages;
+    extern const Event ParquetPrunedRowsByColumnIndex;
 }
 
 namespace DB::Parquet
@@ -1227,6 +1229,10 @@ void Reader::intersectColumnIndexResultsAndInitSubgroups(RowGroup & row_group)
             }
         }
     }
+    size_t pruned_rows = size_t(row_group.meta->num_rows) - num_rows;
+    if (pruned_rows > 0)
+        ProfileEvents::increment(ProfileEvents::ParquetPrunedRowsByColumnIndex, pruned_rows);
+
     if (num_rows == 0)
         return;
 
@@ -1357,6 +1363,12 @@ void Reader::determinePagesToPrefetch(ColumnChunk & column, const RowSubgroup & 
             }
         }
         chassert(!page_byte_ranges.empty());
+
+        size_t total_pages = locations.size();
+        size_t selected_pages = column.data_pages.size();
+        if (selected_pages < total_pages)
+            ProfileEvents::increment(ProfileEvents::ParquetPrunedPages, total_pages - selected_pages);
+        ProfileEvents::increment(ProfileEvents::ParquetReadPages, selected_pages);
 
         auto handles = prefetcher.splitRange(std::move(column.data_pages_prefetch), page_byte_ranges, /*likely_to_be_used*/ false);
 
