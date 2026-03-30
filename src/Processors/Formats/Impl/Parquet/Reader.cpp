@@ -429,10 +429,14 @@ void Reader::prefilterAndInitRowGroups(const std::optional<std::unordered_set<UI
     /// Phase B: build spatial KeyConditions now that SchemaConverter has set idx_in_output_block
     /// for the injected bbox columns. Also mark those primitives as used_by_key_condition so
     /// getHyperrectangleForRowGroup() reads their min/max stats.
+    /// Additionally, build a per-row bbox prefilter DAG to eliminate rows that cannot possibly
+    /// intersect the query bbox before the (potentially expensive) spatial predicate runs.
     if (options.format.parquet.spatial_filter_push_down && !all_spatial_filters.empty())
     {
         if (auto ctx = format_filter_info->context.lock())
         {
+            std::vector<std::tuple<SpatialFilter, String, String, String, String>> bbox_filter_inputs;
+
             for (const auto & sf : all_spatial_filters)
             {
                 auto geo_it = schemer.geo_columns.find(sf.geometry_column_name);
@@ -456,7 +460,15 @@ void Reader::prefilterAndInitRowGroups(const std::optional<std::unordered_set<UI
                     for (auto & pc : primitive_columns)
                         if (pc.name == *col)
                             pc.used_by_key_condition = true;
+
+                /// Collect inputs for the per-row prefilter DAG.
+                bbox_filter_inputs.emplace_back(
+                    sf,
+                    bbox_cov.xmin_column, bbox_cov.ymin_column,
+                    bbox_cov.xmax_column, bbox_cov.ymax_column);
             }
+
+            bbox_row_prefilter = buildBboxRowFilterDAG(bbox_filter_inputs, ctx);
         }
         else
         {
@@ -906,6 +918,11 @@ void Reader::preparePrewhere()
         }
     };
 
+    /// Inject bbox prefilter as the very first step so that downstream predicates
+    /// (including potentially expensive WASM spatial functions) only evaluate rows
+    /// whose bounding box intersects the query bbox.
+    if (bbox_row_prefilter)
+        add_step(bbox_row_prefilter->first, bbox_row_prefilter->second, true);
     if (row_level_filter)
         add_step(row_level_filter->actions, row_level_filter->column_name, true);
     if (prewhere_info)

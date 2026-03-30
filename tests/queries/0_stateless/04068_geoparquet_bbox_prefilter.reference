@@ -1,0 +1,49 @@
+=== all rows ===
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+11
+12
+13
+14
+15
+16
+17
+18
+19
+20
+=== south texas (push-down enabled) ===
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+=== south texas (push-down disabled) ===
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+=== no match (query outside all data) ===
+0
+=== ParquetRowsFilterExpression (push-down enabled) ===
+ParquetRowsFilterExpression: 30 (increment)
+=== ParquetRowsFilterExpression (push-down disabled) ===
+ParquetRowsFilterExpression: 20 (increment)
