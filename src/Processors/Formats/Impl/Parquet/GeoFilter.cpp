@@ -282,4 +282,77 @@ std::shared_ptr<DB::KeyCondition> buildBboxKeyCondition(
             DB::ActionsDAG(extended_sample_block.getColumnsWithTypeAndName())));
 }
 
+std::optional<std::pair<DB::ActionsDAG, String>> buildBboxRowFilterDAG(
+    const std::vector<std::tuple<SpatialFilter, String, String, String, String>> & filters_with_cols,
+    const DB::ContextPtr & context)
+{
+    if (filters_with_cols.empty())
+        return std::nullopt;
+
+    static const String kOutputColName = "__spatial_bbox_prefilter";
+
+    DB::ActionsDAG dag;
+    auto float64 = std::make_shared<DB::DataTypeFloat64>();
+    auto & fn = DB::FunctionFactory::instance();
+    auto le = fn.get("lessOrEquals", context);
+    auto ge = fn.get("greaterOrEquals", context);
+    auto and_fn = fn.get("and", context);
+
+    /// Track already-added INPUT nodes to avoid duplicates when multiple filters
+    /// reference the same bbox column.
+    std::unordered_map<String, const DB::ActionsDAG::Node *> input_nodes;
+
+    auto get_or_add_input = [&](const String & col_name) -> const DB::ActionsDAG::Node &
+    {
+        auto it = input_nodes.find(col_name);
+        if (it != input_nodes.end())
+            return *it->second;
+        const auto & node = dag.addInput(col_name, float64);
+        input_nodes[col_name] = &node;
+        return node;
+    };
+
+    size_t const_idx = 0;
+    auto make_const = [&](double v) -> const DB::ActionsDAG::Node &
+    {
+        String name = "__bbox_const_" + std::to_string(const_idx++);
+        return dag.addColumn(DB::ColumnWithTypeAndName{
+            float64->createColumnConst(1, DB::Field(v)), float64, name});
+    };
+
+    const DB::ActionsDAG::Node * combined = nullptr;
+
+    for (const auto & [sf, xmin_col, ymin_col, xmax_col, ymax_col] : filters_with_cols)
+    {
+        const auto & xmin_in = get_or_add_input(xmin_col);
+        const auto & xmax_in = get_or_add_input(xmax_col);
+        const auto & ymin_in = get_or_add_input(ymin_col);
+        const auto & ymax_in = get_or_add_input(ymax_col);
+
+        const auto & c_qxmax = make_const(sf.query_xmax);
+        const auto & c_qxmin = make_const(sf.query_xmin);
+        const auto & c_qymax = make_const(sf.query_ymax);
+        const auto & c_qymin = make_const(sf.query_ymin);
+
+        /// xmin_col <= q_xmax  AND  xmax_col >= q_xmin  AND  ymin_col <= q_ymax  AND  ymax_col >= q_ymin
+        const auto & cmp1 = dag.addFunction(le, {&xmin_in, &c_qxmax}, "");
+        const auto & cmp2 = dag.addFunction(ge, {&xmax_in, &c_qxmin}, "");
+        const auto & cmp3 = dag.addFunction(le, {&ymin_in, &c_qymax}, "");
+        const auto & cmp4 = dag.addFunction(ge, {&ymax_in, &c_qymin}, "");
+        const auto & and1 = dag.addFunction(and_fn, {&cmp1, &cmp2}, "");
+        const auto & and2 = dag.addFunction(and_fn, {&and1, &cmp3}, "");
+        const auto & filter_node = dag.addFunction(and_fn, {&and2, &cmp4}, "");
+
+        if (combined)
+            combined = &dag.addFunction(and_fn, {combined, &filter_node}, "");
+        else
+            combined = &filter_node;
+    }
+
+    const auto & output = dag.addAlias(*combined, kOutputColName);
+    dag.getOutputs() = {&output};
+
+    return std::make_pair(std::move(dag), kOutputColName);
+}
+
 } // namespace DB::Parquet

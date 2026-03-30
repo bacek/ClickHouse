@@ -9,7 +9,9 @@
 #include <Common/StringUtils.h>
 #include <Interpreters/Context_fwd.h>
 
-namespace DB { class ActionsDAG; class Block; class KeyCondition; }
+#include <Interpreters/ActionsDAG.h>
+
+namespace DB { class Block; class KeyCondition; }
 
 namespace DB::Parquet
 {
@@ -48,5 +50,13 @@ std::shared_ptr<DB::KeyCondition> buildBboxKeyCondition(
     const String & xmax_col, const String & ymax_col,
     const DB::ContextPtr & context,
     const DB::Block & extended_sample_block);
+
+/// Build a per-row ActionsDAG that evaluates the bbox intersection predicate for all given filters:
+///   (xmin_col <= q_xmax) AND (xmax_col >= q_xmin) AND (ymin_col <= q_ymax) AND (ymax_col >= q_ymin)
+/// Multiple filters are ANDed together. Returns nullopt if the list is empty.
+/// The output column of the returned DAG is named "__spatial_bbox_prefilter".
+std::optional<std::pair<DB::ActionsDAG, String>> buildBboxRowFilterDAG(
+    const std::vector<std::tuple<SpatialFilter, String, String, String, String>> & filters_with_cols,
+    const DB::ContextPtr & context);
 
 }
