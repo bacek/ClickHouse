@@ -484,6 +484,11 @@ struct Reader
     /// One per spatial predicate; checked against the hyperrectangle of bbox column stats.
     std::vector<std::shared_ptr<KeyCondition>> spatial_key_conditions;
 
+    /// Per-row ActionsDAG prefilter built from GeoParquet covering.bbox spatial filters.
+    /// Injected as the first prewhere step so that WASM spatial functions only evaluate
+    /// rows whose bbox intersects the query bbox.
+    std::optional<std::pair<ActionsDAG, String>> bbox_row_prefilter;
+
     /// Per-column KeyConditions extracted from spatial_key_conditions for page-level
     /// spatial bbox pruning. Stored here (not as a local variable) to keep the shared_ptrs
     /// alive, since raw pointers from them are referenced by
