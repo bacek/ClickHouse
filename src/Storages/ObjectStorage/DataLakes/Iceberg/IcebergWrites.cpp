@@ -383,7 +383,6 @@ void generateManifestFile(
                 data_file_statistics->getUpperBounds(), field_id_to_column_index, sample_block);
             if (!upper_statistics.empty())
                 set_fields(upper_statistics, Iceberg::f_upper_bounds, dump_fields);
-            }
         }
         data_file.field(Iceberg::f_record_count) = avro::GenericDatum(static_cast<Int64>(data_file_row_counts[file_idx]));
         data_file.field(Iceberg::f_file_size_in_bytes) = avro::GenericDatum(static_cast<Int64>(data_file_byte_counts[file_idx]));
