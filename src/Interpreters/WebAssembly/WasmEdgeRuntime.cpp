@@ -301,6 +301,14 @@ public:
 
     std::span<uint8_t> getMemory(WasmPtr ptr, WasmSizeT size) override;
 
+    size_t getLinearMemorySize() const override
+    {
+        auto * memory_ctx = WasmEdge_ModuleInstanceFindMemory(vm_instance_cxt, wasmedgeStringWrap("memory"));
+        if (!memory_ctx)
+            return 0;
+        return static_cast<size_t>(WasmEdge_MemoryInstanceGetPageSize(memory_ctx)) * WASMEDGE_PAGE_SIZE;
+    }
+
     std::vector<WasmVal> invokeImpl(std::string_view function_name, const std::vector<WasmVal> & params, StopToken stop_token) override;
 
     void loadModuleFromCode(std::string_view wasm_code);
