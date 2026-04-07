@@ -10,6 +10,8 @@ CUR_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 ${CLICKHOUSE_CLIENT} --enable_analyzer=1 << 'EOF'
 DROP FUNCTION IF EXISTS identity_det;
 DROP FUNCTION IF EXISTS identity_nondet;
+DROP FUNCTION IF EXISTS identity_raw_det;
+DROP FUNCTION IF EXISTS identity_raw_nondet;
 DELETE FROM system.webassembly_modules WHERE name = 'identity_cf_test';
 EOF
 
@@ -50,7 +52,40 @@ SELECT sum(identity_det(1)) FROM numbers(1000); -- expected: 1000
 SET webassembly_udf_max_fuel = 1000000;
 SELECT countIf(identity_nondet(number::Int32) != number::Int32) AS wrong FROM numbers(1000); -- expected: 0
 
+-- ── ROW_DIRECT path ──────────────────────────────────────────────────────────
+
+-- DETERMINISTIC + ABI ROW_DIRECT: constant arguments must also be folded
+CREATE OR REPLACE FUNCTION identity_raw_det
+    LANGUAGE WASM FROM 'identity_cf_test' :: 'identity_raw'
+    ARGUMENTS (x Int32) RETURNS Int32
+    ABI ROW_DIRECT
+    DETERMINISTIC;
+
+-- Non-deterministic ROW_DIRECT: should NOT be folded
+CREATE OR REPLACE FUNCTION identity_raw_nondet
+    LANGUAGE WASM FROM 'identity_cf_test' :: 'identity_raw'
+    ARGUMENTS (x Int32) RETURNS Int32
+    ABI ROW_DIRECT;
+
+-- Correct result regardless of folding
+SELECT identity_raw_det(42);
+SELECT identity_raw_nondet(42);
+
+-- isConstant must be 1 for deterministic ROW_DIRECT, 0 for non-deterministic
+SELECT isConstant(identity_raw_det(42));    -- expected: 1
+SELECT isConstant(identity_raw_nondet(42)); -- expected: 0
+
+-- Fuel proof for ROW_DIRECT: a single fold call should suffice for 1000 rows
+SET webassembly_udf_max_fuel = 10000;
+SELECT sum(identity_raw_det(1)) FROM numbers(1000); -- expected: 1000
+
+-- Non-deterministic ROW_DIRECT must evaluate per-row and return correct values
+SET webassembly_udf_max_fuel = 1000000;
+SELECT countIf(identity_raw_nondet(number::Int32) != number::Int32) AS wrong FROM numbers(1000); -- expected: 0
+
 DROP FUNCTION IF EXISTS identity_det;
 DROP FUNCTION IF EXISTS identity_nondet;
+DROP FUNCTION IF EXISTS identity_raw_det;
+DROP FUNCTION IF EXISTS identity_raw_nondet;
 DELETE FROM system.webassembly_modules WHERE name = 'identity_cf_test';
 EOF
