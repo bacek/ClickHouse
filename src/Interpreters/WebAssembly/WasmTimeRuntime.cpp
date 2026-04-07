@@ -184,6 +184,12 @@ struct WasmTimeRuntime::Impl
         /// The Cranelift optimizer is prohibitively slow in debug builds and can
         /// hit debug-only traps while simplifying even small modules.
         config.cranelift_opt_level(wasmtime::OptLevel::None);
+#elif defined(__APPLE__) && defined(__aarch64__)
+        /// Cranelift's E-Graph optimizer (constructor_simplify) triggers a Rust
+        /// panic (SIGILL) on aarch64-apple-darwin with wasmtime 41.x.
+        /// Disable optimization to avoid hitting that code path until the
+        /// upstream bug is fixed.
+        config.cranelift_opt_level(wasmtime::OptLevel::None);
 #endif
         return config;
     }
