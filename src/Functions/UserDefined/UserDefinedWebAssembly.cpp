@@ -749,7 +749,7 @@ public:
         WebAssembly::WasmCompartment * compartment,
         const ColumnsWithTypeAndName & cols,
         size_t input_rows_count,
-        ContextPtr,
+        ContextPtr context,
         StopToken stop_token) const
     {
         ProfileEventTimeIncrement<Microseconds> timer(ProfileEvents::WasmTotalExecuteMicroseconds);
@@ -758,6 +758,66 @@ public:
             return result_type->createColumn();
 
         const uint32_t num_cols = static_cast<uint32_t>(cols.size());
+
+
+        // ── Batch splitting: avoid WASM OOM for large non-const column data ──
+        //
+        // Estimate total bytes that would be serialised for non-const columns.
+        // If it exceeds 12.5% of the WASM memory limit, split into sub-batches
+        // and recurse. Const columns are passed through unchanged so any
+        // address-keyed in-module state (e.g. PreparedGeometry caches keyed on
+        // column buffer address) remains valid across sub-batch calls.
+        //
+        // 12.5% is conservative: the remainder covers WASM code/stack/globals,
+        // per-row working heap (GEOS objects, STR-tree), row-size variance, and
+        // heap fragmentation from prior alloc/free cycles.
+        {
+            const size_t wasm_memory_limit = context->getSettingsRef()[Setting::webassembly_udf_max_memory];
+            const size_t budget = wasm_memory_limit > 0
+                ? (wasm_memory_limit / 8)
+                : (128ULL * 1024 * 1024);
+
+            size_t total_nonconst_bytes = 0;
+            for (uint32_t ci = 0; ci < num_cols; ++ci)
+            {
+                const IColumn * col = cols[ci].column.get();
+                if (typeid_cast<const ColumnConst *>(col)) continue;
+                const ColumnNullable * nc = typeid_cast<const ColumnNullable *>(col);
+                if (nc) col = &nc->getNestedColumn();
+                if (const auto * sc = typeid_cast<const ColumnString *>(col))
+                    total_nonconst_bytes += sc->getChars().size() + input_rows_count;
+                else
+                    total_nonconst_bytes += input_rows_count * col->sizeOfValueIfFixed();
+            }
+
+            if (total_nonconst_bytes > budget && input_rows_count > 1)
+            {
+                size_t batch_rows = std::max<size_t>(1,
+                    input_rows_count * budget / total_nonconst_bytes);
+
+                MutableColumnPtr result = result_type->createColumn();
+                size_t done = 0;
+                while (done < input_rows_count)
+                {
+                    size_t cur = std::min(batch_rows, input_rows_count - done);
+                    ColumnsWithTypeAndName sub_cols;
+                    sub_cols.reserve(num_cols);
+                    for (uint32_t ci = 0; ci < num_cols; ++ci)
+                    {
+                        const auto & cwa = cols[ci];
+                        if (typeid_cast<const ColumnConst *>(cwa.column.get()))
+                            sub_cols.push_back(cwa);
+                        else
+                            sub_cols.push_back({cwa.column->cut(done, cur), cwa.type, cwa.name});
+                    }
+                    auto part = executeColumnar(compartment, sub_cols, cur, context, stop_token);
+                    result->insertRangeFrom(*part, 0, part->size());
+                    done += cur;
+                }
+                return result;
+            }
+        }
+
         auto wmm = std::make_unique<WasmMemoryManagerV01>(compartment, stop_token);
 
         // ── Manage per-column persistent buffers ─────────────────────────────
@@ -856,14 +916,35 @@ public:
             WasmMemoryGuard result_guard(wmm.get(), result_ptr);
 
             // ── Read output ──────────────────────────────────────────────────
+            MutableColumnPtr output;
             {
                 ProfileEventTimeIncrement<Microseconds> timer_de(ProfileEvents::WasmDeserializationMicroseconds);
                 auto out_view = result_guard.getMemoryView();
-                return readColumnarOutput(
+                output = readColumnarOutput(
                     {out_view.data(), out_view.size()},
                     result_type,
                     input_rows_count);
             }
+
+            // ── Free non-const column buffers ────────────────────────────────
+            // Non-const columns carry fresh data every call; their WASM buffers
+            // are never reused.  Release them now, while the mutex is still held
+            // and wmm is bound to the correct compartment.
+            //
+            // Without this, a second thread that resets active_compartment before
+            // our next sub-batch call will discard these handles without freeing
+            // them, leaking memory in this compartment's WASM heap.  12 parallel
+            // threads × 16 MB/leak × 8 sub-batches = OOM at 128 MB limit.
+            for (uint32_t ci = 0; ci < num_cols; ++ci)
+            {
+                if (col_bufs[ci].handle != 0 && col_bufs[ci].const_col == nullptr)
+                {
+                    wmm->destroyBuffer(col_bufs[ci].handle);
+                    col_bufs[ci].handle = 0;
+                }
+            }
+
+            return output;
         }
     }
 
