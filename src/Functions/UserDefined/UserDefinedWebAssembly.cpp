@@ -743,13 +743,13 @@ public:
     //
     // Per-column WASM buffers are allocated once and reused for COL_IS_CONST columns
     // when the inner ColumnPtr is the same object across calls (exact identity, O(1)).
-    // The WASM side can key any per-column cache on the buffer address; a stable
-    // address means the cache stays valid across batches without re-parsing.
+    // The WASM module can key any per-column state on the buffer address; a stable
+    // address means that state remains valid across batches without rebuilding.
     MutableColumnPtr executeColumnar(
         WebAssembly::WasmCompartment * compartment,
         const ColumnsWithTypeAndName & cols,
         size_t input_rows_count,
-        ContextPtr,
+        ContextPtr context,
         StopToken stop_token) const
     {
         ProfileEventTimeIncrement<Microseconds> timer(ProfileEvents::WasmTotalExecuteMicroseconds);
@@ -761,26 +761,72 @@ public:
         auto wmm = std::make_unique<WasmMemoryManagerV01>(compartment, stop_token);
 
         // ── Manage per-column persistent buffers ─────────────────────────────
+        // Retrieve (or create) the col_bufs vector for this compartment.
+        // Lock only for the map lookup — the compartment is exclusively ours
+        // for the rest of this call, so no further locking is needed.
+        //
+        // The map stores unique_ptr<vector> so the *vector* address is stable
+        // even if the map rehashes when another thread inserts a new compartment.
+        // Taking &map_value directly (without unique_ptr) would dangle after rehash.
+        std::vector<PerColBuf> * col_bufs_ptr;
+        {
+            std::lock_guard lock(col_state_mutex);
+            auto & entry = per_compartment_bufs[compartment];
+            if (!entry)
+                entry = std::make_unique<std::vector<PerColBuf>>();
+            col_bufs_ptr = entry.get();
+        }
+        std::vector<PerColBuf> & col_bufs = *col_bufs_ptr;
+
+        // ── Batch splitting: avoid WASM OOM for large non-const column data ──
+        //
+        // When non-const column data would exceed the budget, split the row range
+        // into smaller sub-batches.  Each sub-batch is a separate WASM call.
+        // Const column buffers persist across sub-batches so address-keyed caches
+        // inside the WASM module remain valid.  Non-const buffers are freed after
+        // each sub-batch.
+        //
+        // Budget = 12.5% of the configured WASM memory limit.
+        // The remainder covers: code segment, stack, globals, in-module working
+        // memory (allocations made during processing each row), non-uniform row
+        // sizes (average-based estimate may undercount), and heap fragmentation
+        // from accumulated small alloc/free cycles across prior invocations.
+        const size_t wasm_memory_limit = context->getSettingsRef()[Setting::webassembly_udf_max_memory];
+        const size_t WASM_BATCH_DATA_BUDGET = wasm_memory_limit > 0
+            ? (wasm_memory_limit / 8)
+            : (128ULL * 1024 * 1024);
+
+        size_t total_nonconst_bytes = 0;
+        for (uint32_t ci = 0; ci < num_cols; ++ci)
+        {
+            const IColumn * col = cols[ci].column.get();
+            if (typeid_cast<const ColumnConst *>(col)) continue;
+            const ColumnNullable * nc = typeid_cast<const ColumnNullable *>(col);
+            if (nc) col = &nc->getNestedColumn();
+            if (const auto * sc = typeid_cast<const ColumnString *>(col))
+                total_nonconst_bytes += sc->getChars().size() + input_rows_count;
+            else
+                total_nonconst_bytes += input_rows_count * col->sizeOfValueIfFixed();
+        }
+
+        size_t batch_rows = input_rows_count;
+        if (total_nonconst_bytes > WASM_BATCH_DATA_BUDGET && input_rows_count > 1)
+            batch_rows = std::max<size_t>(1,
+                input_rows_count * WASM_BATCH_DATA_BUDGET / total_nonconst_bytes);
+
+        // Core per-batch logic: serialise batch_cols/nrows into WASM, call, deserialise.
+        // col_bufs state (const column handles) persists between sub-batch calls so any
+        // address-keyed state inside the WASM module remains valid for the entire query.
+        auto runBatch = [&](const ColumnsWithTypeAndName & batch_cols, uint32_t nrows) -> MutableColumnPtr
         {
             ProfileEventTimeIncrement<Microseconds> timer_ser(ProfileEvents::WasmSerializationMicroseconds);
-            std::lock_guard lock(col_state_mutex);
 
-            // New compartment (new query): discard stale handles.
-            // The old compartment's linear memory is already gone; do NOT call
-            // destroyBuffer on its handles — just forget them.
-            if (compartment != active_compartment)
-            {
-                active_compartment = compartment;
+            if (col_bufs.size() != num_cols)
                 col_bufs.assign(num_cols, PerColBuf{});
-            }
-            else if (col_bufs.size() != num_cols)
-            {
-                col_bufs.assign(num_cols, PerColBuf{});
-            }
 
             for (uint32_t ci = 0; ci < num_cols; ++ci)
             {
-                const IColumn * col = cols[ci].column.get();
+                const IColumn * col = batch_cols[ci].column.get();
                 ColumnPtr inner_col_ptr;  // set only for ColumnConst
                 bool is_const = false;
 
@@ -801,28 +847,37 @@ public:
                     continue;
 
                 bool is_nullable = typeid_cast<const ColumnNullable *>(col) != nullptr;
-                uint32_t nrows = is_const ? 1u : static_cast<uint32_t>(input_rows_count);
+                uint32_t col_nrows = is_const ? 1u : nrows;
 
-                // Allocate the new buffer FIRST so the allocator cannot hand back the
-                // same address while the old buffer is still live, then free old.
                 ColDescriptor desc{};
-                uint32_t buf_size = buildColDescriptor(col, is_const, is_nullable, nrows,
+                uint32_t buf_size = buildColDescriptor(col, is_const, is_nullable, col_nrows,
                                                        COL_BUF_HDR_BYTES, desc);
+
+                // For const columns: allocate new BEFORE freeing old so the allocator
+                // cannot reuse the same address.  A reused address could make any
+                // address-keyed state inside the WASM module treat stale data as valid.
+                // For non-const columns: free first to keep peak WASM memory bounded
+                // (no address-based state is maintained for non-const columns).
+                if (!is_const && col_bufs[ci].handle != 0)
+                {
+                    wmm->destroyBuffer(col_bufs[ci].handle);
+                    col_bufs[ci].handle = 0;
+                }
 
                 WasmPtr new_handle = wmm->createBuffer(buf_size);
                 auto buf_view = wmm->getMemoryView(new_handle);
 
                 ColBufHeader hdr{};
                 hdr.type           = desc.type;
-                hdr.num_rows       = nrows;
+                hdr.num_rows       = col_nrows;
                 hdr.null_offset    = desc.null_offset;
                 hdr.offsets_offset = desc.offsets_offset;
                 hdr.data_offset    = desc.data_offset;
                 hdr.data_size      = desc.data_size;
                 std::memcpy(buf_view.data(), &hdr, sizeof(hdr));
-                writeColData(col, is_nullable, nrows, desc, buf_view);
+                writeColData(col, is_nullable, col_nrows, desc, buf_view);
 
-                if (col_bufs[ci].handle != 0)
+                if (is_const && col_bufs[ci].handle != 0)
                     wmm->destroyBuffer(col_bufs[ci].handle);
 
                 col_bufs[ci] = PerColBuf{new_handle, inner_col_ptr};
@@ -834,9 +889,8 @@ public:
             WasmMemoryGuard call_buf = allocateInWasmMemory(wmm.get(), call_size);
             auto call_mem = call_buf.getMemoryView();
 
-            uint32_t n_rows32 = static_cast<uint32_t>(input_rows_count);
-            std::memcpy(call_mem.data(),     &n_rows32,  4);
-            std::memcpy(call_mem.data() + 4, &num_cols,  4);
+            std::memcpy(call_mem.data(),     &nrows,    4);
+            std::memcpy(call_mem.data() + 4, &num_cols, 4);
             for (uint32_t ci = 0; ci < num_cols; ++ci)
             {
                 uint64_t h = static_cast<uint64_t>(col_bufs[ci].handle);
@@ -846,7 +900,7 @@ public:
             // ── Invoke WASM ──────────────────────────────────────────────────
             auto result_ptr = compartment->invoke<WasmPtr>(
                 col_function_name,
-                {call_buf.getHandle(), static_cast<WasmSizeT>(input_rows_count)},
+                {call_buf.getHandle(), static_cast<WasmSizeT>(nrows)},
                 stop_token);
 
             if (result_ptr == 0)
@@ -856,15 +910,54 @@ public:
             WasmMemoryGuard result_guard(wmm.get(), result_ptr);
 
             // ── Read output ──────────────────────────────────────────────────
+            MutableColumnPtr result;
             {
                 ProfileEventTimeIncrement<Microseconds> timer_de(ProfileEvents::WasmDeserializationMicroseconds);
                 auto out_view = result_guard.getMemoryView();
-                return readColumnarOutput(
-                    {out_view.data(), out_view.size()},
-                    result_type,
-                    input_rows_count);
+                result = readColumnarOutput({out_view.data(), out_view.size()}, result_type, nrows);
             }
+
+            // Free non-const column buffers immediately — they carry no address-keyed
+            // state and persisting them wastes WASM heap between calls.
+            // Const column buffers remain live so any address-keyed state inside
+            // the WASM module stays valid across batches.
+            for (uint32_t ci = 0; ci < num_cols; ++ci)
+            {
+                if (!col_bufs[ci].const_col && col_bufs[ci].handle != 0)
+                {
+                    wmm->destroyBuffer(col_bufs[ci].handle);
+                    col_bufs[ci].handle = 0;
+                }
+            }
+
+            return result;
+        };
+
+        // Common fast path: data fits in one WASM call.
+        if (batch_rows >= input_rows_count)
+            return runBatch(cols, static_cast<uint32_t>(input_rows_count));
+
+        // Splitting path: slice non-const columns into sub-batches and assemble results.
+        MutableColumnPtr result = result_type->createColumn();
+        size_t done = 0;
+        while (done < input_rows_count)
+        {
+            size_t cur = std::min(batch_rows, input_rows_count - done);
+            ColumnsWithTypeAndName sub_cols;
+            sub_cols.reserve(num_cols);
+            for (uint32_t ci = 0; ci < num_cols; ++ci)
+            {
+                const auto & cwa = cols[ci];
+                if (typeid_cast<const ColumnConst *>(cwa.column.get()))
+                    sub_cols.push_back(cwa);
+                else
+                    sub_cols.push_back({cwa.column->cut(done, cur), cwa.type, cwa.name});
+            }
+            auto part = runBatch(sub_cols, static_cast<uint32_t>(cur));
+            result->insertRangeFrom(*part, 0, part->size());
+            done += cur;
         }
+        return result;
     }
 
     // executeOnBlock is required by the base class but unused for ColumnarV1
@@ -901,17 +994,22 @@ private:
 
     String col_function_name;
 
-    // Per-column persistent buffer state.
-    // Buffers survive across executeColumnar() calls within the same compartment.
-    // For COL_IS_CONST columns the buffer is reused when the inner ColumnPtr matches
-    // (exact shared_ptr identity — no hashing, no false positives).  Non-const
-    // columns always get a fresh buffer since their data changes every batch.
+    // Per-compartment persistent column buffer state.
     //
-    // When the compartment changes (new query), stale handles are discarded without
-    // calling destroyBuffer — the old compartment's linear memory is already gone.
-    mutable std::mutex              col_state_mutex;  // guards active_compartment + col_bufs
-    mutable WebAssembly::WasmCompartment * active_compartment = nullptr;
-    mutable std::vector<PerColBuf>  col_bufs;
+    // Each compartment runs exclusively on one thread at a time (pool guarantee),
+    // so per_compartment_bufs[compartment] needs no locking once retrieved.
+    // The mutex protects only the map itself (insertions / lookups).
+    //
+    // COL_IS_CONST column buffers survive across calls within the same compartment
+    // so any address-keyed state inside the WASM module remains valid.
+    // Non-const column buffers are freed after each call (same lifetime as old ABI).
+    //
+    // Stale entries for retired compartments remain until the function is destroyed;
+    // the compartment pool is fixed-size so the map stays bounded.
+    mutable std::mutex col_state_mutex;  // guards per_compartment_bufs map only
+    mutable std::unordered_map<WebAssembly::WasmCompartment *,
+                               std::unique_ptr<std::vector<PerColBuf>>>
+        per_compartment_bufs;
 };
 
 std::unique_ptr<UserDefinedWebAssemblyFunction> UserDefinedWebAssemblyFunction::create(
@@ -1152,7 +1250,7 @@ private:
         // prevents OOM when a constant large geometry is materialized N times in the buffer.
         const size_t wasm_linear_memory = compartment->getLinearMemorySize();
         const size_t input_budget = (fixed_block_size == 0 && wasm_linear_memory > 0)
-            ? wasm_linear_memory / 2  // 50% for input, leave room for GEOS heap
+            ? wasm_linear_memory / 2  // 50% for input, leave room for in-module working memory
             : 0;
 
         size_t batch_start = 0;
