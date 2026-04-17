@@ -172,17 +172,20 @@ bool SpatialRTreeJoin::identifyGeomColumns(
         return false;
 
     const ActionsDAG::Node * fn = outputs[0];
-    if (fn->type != ActionsDAG::ActionType::FUNCTION || fn->children.size() != 2)
+    if (fn->type != ActionsDAG::ActionType::FUNCTION || fn->children.size() < 2)
         return false;
 
-    /// Walk a node chain (e.g. CAST wrappers) down to the first INPUT node.
+    /// Walk a node chain down to the first INPUT node.
+    /// Only follows ALIAS nodes; stops at FUNCTION nodes to avoid treating
+    /// expressions like st_expand_col(b, c) as a plain column reference.
+    /// (If the predicate arg is wrapped in a computation, fall back to hash join.)
     auto find_input = [](const ActionsDAG::Node * node) -> const ActionsDAG::Node *
     {
         while (node)
         {
             if (node->type == ActionsDAG::ActionType::INPUT)
                 return node;
-            if (node->children.empty())
+            if (node->type != ActionsDAG::ActionType::ALIAS || node->children.empty())
                 return nullptr;
             node = node->children[0];
         }

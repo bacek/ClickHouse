@@ -35,9 +35,10 @@ namespace DB
 ///   expression (the original WASM predicate) for an exact spatial check. Only
 ///   matching rows are emitted. No WASM call is made for pairs eliminated by bbox.
 ///
-/// Limitations (v1):
+/// Limitations:
 ///   - INNER JOIN only (getNonJoinedBlocks returns nullptr)
-///   - 2-argument predicates only (st_dwithin with distance arg: v2)
+///   - Both predicate arguments must be direct column references (no function wrapping).
+///     Expressions like st_expand_col(b, c) as an argument fall back to hash join.
 ///   - WKB geometry types 1-7 (Point/LineString/Polygon/Multi*/GeometryCollection)
 class SpatialRTreeJoin : public IJoin
 {
@@ -66,7 +67,8 @@ public:
     }
 
     /// Try to identify left/right geometry column names from the spatial predicate
-    /// ActionsDAG. Returns false if detection fails (caller falls back to HashJoin).
+    /// ActionsDAG. Returns false if detection fails (e.g. either argument is wrapped
+    /// in a function rather than being a direct column reference).
     static bool identifyGeomColumns(
         const ExpressionActionsPtr & expr,
         const Block & right_hdr,
