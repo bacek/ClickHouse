@@ -123,6 +123,13 @@ ExpressionSide getExpressionSide(
 
 using JoinConditionParts = std::vector<ActionsDAG>;
 
+struct ExtractedJoinConditions
+{
+    JoinConditionParts equality;
+    JoinConditionParts spatial;
+    bool trivial_filter = false;
+};
+
 const ActionsDAG::Node & createResultPredicate(
     ActionsDAG & filter_dag,
     const ActionsDAG::Node * original_predicate,
@@ -139,7 +146,7 @@ const ActionsDAG::Node & createResultPredicate(
 };
 
 
-std::pair<JoinConditionParts, bool> extractActionsForJoinCondition(
+ExtractedJoinConditions extractActionsForJoinCondition(
     ActionsDAG & filter_dag,
     const std::string & filter_name,
     const Names & left_stream_available_columns,
@@ -164,7 +171,8 @@ std::pair<JoinConditionParts, bool> extractActionsForJoinCondition(
     /// Extract all conjuncts from filter expression
     auto conjuncts_list = getConjunctsList(predicate);
 
-    JoinConditionParts result;
+    JoinConditionParts equality_parts;
+    JoinConditionParts spatial_parts;
     std::unordered_set<const ActionsDAG::Node *> conjuncts_to_replace;
     ActionsDAG::NodeRawConstPtrs rejected_conjuncts;
     rejected_conjuncts.reserve(conjuncts_list.size());
@@ -188,16 +196,64 @@ std::pair<JoinConditionParts, bool> extractActionsForJoinCondition(
             if ((lhs_side == ExpressionSide::LEFT && rhs_side == ExpressionSide::RIGHT)
              || (lhs_side == ExpressionSide::RIGHT && rhs_side == ExpressionSide::LEFT))
             {
-                result.emplace_back(ActionsDAG::cloneSubDAG({ conjunct }, true));
+                equality_parts.emplace_back(ActionsDAG::cloneSubDAG({ conjunct }, true));
                 conjuncts_to_replace.insert(conjunct);
                 continue;
             }
         }
+
+        bool is_spatial = conjunct->type == ActionsDAG::ActionType::FUNCTION
+            && conjunct->function_base
+            && conjunct->function_base->isSpatialPredicate();
+        if (is_spatial)
+        {
+            /// SpatialRTreeJoin requires each argument to be a direct column reference
+            /// (only ALIAS→INPUT chains; no FUNCTION wrapping). If any arg is wrapped,
+            /// HashJoin fallback with INNER+empty-keys+residual doesn't do a cross product,
+            /// so we must leave such predicates in the WHERE filter instead.
+            auto arg_resolves_to_input = [](const ActionsDAG::Node * node) -> bool
+            {
+                while (node)
+                {
+                    if (node->type == ActionsDAG::ActionType::INPUT)
+                        return true;
+                    if (node->type != ActionsDAG::ActionType::ALIAS || node->children.empty())
+                        return false;
+                    node = node->children[0];
+                }
+                return false;
+            };
+            bool all_args_direct = std::all_of(
+                conjunct->children.begin(), conjunct->children.end(), arg_resolves_to_input);
+            if (!all_args_direct)
+            {
+                rejected_conjuncts.push_back(conjunct);
+                continue;
+            }
+
+            /// Check that the predicate inputs span both tables.
+            auto inputs = getExpressionInputs(conjunct);
+            bool has_left = false;
+            bool has_right = false;
+            for (const auto * inp : inputs)
+            {
+                has_left  |= left_stream_allowed_nodes.contains(inp);
+                has_right |= right_stream_allowed_nodes.contains(inp);
+            }
+            if (has_left && has_right)
+            {
+                spatial_parts.emplace_back(ActionsDAG::cloneSubDAG({ conjunct }, true));
+                conjuncts_to_replace.insert(conjunct);
+                continue;
+            }
+        }
+
         rejected_conjuncts.push_back(conjunct);
     }
 
     const auto trivial_filter = rejected_conjuncts.empty();
-    if (!result.empty())
+    JoinConditionParts result = std::move(equality_parts);
+    if (!result.empty() || !spatial_parts.empty())
     {
         /// There's a non-empty list of extracted condition parts.
         /// After JOIN step these equalities will always evaluate to true.
@@ -229,7 +285,7 @@ std::pair<JoinConditionParts, bool> extractActionsForJoinCondition(
         filter_dag.removeUnusedActions(/*allow_remove_inputs=*/false);
     }
 
-    return { std::move(result), trivial_filter };
+    return { std::move(result), std::move(spatial_parts), trivial_filter };
 }
 
 }
@@ -291,21 +347,25 @@ size_t tryMergeFilterIntoJoinCondition(QueryPlan::Node * parent_node, QueryPlan:
     auto right_stream_available_columns = get_available_columns(*right_stream_header);
 
     auto & filter_dag = filter_step->getExpression();
-    auto [equality_predicates, trivial_filter] = extractActionsForJoinCondition(
+    auto [equality_predicates, spatial_predicates, trivial_filter] = extractActionsForJoinCondition(
         filter_dag,
         filter_step->getFilterColumnName(),
         left_stream_available_columns,
         right_stream_available_columns);
 
-    if (equality_predicates.empty())
+    if (equality_predicates.empty() && spatial_predicates.empty())
         return 0;
 
     for (auto && predicate : equality_predicates)
-    {
         join_step->addConditions(std::move(predicate));
-    }
 
-    if (kind == JoinKind::Cross || kind == JoinKind::Comma)
+    for (auto && predicate : spatial_predicates)
+        join_step->addSpatialCondition(std::move(predicate));
+
+    /// Equality predicates upgrade CROSS→INNER immediately.
+    /// Spatial predicates leave kind as-is; buildPhysicalJoinImpl will upgrade it
+    /// once it finds the spatial predicate in residual_filter.
+    if (!equality_predicates.empty() && (kind == JoinKind::Cross || kind == JoinKind::Comma))
         join_operator.kind = JoinKind::Inner;
 
     /// Remove FilterStep if filter expression is always true

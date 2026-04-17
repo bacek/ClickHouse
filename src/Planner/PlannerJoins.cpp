@@ -1264,19 +1264,11 @@ std::shared_ptr<IJoin> chooseJoinAlgorithm(
     SharedHeader right_table_expression_header,
     const JoinAlgorithmParams & params)
 {
-    if (table_join->getMixedJoinExpression()
-        && !table_join->isEnabledAlgorithm(JoinAlgorithm::HASH)
-        && !table_join->isEnabledAlgorithm(JoinAlgorithm::PARALLEL_HASH)
-        && !table_join->isEnabledAlgorithm(JoinAlgorithm::GRACE_HASH))
-    {
-        throw Exception(ErrorCodes::NOT_IMPLEMENTED,
-            "JOIN with mixed conditions supports only hash join or grace hash join");
-    }
-
     /// Spatial predicate join: INNER JOIN with no equijoin keys and a single
     /// ON clause whose entire condition is a WASM spatial predicate
     /// (is_spatial_predicate=1 in CREATE FUNCTION settings).
     /// Use an R-tree index on the right geometry column to skip bbox-disjoint pairs.
+    /// Must be checked BEFORE the mixed-conditions hash-only guard below.
     if (table_join->getMixedJoinExpression()
         && table_join->kind() == JoinKind::Inner
         && table_join->getClauses().size() == 1
@@ -1287,14 +1279,22 @@ std::shared_ptr<IJoin> chooseJoinAlgorithm(
         if (dag_outputs.size() == 1
             && dag_outputs[0]->type == ActionsDAG::ActionType::FUNCTION
             && dag_outputs[0]->function_base
-            && dag_outputs[0]->function_base->isSpatialPredicate()
-            && dag_outputs[0]->children.size() == 2)
+            && dag_outputs[0]->function_base->isSpatialPredicate())
         {
             String left_col;
             String right_col;
             if (SpatialRTreeJoin::identifyGeomColumns(mixed, *right_table_expression_header, left_col, right_col))
                 return std::make_shared<SpatialRTreeJoin>(table_join, right_table_expression_header);
         }
+    }
+
+    if (table_join->getMixedJoinExpression()
+        && !table_join->isEnabledAlgorithm(JoinAlgorithm::HASH)
+        && !table_join->isEnabledAlgorithm(JoinAlgorithm::PARALLEL_HASH)
+        && !table_join->isEnabledAlgorithm(JoinAlgorithm::GRACE_HASH))
+    {
+        throw Exception(ErrorCodes::NOT_IMPLEMENTED,
+            "JOIN with mixed conditions supports only hash join or grace hash join");
     }
 
     /// JOIN with Join engine.

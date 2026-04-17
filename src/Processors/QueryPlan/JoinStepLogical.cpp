@@ -1092,11 +1092,11 @@ static QueryPlanNode buildPhysicalJoinImpl(
                 if (isInner(join_operator.kind) && join_expression.size() == 1)
                 {
                     const auto * node = join_expression[0].getNode();
+                    /// Spatial predicates (st_within, st_contains, st_intersects, …) route to SpatialRTreeJoin.
                     is_spatial_predicate_join = node
                         && node->type == ActionsDAG::ActionType::FUNCTION
                         && node->function_base
-                        && node->function_base->isSpatialPredicate()
-                        && node->children.size() == 2;
+                        && node->function_base->isSpatialPredicate();
                 }
 
                 if (is_spatial_predicate_join)
@@ -1175,6 +1175,47 @@ static QueryPlanNode buildPhysicalJoinImpl(
     }
 
     join_operator.residual_filter.append_range(join_expression);
+
+    /// Auto-rewrite: a CROSS JOIN (or comma join) whose residual filter contains
+    /// a spatial predicate referencing columns from BOTH tables can be promoted to
+    /// an INNER JOIN handled by SpatialRTreeJoin.
+    ///
+    /// Single-table residual conditions (e.g. st_intersects(CONST, z.col)) are
+    /// already pushed to the appropriate scan by earlier query-tree optimisations,
+    /// so they do not appear here.  Any remaining mixed conditions become post-join
+    /// filters via the normal residual path.
+    if (isCrossOrComma(join_operator.kind)
+        && join_operator.strictness == JoinStrictness::All
+        && !join_operator.residual_filter.empty())
+    {
+        auto spatial_it = std::find_if(
+            join_operator.residual_filter.begin(),
+            join_operator.residual_filter.end(),
+            [](const JoinActionRef & ref) -> bool
+            {
+                const auto * node = ref.getNode();
+                if (!node || node->type != ActionsDAG::ActionType::FUNCTION
+                    || !node->function_base || !node->function_base->isSpatialPredicate())
+                    return false;
+                /// Must reference columns from both the left (bit 0) and right (bit 1) tables.
+                auto src = ref.getSourceRelations();
+                return src.test(0) && src.test(1);
+            });
+
+        if (spatial_it != join_operator.residual_filter.end())
+        {
+            JoinActionRef spatial_pred = *spatial_it;
+            join_operator.residual_filter.erase(spatial_it);
+            join_operator.kind = JoinKind::Inner;
+            table_join_clauses.emplace_back(); /// empty-key clause for SpatialRTreeJoin
+
+            auto spatial_dag = JoinExpressionActions::getSubDAG(std::views::single(spatial_pred));
+            ExpressionActionsPtr & mixed_join_expression = table_join->getMixedJoinExpression();
+            mixed_join_expression = std::make_shared<ExpressionActions>(
+                std::move(spatial_dag), optimization_settings.actions_settings);
+        }
+    }
+
     JoinActionRef residual_filter_condition = concatConditions(join_operator.residual_filter);
     std::unordered_map<const ActionsDAG::Node *, const ActionsDAG::Node *> actions_after_join_fold;
     for (const auto * action : actions_after_join)
@@ -1218,14 +1259,17 @@ static QueryPlanNode buildPhysicalJoinImpl(
         }
     }
 
+    /// Returns true for a spatial predicate that references both join tables.
+    /// Requires cross-table span so that single-table spatial conditions (e.g.
+    /// st_intersects(CONST, right_col)) are not mistakenly treated as join predicates.
     auto is_spatial_predicate_residual = [](const JoinActionRef & ref) -> bool
     {
         const auto * node = ref.getNode();
-        return node
-            && node->type == ActionsDAG::ActionType::FUNCTION
-            && node->function_base
-            && node->function_base->isSpatialPredicate()
-            && node->children.size() == 2;
+        if (!node || node->type != ActionsDAG::ActionType::FUNCTION
+            || !node->function_base || !node->function_base->isSpatialPredicate())
+            return false;
+        auto src = ref.getSourceRelations();
+        return src.test(0) && src.test(1);
     };
 
     if (residual_filter_condition && (is_disjunctive_condition || !canPushDownFromOn(join_operator) || is_spatial_predicate_residual(residual_filter_condition)))
@@ -1687,6 +1731,14 @@ void JoinStepLogical::addConditions(ActionsDAG actions_dag)
     expression_actions.getActionsDAG()->mergeNodes(std::move(actions_dag), &conditions);
     for (const auto * node : conditions)
         join_operator.expression.emplace_back(node, expression_actions);
+}
+
+void JoinStepLogical::addSpatialCondition(ActionsDAG actions_dag)
+{
+    ActionsDAG::NodeRawConstPtrs conditions;
+    expression_actions.getActionsDAG()->mergeNodes(std::move(actions_dag), &conditions);
+    for (const auto * node : conditions)
+        join_operator.residual_filter.emplace_back(node, expression_actions);
 }
 
 void registerJoinStep(QueryPlanStepRegistry & registry)

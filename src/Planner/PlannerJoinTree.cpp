@@ -2221,11 +2221,11 @@ JoinTreeQueryPlan buildQueryPlanForJoinNodeLegacy(
             if (!join_clauses_and_actions.residual_join_expressions_actions)
                 return false;
             const auto & outputs = join_clauses_and_actions.residual_join_expressions_actions->getOutputs();
+            /// Allow 2-arg (st_within, …) and 3-arg (st_dwithin) spatial predicates.
             return outputs.size() == 1
                 && outputs[0]->type == ActionsDAG::ActionType::FUNCTION
                 && outputs[0]->function_base
-                && outputs[0]->function_base->isSpatialPredicate()
-                && outputs[0]->children.size() == 2;
+                && outputs[0]->function_base->isSpatialPredicate();
         };
         const bool is_spatial_join = is_spatial_predicate_join();
 
