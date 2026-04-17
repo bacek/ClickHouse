@@ -326,22 +326,23 @@ JoinResultPtr SpatialRTreeJoin::joinBlock(Block left_block)
         candidate_block.insert({std::move(mutable_col), right_col_def.type, right_col_def.name});
     }
 
-    /// Apply exact spatial predicate (WASM call via ExpressionActions).
-    table_join->getMixedJoinExpression()->execute(candidate_block);
+    /// Apply the spatial predicate on a scratch block so that ExpressionActions
+    /// does not erase the geometry input columns from candidate_block.
+    /// (execute() removes INPUT-node columns from the block it receives.)
+    Block predicate_block;
+    predicate_block.insert(candidate_block.getByName(left_geom_col));
+    predicate_block.insert(candidate_block.getByName(right_geom_col));
+    table_join->getMixedJoinExpression()->execute(predicate_block);
 
     /// Extract UInt8 filter column produced by the predicate.
-    const auto & filter_col_with_type = candidate_block.getByName(filter_col_name);
-    const auto & filter_col = *filter_col_with_type.column;
+    const auto & filter_col = *predicate_block.getByName(filter_col_name).column;
     const size_t total = candidate_block.rows();
 
     IColumn::Filter mask(total);
     for (size_t i = 0; i < total; ++i)
         mask[i] = filter_col.getBool(i) ? 1 : 0;
 
-    /// Remove the predicate output column — it is not part of the join schema.
-    candidate_block.erase(filter_col_name);
-
-    /// Apply filter to all remaining columns.
+    /// Apply filter to all columns of the original (intact) candidate block.
     for (auto & col : candidate_block)
         col.column = col.column->filter(mask, -1);
 

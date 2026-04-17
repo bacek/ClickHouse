@@ -1085,9 +1085,32 @@ static QueryPlanNode buildPhysicalJoinImpl(
                     throw Exception(ErrorCodes::INVALID_JOIN_ON_EXPRESSION, "Cannot determine join keys in JOIN ON expression {}",
                         formatJoinCondition(join_expression));
 
-                join_operator.kind = JoinKind::Cross;
-                join_operator.residual_filter.append_range(join_expression);
-                join_expression.clear();
+                /// If the sole condition is a 2-argument spatial predicate, keep the join as
+                /// INNER with an empty-key clause so that chooseJoinAlgorithm() can route it
+                /// to SpatialRTreeJoin.  Otherwise fall through to the normal CROSS conversion.
+                bool is_spatial_predicate_join = false;
+                if (isInner(join_operator.kind) && join_expression.size() == 1)
+                {
+                    const auto * node = join_expression[0].getNode();
+                    is_spatial_predicate_join = node
+                        && node->type == ActionsDAG::ActionType::FUNCTION
+                        && node->function_base
+                        && node->function_base->isSpatialPredicate()
+                        && node->children.size() == 2;
+                }
+
+                if (is_spatial_predicate_join)
+                {
+                    /// Add an empty-key clause; the predicate stays in join_expression
+                    /// and will be moved to residual_filter + mixed_join_expression below.
+                    table_join_clauses.emplace_back();
+                }
+                else
+                {
+                    join_operator.kind = JoinKind::Cross;
+                    join_operator.residual_filter.append_range(join_expression);
+                    join_expression.clear();
+                }
             }
         }
     }
@@ -1195,7 +1218,17 @@ static QueryPlanNode buildPhysicalJoinImpl(
         }
     }
 
-    if (residual_filter_condition && (is_disjunctive_condition || !canPushDownFromOn(join_operator)))
+    auto is_spatial_predicate_residual = [](const JoinActionRef & ref) -> bool
+    {
+        const auto * node = ref.getNode();
+        return node
+            && node->type == ActionsDAG::ActionType::FUNCTION
+            && node->function_base
+            && node->function_base->isSpatialPredicate()
+            && node->children.size() == 2;
+    };
+
+    if (residual_filter_condition && (is_disjunctive_condition || !canPushDownFromOn(join_operator) || is_spatial_predicate_residual(residual_filter_condition)))
     {
         auto residual_filter_dag = JoinExpressionActions::getSubDAG(std::views::single(residual_filter_condition));
         ExpressionActionsPtr & mixed_join_expression = table_join->getMixedJoinExpression();

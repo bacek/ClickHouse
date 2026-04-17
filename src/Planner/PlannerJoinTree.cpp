@@ -2211,6 +2211,24 @@ JoinTreeQueryPlan buildQueryPlanForJoinNodeLegacy(
 
         auto & table_join_clauses = table_join->getClauses();
 
+        /// Detect pure spatial-predicate join: single clause, no equijoin keys, residual is a
+        /// 2-argument spatial predicate function.  When true we skip the CROSS-JOIN rewrite so
+        /// that chooseJoinAlgorithm() can route it to SpatialRTreeJoin.
+        auto is_spatial_predicate_join = [&]() -> bool
+        {
+            if (join_kind != JoinKind::Inner || join_clauses.size() != 1)
+                return false;
+            if (!join_clauses_and_actions.residual_join_expressions_actions)
+                return false;
+            const auto & outputs = join_clauses_and_actions.residual_join_expressions_actions->getOutputs();
+            return outputs.size() == 1
+                && outputs[0]->type == ActionsDAG::ActionType::FUNCTION
+                && outputs[0]->function_base
+                && outputs[0]->function_base->isSpatialPredicate()
+                && outputs[0]->children.size() == 2;
+        };
+        const bool is_spatial_join = is_spatial_predicate_join();
+
         for (const auto & join_clause : join_clauses)
         {
             table_join_clauses.emplace_back();
@@ -2221,13 +2239,15 @@ JoinTreeQueryPlan buildQueryPlanForJoinNodeLegacy(
             size_t join_clause_key_nodes_size = join_clause_left_key_nodes.size();
             chassert(join_clause_key_nodes_size == join_clause_right_key_nodes.size());
 
-            if (join_clause_key_nodes_size == 0 && !can_move_out_residuals)
+            if (join_clause_key_nodes_size == 0 && !can_move_out_residuals && !is_spatial_join)
                 throw Exception(ErrorCodes::INVALID_JOIN_ON_EXPRESSION, "Cannot determine join keys in {}", join_node.formatASTForErrorMessage());
 
             /// If there are no keys, but only conditions that cannot be used as keys, then it is a cross join.
             /// Example: SELECT * FROM t1 JOIN t2 ON t1.x > t2.y
             /// Same as: SELECT * FROM t1 CROSS JOIN t2 WHERE t1.x > t2.y
-            if (join_clause_key_nodes_size == 0 && can_move_out_residuals)
+            /// Exception: if the condition is a spatial predicate, keep it as INNER JOIN and let
+            /// SpatialRTreeJoin handle it via the mixed join expression path.
+            if (join_clause_key_nodes_size == 0 && can_move_out_residuals && !is_spatial_join)
             {
                 table_join->getTableJoin().kind = JoinKind::Cross;
                 table_join->setIsJoinWithConstant(true);
@@ -2303,7 +2323,7 @@ JoinTreeQueryPlan buildQueryPlanForJoinNodeLegacy(
             }
         }
 
-        if (!can_move_out_residuals && join_clauses_and_actions.residual_join_expressions_actions)
+        if ((!can_move_out_residuals || is_spatial_join) && join_clauses_and_actions.residual_join_expressions_actions)
         {
             /// Let join algorithm handle residual conditions
             ExpressionActionsPtr & mixed_join_expression = table_join->getMixedJoinExpression();
