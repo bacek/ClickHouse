@@ -1081,15 +1081,9 @@ static QueryPlanNode buildPhysicalJoinImpl(
 
             if (!is_disjunctive_condition)
             {
-                if (!can_convert_to_cross)
-                    throw Exception(ErrorCodes::INVALID_JOIN_ON_EXPRESSION, "Cannot determine join keys in JOIN ON expression {}",
-                        formatJoinCondition(join_expression));
-
-                /// If the sole condition is a 2-argument spatial predicate, keep the join as
-                /// INNER with an empty-key clause so that chooseJoinAlgorithm() can route it
-                /// to SpatialRTreeJoin.  Otherwise fall through to the normal CROSS conversion.
+                /// Check if this is a spatial predicate join (SpatialRTreeJoin handles INNER and LEFT).
                 bool is_spatial_predicate_join = false;
-                if (isInner(join_operator.kind) && join_expression.size() == 1)
+                if ((isInner(join_operator.kind) || isLeft(join_operator.kind)) && join_expression.size() == 1)
                 {
                     const auto * node = join_expression[0].getNode();
                     /// Spatial predicates (st_within, st_contains, st_intersects, …) route to SpatialRTreeJoin.
@@ -1098,6 +1092,10 @@ static QueryPlanNode buildPhysicalJoinImpl(
                         && node->function_base
                         && node->function_base->isSpatialPredicate();
                 }
+
+                if (!can_convert_to_cross && !is_spatial_predicate_join)
+                    throw Exception(ErrorCodes::INVALID_JOIN_ON_EXPRESSION, "Cannot determine join keys in JOIN ON expression {}",
+                        formatJoinCondition(join_expression));
 
                 if (is_spatial_predicate_join)
                 {

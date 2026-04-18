@@ -1270,7 +1270,7 @@ std::shared_ptr<IJoin> chooseJoinAlgorithm(
     /// Use an R-tree index on the right geometry column to skip bbox-disjoint pairs.
     /// Must be checked BEFORE the mixed-conditions hash-only guard below.
     if (table_join->getMixedJoinExpression()
-        && table_join->kind() == JoinKind::Inner
+        && (table_join->kind() == JoinKind::Inner || table_join->kind() == JoinKind::Left)
         && table_join->getClauses().size() == 1
         && table_join->getClauses().front().key_names_left.empty())
     {

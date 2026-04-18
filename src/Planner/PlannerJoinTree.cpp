@@ -2073,7 +2073,8 @@ JoinTreeQueryPlan buildQueryPlanForJoinNodeLegacy(
 
         can_move_out_residuals = join_clauses_and_actions.join_clauses.size() == 1
             && join_strictness == JoinStrictness::All
-            && (join_kind == JoinKind::Inner || join_kind == JoinKind::Cross || join_kind == JoinKind::Comma)
+            && (join_kind == JoinKind::Inner || join_kind == JoinKind::Cross || join_kind == JoinKind::Comma
+                || join_kind == JoinKind::Left)
             && (right_pre_filters.empty() || FilterStep::canUseType(right_pre_filters[0]->result_type))
             && (left_pre_filters.empty() || FilterStep::canUseType(left_pre_filters[0]->result_type));
 
@@ -2216,7 +2217,7 @@ JoinTreeQueryPlan buildQueryPlanForJoinNodeLegacy(
         /// that chooseJoinAlgorithm() can route it to SpatialRTreeJoin.
         auto is_spatial_predicate_join = [&]() -> bool
         {
-            if (join_kind != JoinKind::Inner || join_clauses.size() != 1)
+            if ((join_kind != JoinKind::Inner && join_kind != JoinKind::Left) || join_clauses.size() != 1)
                 return false;
             if (!join_clauses_and_actions.residual_join_expressions_actions)
                 return false;
