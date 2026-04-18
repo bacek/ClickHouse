@@ -290,14 +290,70 @@ bool SpatialRTreeJoin::addBlockToJoin(const Block & block, bool /*check_limits*/
 JoinResultPtr SpatialRTreeJoin::joinBlock(Block left_block)
 {
     const size_t left_rows = left_block.rows();
-    if (left_rows == 0 || total_right_rows == 0)
+    const bool is_left_join = table_join->kind() == JoinKind::Left;
+
+    /// Build an empty-row block (left cols + nullable-default right cols) for LEFT JOIN fallback.
+    auto makeEmptySchema = [&](Block & base) -> Block
     {
-        /// Return empty block with correct schema: left cols + right cols.
-        Block empty = left_block.cloneEmpty();
+        Block result = base.cloneEmpty();
         for (const auto & col : *right_header)
-            if (!empty.has(col.name))
-                empty.insert(col.cloneEmpty());
-        return IJoinResult::createFromBlock(std::move(empty));
+            if (!result.has(col.name))
+                result.insert(col.cloneEmpty());
+        return result;
+    };
+
+    /// Append unmatched left rows (NULLs on right) to result for LEFT JOIN.
+    /// left_matched[li] == true means left row li had at least one matching right row.
+    auto appendUnmatched = [&](Block & result, const std::vector<bool> & left_matched)
+    {
+        std::vector<size_t> unmatched;
+        for (size_t li = 0; li < left_rows; ++li)
+            if (!left_matched[li])
+                unmatched.push_back(li);
+
+        if (unmatched.empty())
+            return;
+
+        const size_t n = unmatched.size();
+        for (auto & dst_col : result)
+        {
+            auto mut = dst_col.column->assumeMutable();
+            if (left_block.has(dst_col.name))
+            {
+                const auto & src = *left_block.getByName(dst_col.name).column;
+                for (size_t li : unmatched)
+                    mut->insertFrom(src, li);
+            }
+            else
+            {
+                for (size_t i = 0; i < n; ++i)
+                    mut->insertDefault();
+            }
+            dst_col.column = std::move(mut);
+        }
+    };
+
+    if (left_rows == 0)
+        return IJoinResult::createFromBlock(makeEmptySchema(left_block));
+
+    if (total_right_rows == 0)
+    {
+        if (!is_left_join)
+            return IJoinResult::createFromBlock(makeEmptySchema(left_block));
+
+        /// LEFT JOIN with no right rows: emit all left rows with NULL right cols.
+        Block result = makeEmptySchema(left_block);
+        for (auto & dst_col : result)
+        {
+            auto mut = dst_col.column->assumeMutable();
+            if (left_block.has(dst_col.name))
+                mut->insertRangeFrom(*left_block.getByName(dst_col.name).column, 0, left_rows);
+            else
+                for (size_t i = 0; i < left_rows; ++i)
+                    mut->insertDefault();
+            dst_col.column = std::move(mut);
+        }
+        return IJoinResult::createFromBlock(std::move(result));
     }
 
     const IColumn & left_geom = *left_block.getByName(left_geom_col).column;
@@ -327,11 +383,14 @@ JoinResultPtr SpatialRTreeJoin::joinBlock(Block left_block)
 
     if (candidates.empty())
     {
-        Block empty = left_block.cloneEmpty();
-        for (const auto & col : *right_header)
-            if (!empty.has(col.name))
-                empty.insert(col.cloneEmpty());
-        return IJoinResult::createFromBlock(std::move(empty));
+        if (!is_left_join)
+            return IJoinResult::createFromBlock(makeEmptySchema(left_block));
+
+        /// LEFT JOIN with no bbox candidates: all left rows unmatched.
+        Block result = makeEmptySchema(left_block);
+        std::vector<bool> none_matched(left_rows, false);
+        appendUnmatched(result, none_matched);
+        return IJoinResult::createFromBlock(std::move(result));
     }
 
     const size_t n_cand = candidates.size();
@@ -381,9 +440,20 @@ JoinResultPtr SpatialRTreeJoin::joinBlock(Block left_block)
     for (size_t i = 0; i < total; ++i)
         mask[i] = filter_col.getBool(i) ? 1 : 0;
 
+    /// For LEFT JOIN, track which left rows had at least one match.
+    std::vector<bool> left_matched(is_left_join ? left_rows : 0, false);
+    if (is_left_join)
+        for (size_t i = 0; i < total; ++i)
+            if (mask[i])
+                left_matched[candidates[i].left_row] = true;
+
     /// Apply filter to all columns of the original (intact) candidate block.
     for (auto & col : candidate_block)
         col.column = col.column->filter(mask, -1);
+
+    /// Append unmatched left rows (with NULL right cols) for LEFT JOIN.
+    if (is_left_join)
+        appendUnmatched(candidate_block, left_matched);
 
     return IJoinResult::createFromBlock(std::move(candidate_block));
 }
