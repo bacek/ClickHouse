@@ -163,7 +163,9 @@ bool SpatialRTreeJoin::identifyGeomColumns(
     const ExpressionActionsPtr & expr,
     const Block & right_hdr,
     String & out_left_col,
-    String & out_right_col)
+    String & out_right_col,
+    int expand_arg_index,
+    double & out_bbox_expand)
 {
     const auto & dag = expr->getActionsDAG();
     const auto & outputs = dag.getOutputs();
@@ -213,20 +215,46 @@ bool SpatialRTreeJoin::identifyGeomColumns(
         return false;
     }
 
+    /// Extract the constant distance value from the designated argument index.
+    /// If it is not a compile-time constant we fall back to hash join (returning false)
+    /// to avoid false negatives in the bbox pre-filter.
+    out_bbox_expand = 0.0;
+    if (expand_arg_index >= 0)
+    {
+        auto idx = static_cast<size_t>(expand_arg_index);
+        if (idx >= fn->children.size())
+            return false;
+        const auto * dist_node = fn->children[idx];
+        if (dist_node->type != ActionsDAG::ActionType::COLUMN
+            || !dist_node->column
+            || dist_node->column->size() == 0)
+            return false;
+        try
+        {
+            out_bbox_expand = dist_node->column->getFloat64(0);
+        }
+        catch (...)
+        {
+            return false;
+        }
+    }
+
     return true;
 }
 
 // ── IJoin implementation ──────────────────────────────────────────────────────
 
-SpatialRTreeJoin::SpatialRTreeJoin(std::shared_ptr<TableJoin> table_join_, SharedHeader right_header_)
+SpatialRTreeJoin::SpatialRTreeJoin(std::shared_ptr<TableJoin> table_join_, SharedHeader right_header_, double bbox_expand_)
     : table_join(std::move(table_join_))
     , right_header(std::move(right_header_))
+    , bbox_expand(bbox_expand_)
 {
     const auto & mixed = table_join->getMixedJoinExpression();
     if (!mixed)
         throw Exception(ErrorCodes::LOGICAL_ERROR, "SpatialRTreeJoin: no mixed join expression");
 
-    if (!identifyGeomColumns(mixed, *right_header, left_geom_col, right_geom_col))
+    double ignored_expand = 0.0;
+    if (!identifyGeomColumns(mixed, *right_header, left_geom_col, right_geom_col, -1, ignored_expand))
         throw Exception(
             ErrorCodes::LOGICAL_ERROR,
             "SpatialRTreeJoin: cannot identify geometry columns from spatial predicate DAG");
@@ -284,6 +312,14 @@ JoinResultPtr SpatialRTreeJoin::joinBlock(Block left_block)
     {
         hits.clear();
         BGBox bbox = wkbBBox(left_geom.getDataAt(li));
+        if (bbox_expand > 0.0)
+        {
+            bbox = BGBox{
+                BGPoint{boost::geometry::get<boost::geometry::min_corner, 0>(bbox) - bbox_expand,
+                        boost::geometry::get<boost::geometry::min_corner, 1>(bbox) - bbox_expand},
+                BGPoint{boost::geometry::get<boost::geometry::max_corner, 0>(bbox) + bbox_expand,
+                        boost::geometry::get<boost::geometry::max_corner, 1>(bbox) + bbox_expand}};
+        }
         rtree.query(boost::geometry::index::intersects(bbox), std::back_inserter(hits));
         for (const auto & [box, pos] : hits)
             candidates.push_back({li, pos.block_idx, pos.row_idx});

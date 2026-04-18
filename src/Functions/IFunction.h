@@ -206,6 +206,12 @@ public:
       */
     virtual bool isSpatialPredicate() const { return false; }
 
+    /** For distance-based spatial predicates (e.g. st_dwithin), returns the 0-based index of
+      * the constant distance argument used to expand the R-tree query bbox.
+      * Returns -1 if the function has no distance argument (pure 2-arg spatial predicate).
+      */
+    virtual int getSpatialExpandArg() const { return -1; }
+
     /** Should we evaluate this function while constant folding, if arguments are constants?
       * Usually this is true. Notable counterexample is function 'sleep'.
       * If we will call it during query analysis, we will sleep extra amount of time.
@@ -573,6 +579,7 @@ public:
     virtual bool isServerConstant() const { return false; }
     virtual bool isStateful() const { return false; }
     virtual bool isSpatialPredicate() const { return false; }
+    virtual int getSpatialExpandArg() const { return -1; }
 
     using ShortCircuitSettings = IFunctionBase::ShortCircuitSettings;
     virtual bool isShortCircuit(ShortCircuitSettings & /*settings*/, size_t /*number_of_arguments*/) const { return false; }
