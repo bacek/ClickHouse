@@ -948,6 +948,13 @@ public:
     {
         return user_defined_function->getSettings().getValue("is_spatial_predicate").safeGet<UInt64>() != 0;
     }
+    int getSpatialExpandArg() const override
+    {
+        auto val = user_defined_function->getSettings().getValue("spatial_expand_arg");
+        if (val.isNull()) return -1;
+        auto idx = val.safeGet<Int64>();
+        return idx < 0 ? -1 : static_cast<int>(idx);
+    }
     bool isSuitableForShortCircuitArgumentsExecution(const DataTypesWithConstInfo & /* arguments */) const override { return false; }
     size_t getNumberOfArguments() const override { return user_defined_function->getArguments().size(); }
 
@@ -1513,6 +1520,20 @@ struct WebAssemblyFunctionSettingsConstraits : public IHints<>
         }
     };
 
+    struct SettingInt64
+    {
+        SettingDefinition withDefault(Int64 default_value) const
+        {
+            return SettingDefinition(
+                [](std::string_view name, const Field & value)
+                {
+                    if (value.getType() != Field::Types::Int64 && value.getType() != Field::Types::UInt64)
+                        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Expected an integer for setting '{}'", name);
+                },
+                Field(default_value));
+        }
+    };
+
     const std::unordered_map<String, SettingDefinition> settings_def = {
         /// Serialization format for input/output data for ABI what uses serialization
         {"serialization_format", SettingStringFromSet{{"MsgPack", "JSONEachRow", "CSV", "TSV", "TSVRaw", "RowBinary"}}.withDefault("MsgPack")},
@@ -1522,6 +1543,10 @@ struct WebAssemblyFunctionSettingsConstraits : public IHints<>
         {"is_aggregate", SettingBool{}.withDefault(false)},
         /// Whether bbox-disjoint pruning is safe for this function (see IFunctionBase::isSpatialPredicate).
         {"is_spatial_predicate", SettingBool{}.withDefault(false)},
+        /// For distance predicates (e.g. st_dwithin): 0-based index of the constant distance
+        /// argument. SpatialRTreeJoin expands the R-tree query bbox by this amount.
+        /// -1 (default) means no expansion.
+        {"spatial_expand_arg", SettingInt64{}.withDefault(-1)},
     };
 
     std::vector<String> getAllRegisteredNames() const override

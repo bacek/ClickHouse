@@ -1283,8 +1283,10 @@ std::shared_ptr<IJoin> chooseJoinAlgorithm(
         {
             String left_col;
             String right_col;
-            if (SpatialRTreeJoin::identifyGeomColumns(mixed, *right_table_expression_header, left_col, right_col))
-                return std::make_shared<SpatialRTreeJoin>(table_join, right_table_expression_header);
+            double bbox_expand = 0.0;
+            int expand_arg_index = dag_outputs[0]->function_base->getSpatialExpandArg();
+            if (SpatialRTreeJoin::identifyGeomColumns(mixed, *right_table_expression_header, left_col, right_col, expand_arg_index, bbox_expand))
+                return std::make_shared<SpatialRTreeJoin>(table_join, right_table_expression_header, bbox_expand);
         }
     }
 
