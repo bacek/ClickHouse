@@ -34,7 +34,7 @@ public:
         bool use_new_analyzer_,
         bool use_join_disjunctions_push_down_ = false);
 
-    String getName() const override { return "Join"; }
+    String getName() const override;
 
     QueryPipelineBuilderPtr updatePipeline(QueryPipelineBuilders pipelines, const BuildQueryPipelineSettings &) override;
 

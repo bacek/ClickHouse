@@ -95,6 +95,17 @@ std::vector<size_t> getPermutationForBlock(
 
 }
 
+String JoinStep::getName() const
+{
+    if (join)
+    {
+        const auto & algo = join->getName();
+        if (algo != "HashJoin")
+            return "Join (" + algo + ")";
+    }
+    return "Join";
+}
+
 JoinStep::JoinStep(
     const SharedHeader & left_header_,
     const SharedHeader & right_header_,
