@@ -43,7 +43,7 @@ namespace DB
 class SpatialRTreeJoin : public IJoin
 {
 public:
-    SpatialRTreeJoin(std::shared_ptr<TableJoin> table_join_, SharedHeader right_header_);
+    SpatialRTreeJoin(std::shared_ptr<TableJoin> table_join_, SharedHeader right_header_, double bbox_expand_ = 0.0);
 
     std::string getName() const override { return "SpatialRTreeJoin"; }
     const TableJoin & getTableJoin() const override { return *table_join; }
@@ -69,11 +69,15 @@ public:
     /// Try to identify left/right geometry column names from the spatial predicate
     /// ActionsDAG. Returns false if detection fails (e.g. either argument is wrapped
     /// in a function rather than being a direct column reference).
+    /// expand_arg_index: 0-based index of the constant distance argument (-1 = none).
+    /// On success, out_bbox_expand is set to the constant value at that index (0.0 if -1).
     static bool identifyGeomColumns(
         const ExpressionActionsPtr & expr,
         const Block & right_hdr,
         String & out_left_col,
-        String & out_right_col);
+        String & out_right_col,
+        int expand_arg_index,
+        double & out_bbox_expand);
 
 private:
     using BGPoint = boost::geometry::model::d2::point_xy<double>;
@@ -95,6 +99,7 @@ private:
     String left_geom_col;
     String right_geom_col;
     String filter_col_name; /// output column name of the mixed join expression
+    double bbox_expand = 0.0; /// for distance predicates (e.g. st_dwithin): expand query bbox by this amount
 
     std::vector<Block> right_blocks;
     RTree rtree;
