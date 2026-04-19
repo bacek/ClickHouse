@@ -310,6 +310,10 @@ public:
             buffer = *reinterpret_cast<const WasmBuffer *>(raw_buffer_ptr);
         }
 
+        if (buffer.size > 0 && buffer.ptr == 0)
+            throw Exception(ErrorCodes::WASM_ERROR,
+                "WebAssembly buffer returned null data pointer with size {}", buffer.size);
+
         return compartment->getMemory(buffer.ptr, buffer.size);
     }
 
