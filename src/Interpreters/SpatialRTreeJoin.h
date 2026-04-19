@@ -4,6 +4,7 @@
 #include <Interpreters/ExpressionActions.h>
 #include <Interpreters/IJoin.h>
 #include <Interpreters/TableJoin.h>
+#include <mutex>
 
 /// Warning in boost::geometry during template strategy substitution.
 #pragma clang diagnostic push
@@ -99,6 +100,10 @@ private:
     String left_geom_col;
     String right_geom_col;
     String filter_col_name; /// output column name of the mixed join expression
+
+    /// Serialises concurrent addBlockToJoin() calls (parallel build via supportParallelJoin).
+    /// joinBlock() is read-only after build and needs no lock.
+    std::mutex build_mutex;
 
     std::vector<Block> right_blocks;
     RTree rtree;
