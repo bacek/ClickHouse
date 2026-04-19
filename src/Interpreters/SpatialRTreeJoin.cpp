@@ -4,6 +4,7 @@
 #include <cstring>
 #include <limits>
 
+#include <Columns/ColumnConst.h>
 #include <Columns/ColumnString.h>
 #include <Common/Exception.h>
 #include <IO/ReadBufferFromMemory.h>
@@ -294,28 +295,36 @@ JoinResultPtr SpatialRTreeJoin::joinBlock(Block left_block)
     const size_t left_rows = left_block.rows();
     const bool is_left_join = table_join->kind() == JoinKind::Left;
 
-    /// Build an empty-row block (left cols + nullable-default right cols) for LEFT JOIN fallback.
-    auto makeEmptySchema = [&](Block & base) -> Block
+    /// Build the output block schema from the columns the planner says are needed
+    /// downstream (table_join->resultColumnsFromLeftTable() and columnsAddedByJoin).
+    /// This correctly excludes geometry-only columns (e.g. z_boundary in Q10, which
+    /// is 150 KB/row and would OOM if materialised for every match) while including
+    /// them when they ARE used in SELECT (e.g. b1.geom in Q9's st_area(b1.geom)).
+    auto buildOutputSchema = [&]() -> Block
     {
-        Block result = base.cloneEmpty();
-        for (const auto & col : *right_header)
-            if (!result.has(col.name))
-                result.insert(col.cloneEmpty());
-        return result;
+        Block schema;
+        for (const auto & col_def : table_join->resultColumnsFromLeftTable())
+        {
+            if (left_block.has(col_def.name))
+                schema.insert(left_block.getByName(col_def.name).cloneEmpty());
+        }
+        for (const auto & col_def : table_join->columnsAddedByJoin())
+        {
+            if (!schema.has(col_def.name))
+                schema.insert({col_def.type->createColumn(), col_def.type, col_def.name});
+        }
+        return schema;
     };
 
     /// Append unmatched left rows (NULLs on right) to result for LEFT JOIN.
-    /// left_matched[li] == true means left row li had at least one matching right row.
     auto appendUnmatched = [&](Block & result, const std::vector<bool> & left_matched)
     {
         std::vector<size_t> unmatched;
         for (size_t li = 0; li < left_rows; ++li)
             if (!left_matched[li])
                 unmatched.push_back(li);
-
         if (unmatched.empty())
             return;
-
         const size_t n = unmatched.size();
         for (auto & dst_col : result)
         {
@@ -336,15 +345,15 @@ JoinResultPtr SpatialRTreeJoin::joinBlock(Block left_block)
     };
 
     if (left_rows == 0)
-        return IJoinResult::createFromBlock(makeEmptySchema(left_block));
+        return IJoinResult::createFromBlock(buildOutputSchema());
 
     if (total_right_rows == 0)
     {
+        Block result = buildOutputSchema();
         if (!is_left_join)
-            return IJoinResult::createFromBlock(makeEmptySchema(left_block));
+            return IJoinResult::createFromBlock(std::move(result));
 
         /// LEFT JOIN with no right rows: emit all left rows with NULL right cols.
-        Block result = makeEmptySchema(left_block);
         for (auto & dst_col : result)
         {
             auto mut = dst_col.column->assumeMutable();
@@ -363,7 +372,7 @@ JoinResultPtr SpatialRTreeJoin::joinBlock(Block left_block)
     /// Collect all bbox candidates across all left rows.
     struct Candidate { size_t left_row; UInt32 block_idx; UInt32 row_idx; };
     std::vector<Candidate> candidates;
-    candidates.reserve(left_rows * 4); /// rough heuristic
+    candidates.reserve(left_rows * 4);
 
     std::vector<std::pair<BGBox, RightPos>> hits;
     for (size_t li = 0; li < left_rows; ++li)
@@ -385,11 +394,11 @@ JoinResultPtr SpatialRTreeJoin::joinBlock(Block left_block)
 
     if (candidates.empty())
     {
+        Block result = buildOutputSchema();
         if (!is_left_join)
-            return IJoinResult::createFromBlock(makeEmptySchema(left_block));
+            return IJoinResult::createFromBlock(std::move(result));
 
         /// LEFT JOIN with no bbox candidates: all left rows unmatched.
-        Block result = makeEmptySchema(left_block);
         std::vector<bool> none_matched(left_rows, false);
         appendUnmatched(result, none_matched);
         return IJoinResult::createFromBlock(std::move(result));
@@ -397,12 +406,146 @@ JoinResultPtr SpatialRTreeJoin::joinBlock(Block left_block)
 
     const size_t n_cand = candidates.size();
 
-    /// Build a block with left columns (repeated) + right columns (one per candidate).
+    // ─────────────────────────────────────────────────────────────────────────
+    // Grouped predicate evaluation with ColumnConst for the "smaller" side.
+    //
+    // Zone WKBs can be ~100-150 KB each.  A naïve approach that copies one WKB
+    // per candidate row produces gigabytes for large inputs (Q10: 6M trips ×
+    // ~150KB zone = 900GB; Q11: 195K candidates × 150KB = 29GB).
+    //
+    // Instead we group candidates by whichever side has fewer unique instances
+    // and wrap that side's geometry in a ColumnConst.  ColumnConst is recognised
+    // by the COLUMNAR_V1 bridge as COL_IS_CONST, so WASM builds a PreparedGeometry
+    // once per group and re-uses it for all rows in the group.
+    //
+    // Grouping strategy:
+    //   • fewer unique right rows → group by right → right_geom = ColumnConst
+    //     (Q11: RIGHT = ~100 zones, LEFT = 65K trips)
+    //   • otherwise              → group by left  → left_geom  = ColumnConst
+    //     (Q10: LEFT = ~100 zones, RIGHT = 6M trips)
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// Count unique right rows among candidates.
+    std::unordered_map<uint64_t, std::vector<size_t>> right_groups;
+    right_groups.reserve(std::min(n_cand, static_cast<size_t>(4096)));
+    for (size_t ci = 0; ci < n_cand; ++ci)
+    {
+        uint64_t key = static_cast<uint64_t>(candidates[ci].block_idx) * 0x100000000ULL
+                     + candidates[ci].row_idx;
+        right_groups[key].push_back(ci);
+    }
+
+    const bool group_by_right = right_groups.size() <= left_rows;
+
+    IColumn::Filter final_mask(n_cand, 0);
+
+    if (group_by_right)
+    {
+        /// Right side is ColumnConst per group (same right row for all k candidates).
+        /// Wrapping ALL right columns as ColumnConst (not just the geometry) means:
+        ///   - Large WKBs (100-150 KB) are not copied k times → no OOM.
+        ///   - The geometry ColumnConst is recognised by the COLUMNAR_V1 bridge as
+        ///     COL_IS_CONST → PreparedGeometry is built once per group.
+        ///   - Non-geometry columns (e.g. b2.id in Q9's `b1.id < b2.id`) are also
+        ///     present so the full mixed_join_expression can be evaluated.
+        for (const auto & [key, indices] : right_groups)
+        {
+            const size_t k = indices.size();
+            const auto & c0 = candidates[indices[0]];
+            const Block & right_block = right_blocks[c0.block_idx];
+
+            Block pred_block;
+
+            // All left columns: k varying values.
+            for (const auto & src_col : left_block)
+            {
+                auto data = src_col.type->createColumn();
+                data->reserve(k);
+                for (size_t ci : indices)
+                    data->insertFrom(*src_col.column, candidates[ci].left_row);
+                pred_block.insert({std::move(data), src_col.type, src_col.name});
+            }
+
+            // All right columns: ColumnConst (same right row for entire group).
+            for (const auto & right_col_def : *right_header)
+            {
+                if (pred_block.has(right_col_def.name))
+                    continue; // skip name collisions (table-qualified names prevent these in practice)
+                ColumnPtr single = right_block.getByName(right_col_def.name).column->cut(c0.row_idx, 1);
+                pred_block.insert({ColumnConst::create(single, k), right_col_def.type, right_col_def.name});
+            }
+
+            table_join->getMixedJoinExpression()->execute(pred_block);
+            const auto & fc = *pred_block.getByName(filter_col_name).column;
+            for (size_t j = 0; j < k; ++j)
+                final_mask[indices[j]] = fc.getBool(j) ? 1 : 0;
+        }
+    }
+    else
+    {
+        /// Left side is ColumnConst per group (same left row for all k candidates).
+        std::unordered_map<size_t, std::vector<size_t>> left_groups;
+        left_groups.reserve(left_rows);
+        for (size_t ci = 0; ci < n_cand; ++ci)
+            left_groups[candidates[ci].left_row].push_back(ci);
+
+        for (const auto & [left_row, indices] : left_groups)
+        {
+            const size_t k = indices.size();
+
+            Block pred_block;
+
+            // All left columns: ColumnConst (same left row for entire group).
+            for (const auto & src_col : left_block)
+            {
+                ColumnPtr single = src_col.column->cut(left_row, 1);
+                pred_block.insert({ColumnConst::create(single, k), src_col.type, src_col.name});
+            }
+
+            // All right columns: k varying values.
+            for (const auto & right_col_def : *right_header)
+            {
+                if (pred_block.has(right_col_def.name))
+                    continue;
+                auto data = right_col_def.type->createColumn();
+                data->reserve(k);
+                for (size_t ci : indices)
+                    data->insertFrom(
+                        *right_blocks[candidates[ci].block_idx].getByName(right_col_def.name).column,
+                        candidates[ci].row_idx);
+                pred_block.insert({std::move(data), right_col_def.type, right_col_def.name});
+            }
+
+            table_join->getMixedJoinExpression()->execute(pred_block);
+            const auto & fc = *pred_block.getByName(filter_col_name).column;
+            for (size_t j = 0; j < k; ++j)
+                final_mask[indices[j]] = fc.getBool(j) ? 1 : 0;
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Build result block (non-geometry columns only) from matched candidates.
+    //
+    // We exclude left_geom_col and right_geom_col: they are predicate-only and
+    // are never in the join output header (confirmed from EXPLAIN for Q4, Q6,
+    // Q8, Q10, Q11).  Excluding them avoids copying large WKBs into the result.
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// For LEFT JOIN, track which left rows had at least one match.
+    std::vector<bool> left_matched(is_left_join ? left_rows : 0, false);
+    if (is_left_join)
+        for (size_t ci = 0; ci < n_cand; ++ci)
+            if (final_mask[ci])
+                left_matched[candidates[ci].left_row] = true;
+
     Block candidate_block;
 
-    /// Left columns
-    for (const auto & src_col : left_block)
+    /// Left output columns (those the planner needs downstream).
+    for (const auto & col_def : table_join->resultColumnsFromLeftTable())
     {
+        if (!left_block.has(col_def.name))
+            continue;
+        const auto & src_col = left_block.getByName(col_def.name);
         auto mutable_col = src_col.column->cloneEmpty();
         mutable_col->reserve(n_cand);
         for (const auto & c : candidates)
@@ -410,48 +553,21 @@ JoinResultPtr SpatialRTreeJoin::joinBlock(Block left_block)
         candidate_block.insert({std::move(mutable_col), src_col.type, src_col.name});
     }
 
-    /// Right columns
-    for (const auto & right_col_def : *right_header)
+    /// Right output columns (those the planner needs downstream).
+    for (const auto & col_def : table_join->columnsAddedByJoin())
     {
-        if (candidate_block.has(right_col_def.name))
-            continue; /// already present (name collision with left — ignore for now)
-
-        auto mutable_col = right_col_def.column->cloneEmpty();
+        if (candidate_block.has(col_def.name))
+            continue;
+        auto mutable_col = col_def.type->createColumn();
         mutable_col->reserve(n_cand);
         for (const auto & c : candidates)
-        {
-            const Block & rb = right_blocks[c.block_idx];
-            mutable_col->insertFrom(*rb.getByName(right_col_def.name).column, c.row_idx);
-        }
-        candidate_block.insert({std::move(mutable_col), right_col_def.type, right_col_def.name});
+            mutable_col->insertFrom(*right_blocks[c.block_idx].getByName(col_def.name).column, c.row_idx);
+        candidate_block.insert({std::move(mutable_col), col_def.type, col_def.name});
     }
 
-    /// Apply the spatial predicate on a scratch block so that ExpressionActions
-    /// does not erase the geometry input columns from candidate_block.
-    /// (execute() removes INPUT-node columns from the block it receives.)
-    Block predicate_block;
-    predicate_block.insert(candidate_block.getByName(left_geom_col));
-    predicate_block.insert(candidate_block.getByName(right_geom_col));
-    table_join->getMixedJoinExpression()->execute(predicate_block);
-
-    /// Extract UInt8 filter column produced by the predicate.
-    const auto & filter_col = *predicate_block.getByName(filter_col_name).column;
-    const size_t total = candidate_block.rows();
-
-    IColumn::Filter mask(total);
-    for (size_t i = 0; i < total; ++i)
-        mask[i] = filter_col.getBool(i) ? 1 : 0;
-
-    /// For LEFT JOIN, track which left rows had at least one match.
-    std::vector<bool> left_matched(is_left_join ? left_rows : 0, false);
-    if (is_left_join)
-        for (size_t i = 0; i < total; ++i)
-            if (mask[i])
-                left_matched[candidates[i].left_row] = true;
-
-    /// Apply filter to all columns of the original (intact) candidate block.
+    /// Apply filter (fast vectorised path via column->filter).
     for (auto & col : candidate_block)
-        col.column = col.column->filter(mask, -1);
+        col.column = col.column->filter(final_mask, -1);
 
     /// Append unmatched left rows (with NULL right cols) for LEFT JOIN.
     if (is_left_join)
