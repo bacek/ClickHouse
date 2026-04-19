@@ -270,11 +270,13 @@ void SpatialRTreeJoin::initialize(const Block & left_sample_block)
 
 bool SpatialRTreeJoin::addBlockToJoin(const Block & block, bool /*check_limits*/)
 {
-    const size_t block_idx = right_blocks.size();
-    right_blocks.push_back(block);
-
     const IColumn & geom_col = *block.getByName(right_geom_col).column;
     const size_t n = block.rows();
+
+    std::lock_guard lock(build_mutex);
+
+    const size_t block_idx = right_blocks.size();
+    right_blocks.push_back(block);
 
     for (size_t row = 0; row < n; ++row)
     {
