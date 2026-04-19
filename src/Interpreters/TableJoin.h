@@ -427,6 +427,7 @@ public:
     const NamesAndTypesList & getOutputColumns(JoinTableSide side) const;
     const NamesAndTypesList & columnsFromJoinedTable() const { return columns_from_joined_table; }
     const NamesAndTypesList & columnsAddedByJoin() const { return columns_added_by_join; }
+    const NamesAndTypesList & resultColumnsFromLeftTable() const { return result_columns_from_left_table; }
 
     /// StorageJoin overrides key names (cause of different names qualification)
     void setRightKeys(const Names & keys) { getOnlyClause().key_names_right = keys; }
