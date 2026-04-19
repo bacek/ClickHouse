@@ -526,48 +526,52 @@ JoinResultPtr SpatialRTreeJoin::joinBlock(Block left_block)
     // ─────────────────────────────────────────────────────────────────────────
     // Build result block (non-geometry columns only) from matched candidates.
     //
-    // We exclude left_geom_col and right_geom_col: they are predicate-only and
-    // are never in the join output header (confirmed from EXPLAIN for Q4, Q6,
-    // Q8, Q10, Q11).  Excluding them avoids copying large WKBs into the result.
+    // We insert only matched rows (final_mask[ci] == 1) directly, avoiding the
+    // O(n_cand) intermediate allocation that previously occurred when building
+    // the full candidate block before filtering.  At SF10 n_cand can reach
+    // millions (wide bbox + dense building dataset), making the old approach
+    // allocate several GB of intermediate data per joinBlock call.
     // ─────────────────────────────────────────────────────────────────────────
+
+    Block candidate_block = buildOutputSchema();
+    const size_t n_out_cols = candidate_block.columns();
+
+    // Precompute per-column source (left or right) to avoid repeated hash lookups.
+    struct ColSource { bool from_left; String name; };
+    std::vector<ColSource> col_sources;
+    col_sources.reserve(n_out_cols);
+    for (size_t i = 0; i < n_out_cols; ++i)
+    {
+        const auto & col_def = candidate_block.getByPosition(i);
+        col_sources.push_back({left_block.has(col_def.name), col_def.name});
+    }
+
+    MutableColumns mutable_cols(n_out_cols);
+    for (size_t i = 0; i < n_out_cols; ++i)
+        mutable_cols[i] = IColumn::mutate(candidate_block.getByPosition(i).column);
 
     /// For LEFT JOIN, track which left rows had at least one match.
     std::vector<bool> left_matched(is_left_join ? left_rows : 0, false);
-    if (is_left_join)
-        for (size_t ci = 0; ci < n_cand; ++ci)
-            if (final_mask[ci])
-                left_matched[candidates[ci].left_row] = true;
 
-    Block candidate_block;
-
-    /// Left output columns (those the planner needs downstream).
-    for (const auto & col_def : table_join->resultColumnsFromLeftTable())
+    for (size_t ci = 0; ci < n_cand; ++ci)
     {
-        if (!left_block.has(col_def.name))
+        if (!final_mask[ci])
             continue;
-        const auto & src_col = left_block.getByName(col_def.name);
-        auto mutable_col = src_col.column->cloneEmpty();
-        mutable_col->reserve(n_cand);
-        for (const auto & c : candidates)
-            mutable_col->insertFrom(*src_col.column, c.left_row);
-        candidate_block.insert({std::move(mutable_col), src_col.type, src_col.name});
+        const auto & c = candidates[ci];
+        if (is_left_join)
+            left_matched[c.left_row] = true;
+        for (size_t i = 0; i < n_out_cols; ++i)
+        {
+            if (col_sources[i].from_left)
+                mutable_cols[i]->insertFrom(*left_block.getByName(col_sources[i].name).column, c.left_row);
+            else
+                mutable_cols[i]->insertFrom(
+                    *right_blocks[c.block_idx].getByName(col_sources[i].name).column, c.row_idx);
+        }
     }
 
-    /// Right output columns (those the planner needs downstream).
-    for (const auto & col_def : table_join->columnsAddedByJoin())
-    {
-        if (candidate_block.has(col_def.name))
-            continue;
-        auto mutable_col = col_def.type->createColumn();
-        mutable_col->reserve(n_cand);
-        for (const auto & c : candidates)
-            mutable_col->insertFrom(*right_blocks[c.block_idx].getByName(col_def.name).column, c.row_idx);
-        candidate_block.insert({std::move(mutable_col), col_def.type, col_def.name});
-    }
-
-    /// Apply filter (fast vectorised path via column->filter).
-    for (auto & col : candidate_block)
-        col.column = col.column->filter(final_mask, -1);
+    for (size_t i = 0; i < n_out_cols; ++i)
+        candidate_block.getByPosition(i).column = std::move(mutable_cols[i]);
 
     /// Append unmatched left rows (with NULL right cols) for LEFT JOIN.
     if (is_left_join)
