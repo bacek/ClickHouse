@@ -48,6 +48,10 @@ public:
     std::string getName() const override { return "SpatialRTreeJoin"; }
     const TableJoin & getTableJoin() const override { return *table_join; }
 
+    /// The R-tree and right_blocks are read-only after the build phase, so
+    /// joinBlock() can be called concurrently from multiple probe threads.
+    bool supportParallelJoin() const override { return true; }
+
     void initialize(const Block & left_sample_block) override;
     bool addBlockToJoin(const Block & block, bool check_limits) override;
     void checkTypesOfKeys(const Block & /*block*/) const override {}
