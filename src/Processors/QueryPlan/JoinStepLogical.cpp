@@ -1212,6 +1212,33 @@ static QueryPlanNode buildPhysicalJoinImpl(
             ExpressionActionsPtr & mixed_join_expression = table_join->getMixedJoinExpression();
             mixed_join_expression = std::make_shared<ExpressionActions>(
                 std::move(spatial_dag), optimization_settings.actions_settings);
+
+            /// Any remaining cross-table conditions (e.g. `b1.id < b2.id` paired with
+            /// a spatial predicate) become a pre-spatial filter evaluated inside
+            /// SpatialRTreeJoin BEFORE the spatial predicate.  This avoids calling the
+            /// expensive spatial function for pairs that a cheap condition rejects.
+            ///
+            /// Only cross-table conditions (referencing both tables) are lifted here;
+            /// single-table conditions remain in residual_filter for the normal path.
+            std::vector<JoinActionRef> pre_filter_conds;
+            std::vector<JoinActionRef> remaining_residual;
+            for (auto & ref : join_operator.residual_filter)
+            {
+                auto src = ref.getSourceRelations();
+                if (src.test(0) && src.test(1))
+                    pre_filter_conds.push_back(ref);
+                else
+                    remaining_residual.push_back(ref);
+            }
+            join_operator.residual_filter = std::move(remaining_residual);
+
+            if (!pre_filter_conds.empty())
+            {
+                JoinActionRef pre_cond = concatConditions(pre_filter_conds);
+                auto pre_dag = JoinExpressionActions::getSubDAG(std::views::single(pre_cond));
+                table_join->getPreSpatialFilterExpression() = std::make_shared<ExpressionActions>(
+                    std::move(pre_dag), optimization_settings.actions_settings);
+            }
         }
     }
 
