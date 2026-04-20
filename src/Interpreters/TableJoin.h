@@ -176,6 +176,10 @@ private:
     Clauses clauses;
     /// Originally used for inequal join. If there is no any inequal join condition, it will be nullptr.
     std::shared_ptr<ExpressionActions> mixed_join_expression = nullptr;
+    /// Non-spatial conditions from the JOIN ON clause (e.g. `b1.id < b2.id` alongside
+    /// a spatial predicate).  Evaluated inside SpatialRTreeJoin BEFORE the spatial
+    /// predicate so that cheap conditions prune candidates early.  nullptr when absent.
+    std::shared_ptr<ExpressionActions> pre_spatial_filter_expression = nullptr;
 
     ASTTableJoin table_join;
     std::optional<JoinOperator> join_operator;
@@ -344,6 +348,9 @@ public:
 
     const std::shared_ptr<ExpressionActions> & getMixedJoinExpression() const { return mixed_join_expression; }
     std::shared_ptr<ExpressionActions> & getMixedJoinExpression() { return mixed_join_expression; }
+
+    const std::shared_ptr<ExpressionActions> & getPreSpatialFilterExpression() const { return pre_spatial_filter_expression; }
+    std::shared_ptr<ExpressionActions> & getPreSpatialFilterExpression() { return pre_spatial_filter_expression; }
 
     Names getAllNames(JoinTableSide side) const;
 
