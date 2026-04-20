@@ -290,7 +290,7 @@ bool SpatialRTreeJoin::addBlockToJoin(const Block & block, bool /*check_limits*/
     for (size_t row = 0; row < n; ++row)
     {
         BGBox box = wkbBBox(geom_col.getDataAt(row));
-        rtree.insert({box, RightPos{static_cast<UInt32>(block_idx), static_cast<UInt32>(row)}});
+        pending_entries.push_back({box, RightPos{static_cast<UInt32>(block_idx), static_cast<UInt32>(row)}});
     }
 
     total_right_rows  += n;
@@ -374,6 +374,16 @@ JoinResultPtr SpatialRTreeJoin::joinBlock(Block left_block)
         }
         return IJoinResult::createFromBlock(std::move(result));
     }
+
+    /// Bulk-load the R-tree from pending_entries on the first probe call.
+    /// Using the range constructor (packing / STR algorithm) is significantly faster
+    /// than N individual inserts for large right-side tables (e.g. 6M trip rows).
+    std::call_once(rtree_init_flag, [this]
+    {
+        rtree = RTree(pending_entries.begin(), pending_entries.end());
+        pending_entries.clear();
+        pending_entries.shrink_to_fit();
+    });
 
     const IColumn & left_geom = *left_block.getByName(left_geom_col).column;
 
