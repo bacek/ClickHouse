@@ -262,6 +262,14 @@ SpatialRTreeJoin::SpatialRTreeJoin(std::shared_ptr<TableJoin> table_join_, Share
 
     /// The expression's single output column is used as the filter mask.
     filter_col_name = mixed->getActionsDAG().getOutputs()[0]->result_name;
+
+    /// Pick up any non-spatial pre-filter from the planner (e.g. `b1.id < b2.id`
+    /// extracted from ON clause alongside the spatial predicate).
+    if (const auto & pre_expr = table_join->getPreSpatialFilterExpression())
+    {
+        pre_filter_expr = pre_expr;
+        pre_filter_col_name = pre_expr->getActionsDAG().getOutputs()[0]->result_name;
+    }
 }
 
 void SpatialRTreeJoin::initialize(const Block & left_sample_block)
@@ -390,6 +398,52 @@ JoinResultPtr SpatialRTreeJoin::joinBlock(Block left_block)
         rtree.query(boost::geometry::index::intersects(bbox), std::back_inserter(hits));
         for (const auto & [box, pos] : hits)
             candidates.push_back({li, pos.block_idx, pos.row_idx});
+    }
+
+    /// Pre-filter: evaluate cheap non-spatial ON conditions (e.g. `b1.id < b2.id`)
+    /// before invoking the spatial predicate.  Candidates that fail are removed now,
+    /// avoiding expensive geometry work for pairs a simple comparison would reject.
+    ///
+    /// Only the columns required by pre_filter_expr are materialised; geometry columns
+    /// are excluded unless they happen to appear in the non-spatial condition (rare).
+    if (pre_filter_expr && !candidates.empty())
+    {
+        const size_t n = candidates.size();
+
+        NameSet required;
+        for (const auto & col : pre_filter_expr->getRequiredColumns())
+            required.insert(col);
+
+        Block pre_block;
+        for (const auto & src_col : left_block)
+        {
+            if (!required.contains(src_col.name))
+                continue;
+            auto col = src_col.type->createColumn();
+            col->reserve(n);
+            for (const auto & c : candidates)
+                col->insertFrom(*src_col.column, c.left_row);
+            pre_block.insert({std::move(col), src_col.type, src_col.name});
+        }
+        for (const auto & right_col_def : *right_header)
+        {
+            if (!required.contains(right_col_def.name) || pre_block.has(right_col_def.name))
+                continue;
+            auto col = right_col_def.type->createColumn();
+            col->reserve(n);
+            for (const auto & c : candidates)
+                col->insertFrom(*right_blocks[c.block_idx].getByName(right_col_def.name).column, c.row_idx);
+            pre_block.insert({std::move(col), right_col_def.type, right_col_def.name});
+        }
+
+        pre_filter_expr->execute(pre_block);
+        const auto & fc = *pre_block.getByName(pre_filter_col_name).column;
+
+        size_t j = 0;
+        for (size_t i = 0; i < n; ++i)
+            if (fc.getBool(i))
+                candidates[j++] = candidates[i];
+        candidates.resize(j);
     }
 
     if (candidates.empty())

@@ -103,8 +103,13 @@ private:
 
     String left_geom_col;
     String right_geom_col;
-    String filter_col_name; /// output column name of the mixed join expression
-    double bbox_expand = 0.0; /// for distance predicates (e.g. st_dwithin): expand query bbox by this amount
+    String filter_col_name;        /// output column name of the mixed join expression
+    double bbox_expand = 0.0;      /// for distance predicates (e.g. st_dwithin): expand query bbox by this amount
+
+    /// Optional cheap non-spatial pre-filter (e.g. `b1.id < b2.id` from the ON clause).
+    /// Evaluated BEFORE the spatial predicate to prune candidates without geometry work.
+    ExpressionActionsPtr pre_filter_expr;
+    String              pre_filter_col_name;
 
     /// Serialises concurrent addBlockToJoin() calls (parallel build via supportParallelJoin).
     /// joinBlock() is read-only after build and needs no lock.
