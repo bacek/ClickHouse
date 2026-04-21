@@ -57,6 +57,11 @@ public:
     bool addBlockToJoin(const Block & block, bool check_limits) override;
     void checkTypesOfKeys(const Block & /*block*/) const override {}
 
+    /// Bulk-load the R-tree from pending_entries once all right-side data is ingested.
+    /// Called by FillingRightJoinSideTransform (single thread) before any joinBlock().
+    bool hasPostBuildPhase() const override { return true; }
+    void runPostBuildPhase() override;
+
     JoinResultPtr joinBlock(Block block) override;
 
     size_t getTotalRowCount() const override { return total_right_rows; }
@@ -117,13 +122,12 @@ private:
 
     std::vector<Block> right_blocks;
 
-    /// Entries buffered during build phase; consumed by the first joinBlock call.
+    /// Entries buffered during build phase; bulk-loaded into rtree by runPostBuildPhase().
     /// Using bulk-load (packing / STR algorithm) instead of per-row insert reduces
     /// build cost for large right-side tables from O(N log N) quadratic-rebalance to
     /// a single sorted sweep — typically 10× faster for millions of entries.
     std::vector<std::pair<BGBox, RightPos>> pending_entries;
-    RTree rtree;              /// constructed lazily on first joinBlock call
-    std::once_flag rtree_init_flag;
+    RTree rtree;              /// built by runPostBuildPhase(), read-only during probe
 
     size_t total_right_rows = 0;
     size_t total_right_bytes = 0;
