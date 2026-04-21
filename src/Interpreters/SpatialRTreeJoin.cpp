@@ -283,19 +283,38 @@ bool SpatialRTreeJoin::addBlockToJoin(const Block & block, bool /*check_limits*/
     const IColumn & geom_col = *block.getByName(right_geom_col).column;
     const size_t n = block.rows();
 
-    std::lock_guard lock(build_mutex);
-
-    const size_t block_idx = right_blocks.size();
-    right_blocks.push_back(block);
-
-    for (size_t row = 0; row < n; ++row)
+    /// Step 1: claim a block_idx under lock, then release immediately.
+    /// This lets multiple build threads compute bboxes in parallel (step 2).
+    size_t block_idx;
     {
-        BGBox box = wkbBBox(geom_col.getDataAt(row));
-        pending_entries.push_back({box, RightPos{static_cast<UInt32>(block_idx), static_cast<UInt32>(row)}});
+        std::lock_guard lock(build_mutex);
+        block_idx = right_blocks.size();
+        right_blocks.push_back(block);
+        total_right_rows  += n;
+        total_right_bytes += block.allocatedBytes();
     }
 
-    total_right_rows  += n;
-    total_right_bytes += block.allocatedBytes();
+    /// Step 2: compute bboxes without holding the lock.
+    /// geom_col is part of the original block (const ref, caller keeps it alive),
+    /// so reads here are safe even while other threads append to right_blocks.
+    std::vector<std::pair<BGBox, RightPos>> local_entries(n);
+    for (size_t row = 0; row < n; ++row)
+    {
+        local_entries[row] = {
+            wkbBBox(geom_col.getDataAt(row)),
+            RightPos{static_cast<UInt32>(block_idx), static_cast<UInt32>(row)}};
+    }
+
+    /// Step 3: bulk-append to shared pending_entries under lock.
+    /// The insert may reallocate pending_entries — safe because local_entries is stable.
+    {
+        std::lock_guard lock(build_mutex);
+        pending_entries.insert(
+            pending_entries.end(),
+            std::make_move_iterator(local_entries.begin()),
+            std::make_move_iterator(local_entries.end()));
+    }
+
     return true;
 }
 
