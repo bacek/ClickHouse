@@ -12,6 +12,7 @@
 #include <span>
 #include <string>
 #include <variant>
+#include <pthread.h>
 #include <fmt/core.h>
 #include <fmt/ranges.h>
 #include <base/MemorySanitizer.h>
@@ -168,13 +169,7 @@ struct WasmTimeRuntime::Impl
         config.epoch_interruption(true);
         config.signals_based_traps(false);
         config.wasm_exceptions(true);
-#if defined(__APPLE__) && defined(__aarch64__)
-        /// Cranelift's E-Graph optimizer (constructor_simplify) triggers a Rust
-        /// panic (SIGILL) on aarch64-apple-darwin with wasmtime 41.x.
-        /// Disable optimization to avoid hitting that code path until the
-        /// upstream bug is fixed.
-        config.cranelift_opt_level(wasmtime::OptLevel::None);
-#endif
+        config.cranelift_opt_level(wasmtime::OptLevel::Speed);
         return config;
     }
 
