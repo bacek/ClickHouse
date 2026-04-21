@@ -326,15 +326,19 @@ void SpatialRTreeJoin::runPostBuildPhase()
     ///
     /// Splitting into K chunks and building K trees in parallel eliminates the long
     /// single-CPU period that precedes parallel probe when the right side is large (e.g.
-    /// 60M trip points in Q10/Q11).  Each sub-tree covers a contiguous slice of the
-    /// spatially-unsorted pending_entries, so query overhead is O(K × log(N/K)) instead
-    /// of O(log N) — acceptable because empty-result queries dominate at this scale.
+    /// 60M trip points).  Each sub-tree covers a contiguous slice of the spatially-unsorted
+    /// pending_entries, so query overhead is O(K × log(N/K)) instead of O(log N).
+    ///
+    /// For small right sides (≤ 200K entries) the build is already fast and the per-lookup
+    /// cost of querying K trees instead of 1 dominates; use a single tree in that case.
     const size_t n = pending_entries.size();
     if (n == 0)
         return;
 
-    const size_t num_parts = std::max(size_t{1},
-        std::min(static_cast<size_t>(std::thread::hardware_concurrency()), n));
+    static constexpr size_t kParallelThreshold = 200'000;
+    const size_t num_parts = (n <= kParallelThreshold)
+        ? 1
+        : std::max(size_t{1}, std::min(static_cast<size_t>(std::thread::hardware_concurrency()), n));
     sub_trees.resize(num_parts);
 
     const size_t chunk = (n + num_parts - 1) / num_parts;
@@ -436,15 +440,300 @@ JoinResultPtr SpatialRTreeJoin::joinBlock(Block left_block)
 
     const IColumn & left_geom = *left_block.getByName(left_geom_col).column;
 
-    /// Collect all bbox candidates across all left rows.
+    // ─────────────────────────────────────────────────────────────────────────
+    // Probe strategy: collect all bbox candidates across left rows, then
+    // evaluate in grouped batches so WASM builds PreparedGeometry once per
+    // unique geometry value.  Grouping by the side with fewer unique values
+    // (group_by_right or group_by_left) minimises PreparedGeometry rebuilds to
+    // unique_right or unique_left counts per joinBlock call — not per flush.
+    //
+    // Memory protection via lazy iteration: R-tree results are collected one
+    // entry at a time.  If a single left row accumulates ≥ kLargeHit results
+    // (e.g. a globally-scoped zone whose bbox covers the entire right dataset),
+    // the shared candidates buffer is flushed and that row is streamed alone in
+    // kChunkSize-sized batches with the left geometry as ColumnConst.  This
+    // bounds peak memory to O(max(kMaxCandidates, kLargeHit) × entry_size).
+    // ─────────────────────────────────────────────────────────────────────────
+
+    Block output = buildOutputSchema();
+    const size_t n_out_cols = output.columns();
+
+    struct ColSource { bool from_left; String name; };
+    std::vector<ColSource> col_sources;
+    col_sources.reserve(n_out_cols);
+    for (size_t i = 0; i < n_out_cols; ++i)
+    {
+        const auto & col_def = output.getByPosition(i);
+        col_sources.push_back({left_block.has(col_def.name), col_def.name});
+    }
+
+    MutableColumns mutable_cols(n_out_cols);
+    for (size_t i = 0; i < n_out_cols; ++i)
+        mutable_cols[i] = IColumn::mutate(output.getByPosition(i).column);
+
+    std::vector<bool> left_matched(is_left_join ? left_rows : 0, false);
+
+    NameSet pre_filter_required;
+    if (pre_filter_expr)
+        for (const auto & col : pre_filter_expr->getRequiredColumns())
+            pre_filter_required.insert(col);
+
+    static constexpr size_t kChunkSize     = 65536;       // WASM batch size for large-row streaming
+    static constexpr size_t kLargeHit      = 4'000'000;   // per-row hit limit before streaming mode
+    static constexpr size_t kMaxCandidates = 8'000'000;   // shared buffer overflow guard
+
     struct Candidate { size_t left_row; UInt32 block_idx; UInt32 row_idx; };
     std::vector<Candidate> candidates;
-    candidates.reserve(left_rows * 4);
+    candidates.reserve(std::min(left_rows * 8, kMaxCandidates));
 
-    std::vector<std::pair<BGBox, RightPos>> hits;
+    // ── helpers ──────────────────────────────────────────────────────────────
+
+    /// Apply pre_filter_expr to a block of candidates (in-place compaction).
+    auto applyPreFilter = [&](std::vector<Candidate> & cands)
+    {
+        if (!pre_filter_expr || cands.empty())
+            return;
+        const size_t n = cands.size();
+
+        Block pre_block;
+        for (const auto & src_col : left_block)
+        {
+            if (!pre_filter_required.contains(src_col.name))
+                continue;
+            auto col = src_col.type->createColumn();
+            col->reserve(n);
+            for (const auto & c : cands)
+                col->insertFrom(*src_col.column, c.left_row);
+            pre_block.insert({std::move(col), src_col.type, src_col.name});
+        }
+        for (const auto & rcd : *right_header)
+        {
+            if (!pre_filter_required.contains(rcd.name) || pre_block.has(rcd.name))
+                continue;
+            auto col = rcd.type->createColumn();
+            col->reserve(n);
+            for (const auto & c : cands)
+                col->insertFrom(*right_blocks[c.block_idx].getByName(rcd.name).column, c.row_idx);
+            pre_block.insert({std::move(col), rcd.type, rcd.name});
+        }
+        pre_filter_expr->execute(pre_block);
+        const auto & fc = *pre_block.getByName(pre_filter_col_name).column;
+        size_t j = 0;
+        for (size_t i = 0; i < n; ++i)
+            if (fc.getBool(i))
+                cands[j++] = cands[i];
+        cands.resize(j);
+    };
+
+    /// Evaluate spatial predicate on cands and emit matched rows.
+    /// Decides group_by_right vs group_by_left to pick the better ColumnConst side.
+    auto evaluateAndEmit = [&](std::vector<Candidate> & cands)
+    {
+        if (cands.empty())
+            return;
+
+        applyPreFilter(cands);
+        if (cands.empty())
+            return;
+
+        const size_t n = cands.size();
+
+        // Count unique right rows to decide which side becomes ColumnConst.
+        std::unordered_map<uint64_t, std::vector<size_t>> right_groups;
+        right_groups.reserve(std::min(n, static_cast<size_t>(4096)));
+        for (size_t ci = 0; ci < n; ++ci)
+        {
+            uint64_t key = static_cast<uint64_t>(cands[ci].block_idx) * 0x100000000ULL + cands[ci].row_idx;
+            right_groups[key].push_back(ci);
+        }
+        const bool group_by_right = right_groups.size() <= left_rows;
+
+        IColumn::Filter mask(n, 0);
+
+        if (group_by_right)
+        {
+            for (const auto & [key, indices] : right_groups)
+            {
+                const size_t k = indices.size();
+                const auto & c0 = cands[indices[0]];
+                const Block & rb = right_blocks[c0.block_idx];
+
+                Block pred_block;
+                for (const auto & src_col : left_block)
+                {
+                    auto data = src_col.type->createColumn();
+                    data->reserve(k);
+                    for (size_t ci : indices)
+                        data->insertFrom(*src_col.column, cands[ci].left_row);
+                    pred_block.insert({std::move(data), src_col.type, src_col.name});
+                }
+                for (const auto & rcd : *right_header)
+                {
+                    if (pred_block.has(rcd.name))
+                        continue;
+                    ColumnPtr single = rb.getByName(rcd.name).column->cut(c0.row_idx, 1);
+                    pred_block.insert({ColumnConst::create(std::move(single), k), rcd.type, rcd.name});
+                }
+                table_join->getMixedJoinExpression()->execute(pred_block);
+                const auto & fc = *pred_block.getByName(filter_col_name).column;
+                for (size_t j = 0; j < k; ++j)
+                    mask[indices[j]] = fc.getBool(j) ? 1 : 0;
+            }
+        }
+        else
+        {
+            std::unordered_map<size_t, std::vector<size_t>> left_groups;
+            left_groups.reserve(left_rows);
+            for (size_t ci = 0; ci < n; ++ci)
+                left_groups[cands[ci].left_row].push_back(ci);
+
+            for (const auto & [left_row, indices] : left_groups)
+            {
+                const size_t k = indices.size();
+                Block pred_block;
+                for (const auto & src_col : left_block)
+                {
+                    ColumnPtr single = src_col.column->cut(left_row, 1);
+                    pred_block.insert({ColumnConst::create(std::move(single), k), src_col.type, src_col.name});
+                }
+                for (const auto & rcd : *right_header)
+                {
+                    if (pred_block.has(rcd.name))
+                        continue;
+                    auto data = rcd.type->createColumn();
+                    data->reserve(k);
+                    for (size_t ci : indices)
+                        data->insertFrom(
+                            *right_blocks[cands[ci].block_idx].getByName(rcd.name).column,
+                            cands[ci].row_idx);
+                    pred_block.insert({std::move(data), rcd.type, rcd.name});
+                }
+                table_join->getMixedJoinExpression()->execute(pred_block);
+                const auto & fc = *pred_block.getByName(filter_col_name).column;
+                for (size_t j = 0; j < k; ++j)
+                    mask[indices[j]] = fc.getBool(j) ? 1 : 0;
+            }
+        }
+
+        for (size_t ci = 0; ci < n; ++ci)
+        {
+            if (!mask[ci])
+                continue;
+            const auto & c = cands[ci];
+            if (is_left_join)
+                left_matched[c.left_row] = true;
+            for (size_t i = 0; i < n_out_cols; ++i)
+            {
+                if (col_sources[i].from_left)
+                    mutable_cols[i]->insertFrom(*left_block.getByName(col_sources[i].name).column, c.left_row);
+                else
+                    mutable_cols[i]->insertFrom(
+                        *right_blocks[c.block_idx].getByName(col_sources[i].name).column, c.row_idx);
+            }
+        }
+
+        cands.clear();
+    };
+
+    /// Process a single left row's hit list in kChunkSize-sized batches.
+    /// Used when one left row has ≥ kLargeHit R-tree results (large-row mode).
+    /// Left row is ColumnConst per batch (PreparedGeometry for left geometry).
+    auto processLargeRow = [&](size_t li, std::vector<std::pair<BGBox, RightPos>> & row_hits)
+    {
+        for (size_t h = 0; h < row_hits.size(); h += kChunkSize)
+        {
+            const size_t chunk_end = std::min(h + kChunkSize, row_hits.size());
+            const size_t k = chunk_end - h;
+
+            // Pre-filter
+            std::vector<size_t> surviving;
+            if (pre_filter_expr)
+            {
+                Block pre_block;
+                for (const auto & src_col : left_block)
+                {
+                    if (!pre_filter_required.contains(src_col.name))
+                        continue;
+                    auto col = src_col.type->createColumn();
+                    col->reserve(k);
+                    for (size_t j = h; j < chunk_end; ++j)
+                        col->insertFrom(*src_col.column, li);
+                    pre_block.insert({std::move(col), src_col.type, src_col.name});
+                }
+                for (const auto & rcd : *right_header)
+                {
+                    if (!pre_filter_required.contains(rcd.name) || pre_block.has(rcd.name))
+                        continue;
+                    auto col = rcd.type->createColumn();
+                    col->reserve(k);
+                    for (size_t j = h; j < chunk_end; ++j)
+                        col->insertFrom(*right_blocks[row_hits[j].second.block_idx].getByName(rcd.name).column, row_hits[j].second.row_idx);
+                    pre_block.insert({std::move(col), rcd.type, rcd.name});
+                }
+                pre_filter_expr->execute(pre_block);
+                const auto & pfc = *pre_block.getByName(pre_filter_col_name).column;
+                surviving.reserve(k);
+                for (size_t j = 0; j < k; ++j)
+                    if (pfc.getBool(j))
+                        surviving.push_back(h + j);
+                if (surviving.empty())
+                    continue;
+            }
+
+            const size_t eff_k = pre_filter_expr ? surviving.size() : k;
+            Block pred_block;
+            for (const auto & src_col : left_block)
+            {
+                ColumnPtr single = src_col.column->cut(li, 1);
+                pred_block.insert({ColumnConst::create(std::move(single), eff_k), src_col.type, src_col.name});
+            }
+            for (const auto & rcd : *right_header)
+            {
+                if (pred_block.has(rcd.name))
+                    continue;
+                auto col = rcd.type->createColumn();
+                col->reserve(eff_k);
+                if (pre_filter_expr)
+                    for (size_t idx : surviving)
+                        col->insertFrom(*right_blocks[row_hits[idx].second.block_idx].getByName(rcd.name).column, row_hits[idx].second.row_idx);
+                else
+                    for (size_t j = h; j < chunk_end; ++j)
+                        col->insertFrom(*right_blocks[row_hits[j].second.block_idx].getByName(rcd.name).column, row_hits[j].second.row_idx);
+                pred_block.insert({std::move(col), rcd.type, rcd.name});
+            }
+            table_join->getMixedJoinExpression()->execute(pred_block);
+            const auto & fc = *pred_block.getByName(filter_col_name).column;
+            for (size_t j = 0; j < eff_k; ++j)
+            {
+                if (!fc.getBool(j))
+                    continue;
+                const size_t hit_idx = pre_filter_expr ? surviving[j] : (h + j);
+                const RightPos & pos = row_hits[hit_idx].second;
+                if (is_left_join)
+                    left_matched[li] = true;
+                for (size_t ci = 0; ci < n_out_cols; ++ci)
+                {
+                    if (col_sources[ci].from_left)
+                        mutable_cols[ci]->insertFrom(*left_block.getByName(col_sources[ci].name).column, li);
+                    else
+                        mutable_cols[ci]->insertFrom(*right_blocks[pos.block_idx].getByName(col_sources[ci].name).column, pos.row_idx);
+                }
+            }
+        }
+    };
+
+    // ── main probe loop ───────────────────────────────────────────────────────
+
+    /// Per-left-row hit buffer.  Populated lazily one entry at a time so we can
+    /// detect and handle large-hit-count rows before materialising them fully.
+    std::vector<std::pair<BGBox, RightPos>> row_buf;
+    row_buf.reserve(kChunkSize);
+
     for (size_t li = 0; li < left_rows; ++li)
     {
-        hits.clear();
+        row_buf.clear();
+        bool is_large = false;
+
         BGBox bbox = wkbBBox(left_geom.getDataAt(li));
         if (bbox_expand > 0.0)
         {
@@ -454,244 +743,60 @@ JoinResultPtr SpatialRTreeJoin::joinBlock(Block left_block)
                 BGPoint{boost::geometry::get<boost::geometry::max_corner, 0>(bbox) + bbox_expand,
                         boost::geometry::get<boost::geometry::max_corner, 1>(bbox) + bbox_expand}};
         }
+
         for (const auto & sub_tree : sub_trees)
-            sub_tree.query(boost::geometry::index::intersects(bbox), std::back_inserter(hits));
-        for (const auto & [box, pos] : hits)
-            candidates.push_back({li, pos.block_idx, pos.row_idx});
-    }
-
-    /// Pre-filter: evaluate cheap non-spatial ON conditions (e.g. `b1.id < b2.id`)
-    /// before invoking the spatial predicate.  Candidates that fail are removed now,
-    /// avoiding expensive geometry work for pairs a simple comparison would reject.
-    ///
-    /// Only the columns required by pre_filter_expr are materialised; geometry columns
-    /// are excluded unless they happen to appear in the non-spatial condition (rare).
-    if (pre_filter_expr && !candidates.empty())
-    {
-        const size_t n = candidates.size();
-
-        NameSet required;
-        for (const auto & col : pre_filter_expr->getRequiredColumns())
-            required.insert(col);
-
-        Block pre_block;
-        for (const auto & src_col : left_block)
         {
-            if (!required.contains(src_col.name))
-                continue;
-            auto col = src_col.type->createColumn();
-            col->reserve(n);
-            for (const auto & c : candidates)
-                col->insertFrom(*src_col.column, c.left_row);
-            pre_block.insert({std::move(col), src_col.type, src_col.name});
-        }
-        for (const auto & right_col_def : *right_header)
-        {
-            if (!required.contains(right_col_def.name) || pre_block.has(right_col_def.name))
-                continue;
-            auto col = right_col_def.type->createColumn();
-            col->reserve(n);
-            for (const auto & c : candidates)
-                col->insertFrom(*right_blocks[c.block_idx].getByName(right_col_def.name).column, c.row_idx);
-            pre_block.insert({std::move(col), right_col_def.type, right_col_def.name});
-        }
-
-        pre_filter_expr->execute(pre_block);
-        const auto & fc = *pre_block.getByName(pre_filter_col_name).column;
-
-        size_t j = 0;
-        for (size_t i = 0; i < n; ++i)
-            if (fc.getBool(i))
-                candidates[j++] = candidates[i];
-        candidates.resize(j);
-    }
-
-    if (candidates.empty())
-    {
-        Block result = buildOutputSchema();
-        if (!is_left_join)
-            return IJoinResult::createFromBlock(std::move(result));
-
-        /// LEFT JOIN with no bbox candidates: all left rows unmatched.
-        std::vector<bool> none_matched(left_rows, false);
-        appendUnmatched(result, none_matched);
-        return IJoinResult::createFromBlock(std::move(result));
-    }
-
-    const size_t n_cand = candidates.size();
-
-    // ─────────────────────────────────────────────────────────────────────────
-    // Grouped predicate evaluation with ColumnConst for the "smaller" side.
-    //
-    // Zone WKBs can be ~100-150 KB each.  A naïve approach that copies one WKB
-    // per candidate row produces gigabytes for large inputs (Q10: 6M trips ×
-    // ~150KB zone = 900GB; Q11: 195K candidates × 150KB = 29GB).
-    //
-    // Instead we group candidates by whichever side has fewer unique instances
-    // and wrap that side's geometry in a ColumnConst.  ColumnConst is recognised
-    // by the COLUMNAR_V1 bridge as COL_IS_CONST, so WASM builds a PreparedGeometry
-    // once per group and re-uses it for all rows in the group.
-    //
-    // Grouping strategy:
-    //   • fewer unique right rows → group by right → right_geom = ColumnConst
-    //     (Q11: RIGHT = ~100 zones, LEFT = 65K trips)
-    //   • otherwise              → group by left  → left_geom  = ColumnConst
-    //     (Q10: LEFT = ~100 zones, RIGHT = 6M trips)
-    // ─────────────────────────────────────────────────────────────────────────
-
-    /// Count unique right rows among candidates.
-    std::unordered_map<uint64_t, std::vector<size_t>> right_groups;
-    right_groups.reserve(std::min(n_cand, static_cast<size_t>(4096)));
-    for (size_t ci = 0; ci < n_cand; ++ci)
-    {
-        uint64_t key = static_cast<uint64_t>(candidates[ci].block_idx) * 0x100000000ULL
-                     + candidates[ci].row_idx;
-        right_groups[key].push_back(ci);
-    }
-
-    const bool group_by_right = right_groups.size() <= left_rows;
-
-    IColumn::Filter final_mask(n_cand, 0);
-
-    if (group_by_right)
-    {
-        /// Right side is ColumnConst per group (same right row for all k candidates).
-        /// Wrapping ALL right columns as ColumnConst (not just the geometry) means:
-        ///   - Large WKBs (100-150 KB) are not copied k times → no OOM.
-        ///   - The geometry ColumnConst is recognised by the COLUMNAR_V1 bridge as
-        ///     COL_IS_CONST → PreparedGeometry is built once per group.
-        ///   - Non-geometry columns (e.g. b2.id in Q9's `b1.id < b2.id`) are also
-        ///     present so the full mixed_join_expression can be evaluated.
-        for (const auto & [key, indices] : right_groups)
-        {
-            const size_t k = indices.size();
-            const auto & c0 = candidates[indices[0]];
-            const Block & right_block = right_blocks[c0.block_idx];
-
-            Block pred_block;
-
-            // All left columns: k varying values.
-            for (const auto & src_col : left_block)
+            for (auto qit = sub_tree.qbegin(boost::geometry::index::intersects(bbox));
+                 qit != sub_tree.qend(); ++qit)
             {
-                auto data = src_col.type->createColumn();
-                data->reserve(k);
-                for (size_t ci : indices)
-                    data->insertFrom(*src_col.column, candidates[ci].left_row);
-                pred_block.insert({std::move(data), src_col.type, src_col.name});
-            }
+                row_buf.push_back(*qit);
 
-            // All right columns: ColumnConst (same right row for entire group).
-            for (const auto & right_col_def : *right_header)
-            {
-                if (pred_block.has(right_col_def.name))
-                    continue; // skip name collisions (table-qualified names prevent these in practice)
-                ColumnPtr single = right_block.getByName(right_col_def.name).column->cut(c0.row_idx, 1);
-                pred_block.insert({ColumnConst::create(single, k), right_col_def.type, right_col_def.name});
-            }
+                if (!is_large && row_buf.size() >= kLargeHit)
+                {
+                    /// This left row has hit the large-row threshold (e.g. a
+                    /// globally-scoped zone whose bbox covers the entire right
+                    /// dataset).  Flush the shared candidates buffer so other
+                    /// rows' hits are not mixed in, then switch to streaming mode
+                    /// where this row's hits are processed in kChunkSize batches
+                    /// with the left geometry as ColumnConst.
+                    evaluateAndEmit(candidates);
+                    is_large = true;
+                }
 
-            table_join->getMixedJoinExpression()->execute(pred_block);
-            const auto & fc = *pred_block.getByName(filter_col_name).column;
-            for (size_t j = 0; j < k; ++j)
-                final_mask[indices[j]] = fc.getBool(j) ? 1 : 0;
+                if (is_large && row_buf.size() >= kChunkSize)
+                {
+                    processLargeRow(li, row_buf);
+                    row_buf.clear();
+                }
+            }
         }
-    }
-    else
-    {
-        /// Left side is ColumnConst per group (same left row for all k candidates).
-        std::unordered_map<size_t, std::vector<size_t>> left_groups;
-        left_groups.reserve(left_rows);
-        for (size_t ci = 0; ci < n_cand; ++ci)
-            left_groups[candidates[ci].left_row].push_back(ci);
 
-        for (const auto & [left_row, indices] : left_groups)
+        if (is_large)
         {
-            const size_t k = indices.size();
-
-            Block pred_block;
-
-            // All left columns: ColumnConst (same left row for entire group).
-            for (const auto & src_col : left_block)
-            {
-                ColumnPtr single = src_col.column->cut(left_row, 1);
-                pred_block.insert({ColumnConst::create(single, k), src_col.type, src_col.name});
-            }
-
-            // All right columns: k varying values.
-            for (const auto & right_col_def : *right_header)
-            {
-                if (pred_block.has(right_col_def.name))
-                    continue;
-                auto data = right_col_def.type->createColumn();
-                data->reserve(k);
-                for (size_t ci : indices)
-                    data->insertFrom(
-                        *right_blocks[candidates[ci].block_idx].getByName(right_col_def.name).column,
-                        candidates[ci].row_idx);
-                pred_block.insert({std::move(data), right_col_def.type, right_col_def.name});
-            }
-
-            table_join->getMixedJoinExpression()->execute(pred_block);
-            const auto & fc = *pred_block.getByName(filter_col_name).column;
-            for (size_t j = 0; j < k; ++j)
-                final_mask[indices[j]] = fc.getBool(j) ? 1 : 0;
+            if (!row_buf.empty())
+                processLargeRow(li, row_buf);
         }
-    }
-
-    // ─────────────────────────────────────────────────────────────────────────
-    // Build result block (non-geometry columns only) from matched candidates.
-    //
-    // We insert only matched rows (final_mask[ci] == 1) directly, avoiding the
-    // O(n_cand) intermediate allocation that previously occurred when building
-    // the full candidate block before filtering.  At SF10 n_cand can reach
-    // millions (wide bbox + dense building dataset), making the old approach
-    // allocate several GB of intermediate data per joinBlock call.
-    // ─────────────────────────────────────────────────────────────────────────
-
-    Block candidate_block = buildOutputSchema();
-    const size_t n_out_cols = candidate_block.columns();
-
-    // Precompute per-column source (left or right) to avoid repeated hash lookups.
-    struct ColSource { bool from_left; String name; };
-    std::vector<ColSource> col_sources;
-    col_sources.reserve(n_out_cols);
-    for (size_t i = 0; i < n_out_cols; ++i)
-    {
-        const auto & col_def = candidate_block.getByPosition(i);
-        col_sources.push_back({left_block.has(col_def.name), col_def.name});
-    }
-
-    MutableColumns mutable_cols(n_out_cols);
-    for (size_t i = 0; i < n_out_cols; ++i)
-        mutable_cols[i] = IColumn::mutate(candidate_block.getByPosition(i).column);
-
-    /// For LEFT JOIN, track which left rows had at least one match.
-    std::vector<bool> left_matched(is_left_join ? left_rows : 0, false);
-
-    for (size_t ci = 0; ci < n_cand; ++ci)
-    {
-        if (!final_mask[ci])
-            continue;
-        const auto & c = candidates[ci];
-        if (is_left_join)
-            left_matched[c.left_row] = true;
-        for (size_t i = 0; i < n_out_cols; ++i)
+        else if (!row_buf.empty())
         {
-            if (col_sources[i].from_left)
-                mutable_cols[i]->insertFrom(*left_block.getByName(col_sources[i].name).column, c.left_row);
-            else
-                mutable_cols[i]->insertFrom(
-                    *right_blocks[c.block_idx].getByName(col_sources[i].name).column, c.row_idx);
+            /// Normal row: commit its hits to the shared candidate buffer so
+            /// evaluateAndEmit can group across many left rows, calling WASM
+            /// once per unique right (or left) geometry value.
+            for (const auto & [box, pos] : row_buf)
+                candidates.push_back({li, pos.block_idx, pos.row_idx});
+
+            if (candidates.size() >= kMaxCandidates)
+                evaluateAndEmit(candidates);
         }
     }
+    evaluateAndEmit(candidates); // emit all accumulated candidates
 
     for (size_t i = 0; i < n_out_cols; ++i)
-        candidate_block.getByPosition(i).column = std::move(mutable_cols[i]);
+        output.getByPosition(i).column = std::move(mutable_cols[i]);
 
-    /// Append unmatched left rows (with NULL right cols) for LEFT JOIN.
     if (is_left_join)
-        appendUnmatched(candidate_block, left_matched);
+        appendUnmatched(output, left_matched);
 
-    return IJoinResult::createFromBlock(std::move(candidate_block));
+    return IJoinResult::createFromBlock(std::move(output));
 }
 
 }
