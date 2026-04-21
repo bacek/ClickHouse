@@ -298,6 +298,17 @@ bool SpatialRTreeJoin::addBlockToJoin(const Block & block, bool /*check_limits*/
     return true;
 }
 
+void SpatialRTreeJoin::runPostBuildPhase()
+{
+    /// Bulk-load the R-tree from all accumulated entries using the packing (STR) algorithm.
+    /// Called once by FillingRightJoinSideTransform after all addBlockToJoin() calls complete,
+    /// in a single thread, before any joinBlock() call — so no locking is needed here or in
+    /// joinBlock() when accessing the rtree.
+    rtree = RTree(pending_entries.begin(), pending_entries.end());
+    pending_entries.clear();
+    pending_entries.shrink_to_fit();
+}
+
 JoinResultPtr SpatialRTreeJoin::joinBlock(Block left_block)
 {
     const size_t left_rows = left_block.rows();
@@ -374,16 +385,6 @@ JoinResultPtr SpatialRTreeJoin::joinBlock(Block left_block)
         }
         return IJoinResult::createFromBlock(std::move(result));
     }
-
-    /// Bulk-load the R-tree from pending_entries on the first probe call.
-    /// Using the range constructor (packing / STR algorithm) is significantly faster
-    /// than N individual inserts for large right-side tables (e.g. 6M trip rows).
-    std::call_once(rtree_init_flag, [this]
-    {
-        rtree = RTree(pending_entries.begin(), pending_entries.end());
-        pending_entries.clear();
-        pending_entries.shrink_to_fit();
-    });
 
     const IColumn & left_geom = *left_block.getByName(left_geom_col).column;
 
