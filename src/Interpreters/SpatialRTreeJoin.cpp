@@ -3,6 +3,7 @@
 #include <bit>
 #include <cstring>
 #include <limits>
+#include <thread>
 
 #include <Columns/ColumnConst.h>
 #include <Columns/ColumnString.h>
@@ -300,11 +301,39 @@ bool SpatialRTreeJoin::addBlockToJoin(const Block & block, bool /*check_limits*/
 
 void SpatialRTreeJoin::runPostBuildPhase()
 {
-    /// Bulk-load the R-tree from all accumulated entries using the packing (STR) algorithm.
-    /// Called once by FillingRightJoinSideTransform after all addBlockToJoin() calls complete,
-    /// in a single thread, before any joinBlock() call — so no locking is needed here or in
-    /// joinBlock() when accessing the rtree.
-    rtree = RTree(pending_entries.begin(), pending_entries.end());
+    /// Bulk-load sub-trees in parallel using the packing (STR) algorithm.
+    /// Called once by FillingRightJoinSideTransform (single thread) before any joinBlock(),
+    /// so no locking is needed here or in joinBlock() when reading sub_trees.
+    ///
+    /// Splitting into K chunks and building K trees in parallel eliminates the long
+    /// single-CPU period that precedes parallel probe when the right side is large (e.g.
+    /// 60M trip points in Q10/Q11).  Each sub-tree covers a contiguous slice of the
+    /// spatially-unsorted pending_entries, so query overhead is O(K × log(N/K)) instead
+    /// of O(log N) — acceptable because empty-result queries dominate at this scale.
+    const size_t n = pending_entries.size();
+    if (n == 0)
+        return;
+
+    const size_t num_parts = std::max(size_t{1},
+        std::min(static_cast<size_t>(std::thread::hardware_concurrency()), n));
+    sub_trees.resize(num_parts);
+
+    const size_t chunk = (n + num_parts - 1) / num_parts;
+    std::vector<std::thread> threads;
+    threads.reserve(num_parts);
+    for (size_t t = 0; t < num_parts; ++t)
+    {
+        const size_t begin = t * chunk;
+        const size_t end   = std::min(begin + chunk, n);
+        threads.emplace_back([this, begin, end, t]
+        {
+            sub_trees[t] = RTree(pending_entries.begin() + begin,
+                                  pending_entries.begin() + end);
+        });
+    }
+    for (auto & th : threads)
+        th.join();
+
     pending_entries.clear();
     pending_entries.shrink_to_fit();
 }
@@ -406,7 +435,8 @@ JoinResultPtr SpatialRTreeJoin::joinBlock(Block left_block)
                 BGPoint{boost::geometry::get<boost::geometry::max_corner, 0>(bbox) + bbox_expand,
                         boost::geometry::get<boost::geometry::max_corner, 1>(bbox) + bbox_expand}};
         }
-        rtree.query(boost::geometry::index::intersects(bbox), std::back_inserter(hits));
+        for (const auto & sub_tree : sub_trees)
+            sub_tree.query(boost::geometry::index::intersects(bbox), std::back_inserter(hits));
         for (const auto & [box, pos] : hits)
             candidates.push_back({li, pos.block_idx, pos.row_idx});
     }

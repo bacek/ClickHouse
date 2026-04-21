@@ -122,12 +122,15 @@ private:
 
     std::vector<Block> right_blocks;
 
-    /// Entries buffered during build phase; bulk-loaded into rtree by runPostBuildPhase().
-    /// Using bulk-load (packing / STR algorithm) instead of per-row insert reduces
-    /// build cost for large right-side tables from O(N log N) quadratic-rebalance to
-    /// a single sorted sweep — typically 10× faster for millions of entries.
+    /// Entries buffered during build phase; consumed by runPostBuildPhase().
     std::vector<std::pair<BGBox, RightPos>> pending_entries;
-    RTree rtree;              /// built by runPostBuildPhase(), read-only during probe
+
+    /// Sub-trees built in parallel by runPostBuildPhase() — one per CPU core.
+    /// Each covers a contiguous slice of pending_entries (packing/STR algorithm).
+    /// joinBlock() queries all sub-trees and merges candidates; query overhead vs a
+    /// single large tree is O(K × log(N/K)) instead of O(log N), acceptable because
+    /// empty-result queries dominate and their cost scales with tree depth not output.
+    std::vector<RTree> sub_trees;
 
     size_t total_right_rows = 0;
     size_t total_right_bytes = 0;
