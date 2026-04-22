@@ -4,6 +4,7 @@
 
 #include <DataTypes/DataTypeNullable.h>
 
+#include <Analyzer/ConstantNode.h>
 #include <Analyzer/FunctionNode.h>
 #include <Analyzer/InDepthQueryTreeVisitor.h>
 
@@ -115,9 +116,16 @@ struct ChainCandidate
 {
     Strings                          fn_names;          // SOURCE → SINK order
     std::shared_ptr<WasmModule>      wasm_module;
-    QueryTreeNodes                   source_args;       // arguments of the SOURCE function
+    QueryTreeNodes                   source_args;       // arguments fed into chain SOURCE
     DataTypes                        source_arg_types;
     DataTypePtr                      result_type;       // return type of the SINK function
+    // Scalar constants per function, indexed same as fn_names.
+    // SOURCE (index 0) and SINK (last index) have empty inner vectors.
+    std::vector<std::vector<Field>>  fn_scalar_values;
+    std::vector<DataTypes>           fn_scalar_types;
+    // QueryTreeNodePtr for each chain function, SOURCE → SINK order.
+    // Used by the retry loop to recover the dropped SOURCE node as the new input expression.
+    QueryTreeNodes                   fn_nodes;
 };
 
 /// Walk inward from `node` collecting a chain of WASM functions from the same module.
@@ -150,21 +158,35 @@ std::optional<ChainCandidate> tryCollectChain(QueryTreeNodePtr & node)
     if (!inner_wasm || inner_wasm->getModule().get() != sink_wasm->getModule().get())
         return std::nullopt;
 
-    // Build the chain walking inward from the SINK.
-    // We collect function names in SINK→SOURCE order, then reverse.
+    // Collect the chain in SINK→SOURCE order, then reverse.
+    // Scalar constants (from ConstantNode args after the geometry arg) travel with
+    // each function so they can be serialised into row_buf by the executor.
     Strings fn_names;
+    std::vector<std::vector<Field>> fn_scalar_values;
+    std::vector<DataTypes>          fn_scalar_types;
+    QueryTreeNodes                  fn_node_ptrs;  // parallel to fn_names, for shrink retry
+
+    // SINK has no scalar args (enforced by sink_args.size() == 1 above).
     fn_names.push_back(sink_fn->getFunctionName());
+    fn_scalar_values.push_back({});
+    fn_scalar_types.push_back({});
+    fn_node_ptrs.push_back(node);
+
+    // inner_fn: scalars filled in the first loop iteration if it is an XFORM.
     fn_names.push_back(inner_fn->getFunctionName());
+    fn_scalar_values.push_back({});
+    fn_scalar_types.push_back({});
+    fn_node_ptrs.push_back(sink_args[0]);
 
     FunctionNode * source_fn = inner_fn;
 
-    // Keep walking if inner has exactly 1 arg that is also a WASM UDF from same module.
     while (true)
     {
         auto & cur_args = source_fn->getArguments().getNodes();
-        if (cur_args.size() != 1)
-            break; // source_fn is the SOURCE (multiple or zero args)
+        if (cur_args.empty())
+            break;
 
+        // First arg must be a WASM UDF from the same module to continue the chain.
         auto * next_fn = cur_args[0]->as<FunctionNode>();
         if (!next_fn)
             break;
@@ -173,16 +195,43 @@ std::optional<ChainCandidate> tryCollectChain(QueryTreeNodePtr & node)
         if (!next_wasm || next_wasm->getModule().get() != sink_wasm->getModule().get())
             break;
 
+        // Remaining args must be compile-time constants (scalar parameters).
+        std::vector<Field> scalars;
+        DataTypes scalar_types;
+        bool all_const = true;
+        for (size_t k = 1; k < cur_args.size(); ++k)
+        {
+            const auto * cn = cur_args[k]->as<ConstantNode>();
+            if (!cn) { all_const = false; break; }
+            scalars.push_back(cn->getValue());
+            scalar_types.push_back(cn->getResultType());
+        }
+        if (!all_const)
+            break;
+
+        // source_fn is an XFORM — record its scalar args (filling the placeholder).
+        fn_scalar_values.back() = std::move(scalars);
+        fn_scalar_types.back()  = std::move(scalar_types);
+
         fn_names.push_back(next_fn->getFunctionName());
+        fn_scalar_values.push_back({});
+        fn_scalar_types.push_back({});
+        fn_node_ptrs.push_back(cur_args[0]);
         source_fn = next_fn;
     }
 
     // Reverse from SINK→SOURCE to SOURCE→SINK.
     std::reverse(fn_names.begin(), fn_names.end());
+    std::reverse(fn_scalar_values.begin(), fn_scalar_values.end());
+    std::reverse(fn_scalar_types.begin(), fn_scalar_types.end());
+    std::reverse(fn_node_ptrs.begin(), fn_node_ptrs.end());
 
     ChainCandidate candidate;
-    candidate.fn_names    = std::move(fn_names);
-    candidate.wasm_module = sink_wasm->getModule();
+    candidate.fn_names         = std::move(fn_names);
+    candidate.fn_scalar_values = std::move(fn_scalar_values);
+    candidate.fn_scalar_types  = std::move(fn_scalar_types);
+    candidate.fn_nodes         = std::move(fn_node_ptrs);
+    candidate.wasm_module      = sink_wasm->getModule();
     // Use the base (non-nullable) result type so the chain function can rely on
     // useDefaultImplementationForNulls() for external null propagation.  The sink's
     // query-tree result type may be Nullable(T) if it is called with a nullable
@@ -237,12 +286,34 @@ public:
             return;
         }
 
-        if (!validateChainViaWasm(*candidate->wasm_module, candidate->fn_names))
+        // Validate; if rejected, progressively drop from the front (SOURCE end) and
+        // retry.  This handles the case where the deepest function (e.g. st_collect_agg)
+        // is a WASM UDF from the same module but is not registered in the chain registry.
+        // The greedy walk includes it as SOURCE, validation fails, and we retry with the
+        // next function acting as SOURCE — using the dropped node as the new input expression.
+        while (!validateChainViaWasm(*candidate->wasm_module, candidate->fn_names))
         {
+            if (candidate->fn_names.size() <= 2)
+            {
+                LOG_DEBUG(getLogger("WasmChainFusionPass"),
+                    "clickhouse_can_chain_execute rejected chain [{}], no shorter chain possible",
+                    fmt::join(candidate->fn_names, " -> "));
+                return;
+            }
+
+            // Drop the front SOURCE; its entire call expression becomes the new chain input.
+            QueryTreeNodePtr dropped = candidate->fn_nodes.front();
+            candidate->source_args      = {dropped};
+            candidate->source_arg_types = {dropped->as<FunctionNode>()->getResultType()};
+
+            candidate->fn_names.erase(candidate->fn_names.begin());
+            candidate->fn_scalar_values.erase(candidate->fn_scalar_values.begin());
+            candidate->fn_scalar_types.erase(candidate->fn_scalar_types.begin());
+            candidate->fn_nodes.erase(candidate->fn_nodes.begin());
+
             LOG_DEBUG(getLogger("WasmChainFusionPass"),
-                "clickhouse_can_chain_execute rejected chain [{}]",
+                "Retrying with shorter chain [{}]",
                 fmt::join(candidate->fn_names, " -> "));
-            return;
         }
 
         LOG_DEBUG(getLogger("WasmChainFusionPass"),
@@ -254,6 +325,8 @@ public:
             std::move(candidate->wasm_module),
             std::move(candidate->source_arg_types),
             std::move(candidate->result_type),
+            std::move(candidate->fn_scalar_values),
+            std::move(candidate->fn_scalar_types),
             getContext());
 
         auto original_alias = node->getAlias();
