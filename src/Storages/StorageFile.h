@@ -149,6 +149,10 @@ public:
 
     bool supportsTrivialCountOptimization(const StorageSnapshotPtr &, ContextPtr) const override { return true; }
 
+    /// Returns total row count from the schema cache if available for all files.
+    /// Returns nullopt if any file's count is uncached (e.g. first query, glob, archive).
+    std::optional<UInt64> totalRows(ContextPtr context) const override;
+
     void addInferredEngineArgsToCreateQuery(ASTs & args, const ContextPtr & context) const override;
 
 protected:
