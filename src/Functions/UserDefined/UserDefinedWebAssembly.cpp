@@ -1309,12 +1309,16 @@ public:
         std::shared_ptr<WebAssembly::WasmModule> wasm_module_,
         DataTypes source_arg_types_,
         DataTypePtr result_type_,
+        std::vector<std::vector<Field>> fn_scalar_values_,
+        std::vector<DataTypes>          fn_scalar_types_,
         ContextPtr context_)
         : name(std::move(name_))
         , fn_names(std::move(fn_names_))
         , wasm_module(std::move(wasm_module_))
         , source_arg_types(std::move(source_arg_types_))
         , result_type(std::move(result_type_))
+        , fn_scalar_values(std::move(fn_scalar_values_))
+        , fn_scalar_types(std::move(fn_scalar_types_))
         , context(std::move(context_))
         , compartment_pool(
               static_cast<UInt32>(context->getSettingsRef()[Setting::webassembly_udf_max_instances]),
@@ -1366,16 +1370,35 @@ public:
         }
 
         // ── Build COLUMNAR_V1 row buffer ─────────────────────────────────────
-        const uint32_t num_cols = static_cast<uint32_t>(arguments.size());
+        // Scalar constants are appended after the source geometry columns as
+        // COL_IS_CONST columns (1 stored row each).  The WASM side reads them
+        // by column index after consuming the source geometry columns.
+        const uint32_t num_src_cols = static_cast<uint32_t>(arguments.size());
+
+        // Materialise scalar constants into 1-row mutable columns.
+        uint32_t total_scalar_cols = 0;
+        for (const auto & sv : fn_scalar_values)
+            total_scalar_cols += static_cast<uint32_t>(sv.size());
+
+        std::vector<MutableColumnPtr> scalar_col_storage;
+        scalar_col_storage.reserve(total_scalar_cols);
+        for (size_t fi = 0; fi < fn_scalar_values.size(); ++fi)
+            for (size_t si = 0; si < fn_scalar_values[fi].size(); ++si)
+            {
+                auto mut = fn_scalar_types[fi][si]->createColumn();
+                mut->insert(fn_scalar_values[fi][si]);
+                scalar_col_storage.push_back(std::move(mut));
+            }
+
+        const uint32_t num_cols = num_src_cols + total_scalar_cols;
         uint32_t col_cursor = COLUMNAR_HEADER_BYTES + num_cols * COLUMNAR_DESC_BYTES;
 
         std::vector<ColDescriptor> descs(num_cols);
         std::vector<const IColumn *> inner_cols(num_cols);
-        std::vector<bool> is_const_flags(num_cols);
-        std::vector<bool> is_nullable_flags(num_cols);
+        std::vector<bool> is_nullable_flags(num_cols, false);
         std::vector<uint32_t> row_counts(num_cols);
 
-        for (uint32_t ci = 0; ci < num_cols; ++ci)
+        for (uint32_t ci = 0; ci < num_src_cols; ++ci)
         {
             const IColumn * col = arguments[ci].column.get();
             bool is_const = false;
@@ -1386,11 +1409,19 @@ public:
             }
             bool is_nullable = typeid_cast<const ColumnNullable *>(col) != nullptr;
             uint32_t nrows = is_const ? 1u : static_cast<uint32_t>(input_rows_count);
-            is_const_flags[ci]    = is_const;
             is_nullable_flags[ci] = is_nullable;
             inner_cols[ci]        = col;
             row_counts[ci]        = nrows;
             col_cursor = buildColDescriptor(col, is_const, is_nullable, nrows, col_cursor, descs[ci]);
+        }
+
+        for (uint32_t si = 0; si < total_scalar_cols; ++si)
+        {
+            uint32_t ci = num_src_cols + si;
+            const IColumn * col = scalar_col_storage[si].get();
+            inner_cols[ci]  = col;
+            row_counts[ci]  = 1u;
+            col_cursor = buildColDescriptor(col, /*is_const=*/true, /*is_nullable=*/false, 1u, col_cursor, descs[ci]);
         }
 
         {
@@ -1444,6 +1475,8 @@ private:
     std::shared_ptr<WebAssembly::WasmModule>  wasm_module;
     DataTypes                                 source_arg_types;
     DataTypePtr                               result_type;
+    std::vector<std::vector<Field>>           fn_scalar_values;
+    std::vector<DataTypes>                    fn_scalar_types;
     ContextPtr                                context;
     mutable WasmCompartmentPool               compartment_pool;
     mutable StopSource                        interrupt_source;
@@ -1454,6 +1487,8 @@ FunctionOverloadResolverPtr createWasmChainResolver(
     std::shared_ptr<WebAssembly::WasmModule> wasm_module,
     DataTypes source_arg_types,
     DataTypePtr result_type,
+    std::vector<std::vector<Field>> fn_scalar_values,
+    std::vector<DataTypes>          fn_scalar_types,
     ContextPtr context)
 {
     // Synthetic name for logging/explain; not registered in any factory.
@@ -1470,6 +1505,8 @@ FunctionOverloadResolverPtr createWasmChainResolver(
         std::move(wasm_module),
         std::move(source_arg_types),
         std::move(result_type),
+        std::move(fn_scalar_values),
+        std::move(fn_scalar_types),
         std::move(context));
     return std::make_unique<FunctionToOverloadResolverAdaptor>(std::move(fn));
 }
