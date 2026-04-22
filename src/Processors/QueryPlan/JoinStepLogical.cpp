@@ -55,6 +55,7 @@
 
 #include <Storages/MergeTree/MergeTreeData.h>
 #include <Storages/StorageJoin.h>
+#include <Interpreters/SpatialRTreeJoin.h>
 
 #include <Processors/QueryPlan/Optimizations/joinOrder.h>
 #include <algorithm>
@@ -1082,9 +1083,10 @@ static QueryPlanNode buildPhysicalJoinImpl(
 
             if (!is_disjunctive_condition)
             {
-                /// Check if this is a spatial predicate join (SpatialRTreeJoin handles INNER and LEFT).
+                /// Check if this is a spatial predicate join (SpatialRTreeJoin handles INNER, LEFT, and RIGHT).
+                /// RIGHT arises when the generic join optimizer flips a LEFT JOIN to put the smaller side on the build (right) side.
                 bool is_spatial_predicate_join = false;
-                if ((isInner(join_operator.kind) || isLeft(join_operator.kind)) && join_expression.size() == 1)
+                if ((isInner(join_operator.kind) || isLeft(join_operator.kind) || isRight(join_operator.kind)) && join_expression.size() == 1)
                 {
                     const auto * node = join_expression[0].getNode();
                     /// Spatial predicates (st_within, st_contains, st_intersects, …) route to SpatialRTreeJoin.
@@ -1399,6 +1401,68 @@ static QueryPlanNode buildPhysicalJoinImpl(
         right_sample_block,
         join_algorithm_params);
 
+    /// Spatial R-tree side swap: for SpatialRTreeJoin the LEFT side probes the R-tree
+    /// (one R-tree query per left row) and the RIGHT side is the R-tree build side.
+    /// Optimal layout: small side on LEFT (probe), large side on RIGHT (build).
+    /// If the left side is much larger than the right (≥5×), swap so the smaller side
+    /// becomes the probe and the larger side becomes the R-tree.  This converts:
+    ///   INNER → INNER (symmetric, no semantic change)
+    ///   LEFT  → RIGHT (all original-left rows still appear via getNonJoinedBlocks)
+    ///
+    /// We swap:  children[0]↔children[1], left_dag↔right_dag,
+    ///           left_sample_block↔right_sample_block, table_join->swapSides().
+    /// Then we recreate SpatialRTreeJoin with the new right_sample_block (= original left).
+    if (join_algorithm_params.spatial_rtree_swap_table
+        && typeid_cast<const SpatialRTreeJoin *>(join_algorithm_ptr.get())
+        && join_algorithm_params.lhs_size_estimation
+        && join_algorithm_params.rhs_size_estimation)
+    {
+        static constexpr double kSwapRatio = 5.0;
+        /// Swap when left (probe) is much larger than right (build): reduces probe calls.
+        const double ratio = static_cast<double>(*join_algorithm_params.lhs_size_estimation)
+                           / static_cast<double>(*join_algorithm_params.rhs_size_estimation);
+        if (ratio >= kSwapRatio)
+        {
+            std::swap(children[0], children[1]);
+            std::swap(left_dag, right_dag);
+            std::swap(left_sample_block, right_sample_block);
+            table_join->swapSides(); // Left→Right (or Inner stays Inner)
+
+            /// Recompute the R-tree join with the new right_sample_block (= original left = small side).
+            const auto & mixed = table_join->getMixedJoinExpression();
+            if (mixed)
+            {
+                const auto & dag_outputs = mixed->getActionsDAG().getOutputs();
+                if (dag_outputs.size() == 1
+                    && dag_outputs[0]->function_base)
+                {
+                    String lc;
+                    String rc;
+                    double bbox_expand = 0.0;
+                    const int expand_idx = dag_outputs[0]->function_base->getSpatialExpandArg();
+                    if (SpatialRTreeJoin::identifyGeomColumns(mixed, *right_sample_block, lc, rc, expand_idx, bbox_expand))
+                    {
+                        LOG_DEBUG(
+                            getLogger("SpatialRTreeJoin"),
+                            "Swapping R-tree sides (lhs/rhs ratio={:.0f}): build on new-right ({} rows), probe with new-left ({} rows)",
+                            ratio,
+                            *join_algorithm_params.rhs_size_estimation,
+                            *join_algorithm_params.lhs_size_estimation);
+                        join_algorithm_ptr = std::make_shared<SpatialRTreeJoin>(table_join, right_sample_block, bbox_expand);
+                    }
+                    else
+                    {
+                        // identifyGeomColumns failed with swapped header — revert
+                        std::swap(children[0], children[1]);
+                        std::swap(left_dag, right_dag);
+                        std::swap(left_sample_block, right_sample_block);
+                        table_join->swapSides(); // revert
+                    }
+                }
+            }
+        }
+    }
+
     QueryPlanNode node;
     node.children = std::move(children);
     String residual_filter_condition_name = residual_filter_condition ? residual_filter_condition.getColumnName() : "";
@@ -1464,6 +1528,9 @@ void JoinStepLogical::buildPhysicalJoin(
 
         if (join_step->right_rows_estimation)
             join_step->join_algorithm_params->rhs_size_estimation = join_step->right_rows_estimation;
+        if (join_step->left_rows_estimation)
+            join_step->join_algorithm_params->lhs_size_estimation = join_step->left_rows_estimation;
+        join_step->join_algorithm_params->spatial_rtree_swap_table = optimization_settings.spatial_rtree_swap_table;
 
         if (hash_table_key_hash)
         {

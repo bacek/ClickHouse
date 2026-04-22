@@ -2360,6 +2360,13 @@ DECLARE(BoolAuto, query_plan_join_swap_table, Field("auto"), R"(
     - 'false': Never swap tables (the right table is the build table).
     - 'true': Always swap tables (the left table is the build table).
 )", 0) \
+DECLARE(Bool, query_plan_spatial_rtree_swap_table, true, R"(
+    When enabled, automatically swap the build and probe sides of a spatial R-tree join
+    (SpatialRTreeJoin) if row count estimates indicate that the right side is much larger
+    than the left side (more than 5×). Swapping puts the smaller side in the R-tree (build)
+    and streams the larger side as probe rows, which is faster when the larger side consists
+    of point geometries and the smaller side consists of polygons with large bounding boxes.
+)", 0) \
 DECLARE(UInt64, query_plan_optimize_join_order_limit, 10, R"(
     Optimize the order of joins within the same subquery. Currently only supported for very limited cases.
     Value is the maximum number of tables to optimize.

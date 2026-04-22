@@ -26,6 +26,7 @@
 #include <Processors/QueryPlan/Optimizations/Utils.h>
 #include <Processors/QueryPlan/QueryPlan.h>
 #include <Processors/QueryPlan/ReadFromMemoryStorageStep.h>
+#include <Processors/QueryPlan/SourceStepWithFilter.h>
 #include <Processors/Transforms/JoiningTransform.h>
 #include <Processors/QueryPlan/ReadFromMergeTree.h>
 #include <Processors/QueryPlan/SortingStep.h>
@@ -292,6 +293,14 @@ RelationStats estimateReadRowsCount(QueryPlan::Node & node, const ActionsDAG::No
         UInt64 estimated_rows = reading->getStorage()->totalRows({}).value_or(0);
         String table_display_name = reading->getStorage()->getName();
         return RelationStats{.estimated_rows = estimated_rows, .table_name = table_display_name};
+    }
+
+    if (const auto * source = dynamic_cast<const SourceStepWithFilter *>(step))
+    {
+        const auto & storage = source->getStorageSnapshot()->storage;
+        auto rows = storage.totalRows(source->getContext());
+        if (rows)
+            return RelationStats{.estimated_rows = rows, .table_name = storage.getName()};
     }
 
     if (const auto * reading = typeid_cast<const CommonSubplanReferenceStep *>(step))
@@ -1199,14 +1208,40 @@ void optimizeJoinLogicalImpl(JoinStepLogical * join_step, QueryPlan::Node & node
     auto strictness = join_operator.strictness;
     auto kind = join_operator.kind;
     auto locality = join_operator.locality;
+    /// Spatial predicate joins (single ON clause whose only condition is a spatial UDF)
+    /// are routed to SpatialRTreeJoin, which has its own side-swap heuristic.
+    /// Letting the generic hash-join optimizer flip sides is incorrect here: the optimal
+    /// R-tree side depends on bbox geometry (points vs polygons), not just row count.
+    auto is_spatial_pred_join = [&]() -> bool
+    {
+        if (join_operator.expression.size() != 1)
+            return false;
+        const auto * expr_node = join_operator.expression[0].getNode();
+        return expr_node
+            && expr_node->type == ActionsDAG::ActionType::FUNCTION
+            && expr_node->function_base
+            && expr_node->function_base->isSpatialPredicate();
+    };
+
+    const bool is_spatial = is_spatial_pred_join();
+
     if (!optimization_settings.query_plan_optimize_join_order_limit
         || (strictness != JoinStrictness::All && !isSwapOnlyJoinStrictness(strictness))
         || locality != JoinLocality::Unspecified
         || kind == JoinKind::Paste
         || !join_operator.residual_filter.empty()
+        || is_spatial
     )
     {
-        join_step->setOptimized();
+        if (is_spatial && node.children.size() >= 2)
+        {
+            /// Pass row estimates so JoinStepLogical can decide whether to swap sides.
+            auto lhs_est = estimateReadRowsCount(*node.children[0]).estimated_rows;
+            auto rhs_est = estimateReadRowsCount(*node.children[1]).estimated_rows;
+            join_step->setOptimized({}, lhs_est, rhs_est);
+        }
+        else
+            join_step->setOptimized();
         return;
     }
 

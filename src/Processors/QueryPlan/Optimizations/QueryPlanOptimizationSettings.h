@@ -69,6 +69,8 @@ struct QueryPlanOptimizationSettings
     /// true/false - always/never swap
     /// nullopt - swap if it's beneficial
     std::optional<bool> join_swap_table;
+    /// Automatically swap R-tree build/probe sides for spatial joins when right >> left
+    bool spatial_rtree_swap_table = true;
     /// Maximum number of tables in query graph to reorder
     UInt64 query_plan_optimize_join_order_limit;
     /// When non-zero, randomize statistics for join reordering using this value as seed

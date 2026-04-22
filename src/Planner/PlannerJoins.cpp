@@ -69,6 +69,7 @@ namespace Setting
     extern const SettingsNonZeroUInt64 grace_hash_join_initial_buckets;
     extern const SettingsNonZeroUInt64 grace_hash_join_max_buckets;
     extern const SettingsBool allow_dynamic_type_in_join_keys;
+    extern const SettingsBool query_plan_spatial_rtree_swap_table;
 }
 
 namespace ServerSetting
@@ -1230,6 +1231,7 @@ JoinAlgorithmParams::JoinAlgorithmParams(const Context & context)
 
     initial_query_id = context.getInitialQueryId();
     lock_acquire_timeout = std::chrono::milliseconds(settings[Setting::lock_acquire_timeout].totalMilliseconds());
+    spatial_rtree_swap_table = settings[Setting::query_plan_spatial_rtree_swap_table];
 }
 
 JoinAlgorithmParams::JoinAlgorithmParams(
@@ -1270,7 +1272,8 @@ std::shared_ptr<IJoin> chooseJoinAlgorithm(
     /// Use an R-tree index on the right geometry column to skip bbox-disjoint pairs.
     /// Must be checked BEFORE the mixed-conditions hash-only guard below.
     if (table_join->getMixedJoinExpression()
-        && (table_join->kind() == JoinKind::Inner || table_join->kind() == JoinKind::Left)
+        && (table_join->kind() == JoinKind::Inner || table_join->kind() == JoinKind::Left
+            || table_join->kind() == JoinKind::Right)
         && table_join->getClauses().size() == 1
         && table_join->getClauses().front().key_names_left.empty())
     {

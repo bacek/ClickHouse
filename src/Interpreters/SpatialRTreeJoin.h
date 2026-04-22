@@ -49,8 +49,9 @@ public:
     std::string getName() const override { return "SpatialRTreeJoin"; }
     const TableJoin & getTableJoin() const override { return *table_join; }
 
-    /// The R-tree and right_blocks are read-only after the build phase, so
-    /// joinBlock() can be called concurrently from multiple probe threads.
+    /// Parallel join is safe for all kinds.  For RIGHT JOIN the matched bitmap uses
+    /// byte-per-row (vector<char>) with relaxed-atomic writes so concurrent probes
+    /// from multiple threads can safely mark the same right row as matched.
     bool supportParallelJoin() const override { return true; }
 
     void initialize(const Block & left_sample_block) override;
@@ -68,13 +69,15 @@ public:
     size_t getTotalByteCount() const override { return total_right_bytes; }
     bool alwaysReturnsEmptySet() const override { return total_right_rows == 0; }
 
+    /// Thread-safe overrides required because supportParallelJoin() = true causes
+    /// multiple FillingRightJoinSideTransform instances to call setTotals() concurrently.
+    void setTotals(const Block & block) override;
+    const Block & getTotals() const override;
+
     IBlocksStreamPtr getNonJoinedBlocks(
-        const Block & /*left_sample_block*/,
-        const Block & /*result_sample_block*/,
-        UInt64 /*max_block_size*/) const override
-    {
-        return nullptr; /// INNER JOIN only in v1
-    }
+        const Block & left_sample_block,
+        const Block & result_sample_block,
+        UInt64 max_block_size) const override;
 
     /// Try to identify left/right geometry column names from the spatial predicate
     /// ActionsDAG. Returns false if detection fails (e.g. either argument is wrapped
@@ -120,6 +123,10 @@ private:
     /// joinBlock() is read-only after build and needs no lock.
     std::mutex build_mutex;
 
+    /// Protects setTotals/getTotals against concurrent calls from multiple
+    /// FillingRightJoinSideTransform instances (one per parallel build thread).
+    mutable std::mutex totals_mutex;
+
     std::vector<Block> right_blocks;
 
     /// Entries buffered during build phase; consumed by runPostBuildPhase().
@@ -136,6 +143,15 @@ private:
     size_t total_right_bytes = 0;
 
     Block left_sample; /// stored by initialize()
+
+    /// RIGHT JOIN support: tracks which right rows have been matched during probe.
+    /// Indexed as right_matched_per_block[block_idx][row_idx]. Populated lazily in
+    /// runPostBuildPhase() (one inner vector per right block, all 0).
+    /// Byte-per-row (char) allows relaxed-atomic writes from concurrent joinBlock() threads:
+    /// multiple threads may race to write 1 to the same byte, which is safe because
+    /// (a) all writers write the same value and (b) getNonJoinedBlocks() is called only
+    /// after all joinBlock() invocations have completed (pipeline synchronisation barrier).
+    std::vector<std::vector<char>> right_matched_per_block;
 
     /// Scan raw WKB/EWKB bytes and return the bounding box without constructing
     /// any geometry object. Handles 2D and 3D (Z/M) coordinates, EWKB SRID flag,

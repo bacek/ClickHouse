@@ -261,6 +261,12 @@ struct JoinAlgorithmParams
     std::chrono::milliseconds lock_acquire_timeout;
 
     std::optional<UInt64> rhs_size_estimation;
+    std::optional<UInt64> lhs_size_estimation;
+
+    /// When true, automatically swap build/probe sides for spatial R-tree joins
+    /// if the right side is much larger than the left. Controlled by
+    /// query_plan_spatial_rtree_swap_table.
+    bool spatial_rtree_swap_table = true;
 
     explicit JoinAlgorithmParams(const Context & context);
 

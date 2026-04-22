@@ -65,6 +65,7 @@ namespace Setting
     extern const SettingsBool use_top_k_dynamic_filtering;
     extern const SettingsBool vector_search_with_rescoring;
     extern const SettingsBoolAuto query_plan_join_swap_table;
+    extern const SettingsBool query_plan_spatial_rtree_swap_table;
     extern const SettingsDecorrelationJoinKind correlated_subqueries_default_join_kind;
     extern const SettingsDouble join_runtime_bloom_filter_max_ratio_of_set_bits;
     extern const SettingsDouble join_runtime_filter_pass_ratio_threshold_for_disabling;
@@ -165,6 +166,7 @@ QueryPlanOptimizationSettings::QueryPlanOptimizationSettings(
     join_swap_table = from[Setting::query_plan_join_swap_table].is_auto
         ? std::nullopt
         : std::make_optional(from[Setting::query_plan_join_swap_table].base);
+    spatial_rtree_swap_table = from[Setting::query_plan_spatial_rtree_swap_table];
     use_join_disjunctions_push_down = from[Setting::query_plan_enable_optimizations] && from[Setting::use_join_disjunctions_push_down];
     remove_unused_columns = from[Setting::query_plan_enable_optimizations] && from[Setting::query_plan_remove_unused_columns];
 

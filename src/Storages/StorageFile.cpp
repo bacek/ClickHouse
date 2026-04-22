@@ -2440,4 +2440,30 @@ SchemaCache & StorageFile::getSchemaCache(const ContextPtr & context)
     return schema_cache;
 }
 
+std::optional<UInt64> StorageFile::totalRows(ContextPtr context) const
+{
+    /// Only supported for explicit file paths without globs or table file descriptors.
+    if (use_table_fd || is_path_with_globs || paths.empty() || archive_info.has_value())
+        return {};
+
+    auto & cache = getSchemaCache(context);
+    UInt64 total = 0;
+    for (const auto & path : paths)
+    {
+        auto key = getKeyForSchemaCache(path, format_name, format_settings, context);
+        auto get_mod_time = [&]() -> std::optional<time_t>
+        {
+            struct stat st;
+            if (::stat(path.c_str(), &st) == 0)
+                return st.st_mtime;
+            return {};
+        };
+        auto rows = cache.tryGetNumRows(key, get_mod_time);
+        if (!rows)
+            return {}; /// cache miss — cannot give a reliable total
+        total += *rows;
+    }
+    return total;
+}
+
 }
