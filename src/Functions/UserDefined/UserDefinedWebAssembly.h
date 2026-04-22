@@ -1,6 +1,7 @@
 #pragma once
 
 #include <Core/Block.h>
+#include <Core/Field.h>
 
 #include <DataTypes/IDataType.h>
 #include <Interpreters/Context_fwd.h>
@@ -95,11 +96,17 @@ class WasmModuleManager;
 /// source_arg_types: declared argument types of the SOURCE function.
 /// result_type: return type of the SINK function.
 /// wasm_module: the shared WasmModule (all functions must be from the same module).
+/// fn_scalar_values / fn_scalar_types: per-function scalar constants (indexed same as
+///   fn_names); SOURCE and SINK have empty inner vectors. XFORMs may carry compile-time
+///   constant args (e.g. the radius in st_buffer) that are appended to row_buf as
+///   COL_IS_CONST columns so the WASM side can read them without extra protocol fields.
 FunctionOverloadResolverPtr createWasmChainResolver(
     Strings fn_names,
     std::shared_ptr<WebAssembly::WasmModule> wasm_module,
     DataTypes source_arg_types,
     DataTypePtr result_type,
+    std::vector<std::vector<Field>> fn_scalar_values,
+    std::vector<DataTypes>          fn_scalar_types,
     ContextPtr context);
 
 class UserDefinedWebAssemblyFunctionFactory
