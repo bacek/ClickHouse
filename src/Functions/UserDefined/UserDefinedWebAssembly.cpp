@@ -660,10 +660,14 @@ public:
     using ObjectPtr = Base::ObjectPtr;
 
     explicit WasmCompartmentPool(
-        unsigned limit, std::shared_ptr<WebAssembly::WasmModule> wasm_module_, WebAssembly::WasmModule::Config module_cfg_)
+        unsigned limit,
+        std::shared_ptr<WebAssembly::WasmModule> wasm_module_,
+        WebAssembly::WasmModule::Config module_cfg_,
+        std::optional<String> init_function_name_ = std::nullopt)
         : Base(limit, getLogger("WasmCompartmentPool"))
         , wasm_module(std::move(wasm_module_))
         , module_cfg(std::move(module_cfg_))
+        , init_function_name(std::move(init_function_name_))
     {
         LOG_DEBUG(log, "WasmCompartmentPool created with limit: {}", limit);
     }
@@ -674,14 +678,35 @@ protected:
     ObjectPtr allocObject() override
     {
         LOG_DEBUG(log, "Allocating new WasmCompartment");
-        return wasm_module->instantiate(module_cfg);
+        auto compartment = wasm_module->instantiate(module_cfg);
+        if (init_function_name)
+        {
+            StopSource stop_source;
+            compartment->invoke<void>(*init_function_name, {}, stop_source.get_token());
+        }
+        return compartment;
     }
 
 private:
     std::shared_ptr<WebAssembly::WasmModule> wasm_module;
     WebAssembly::WasmModule::Config module_cfg;
+    std::optional<String> init_function_name;
 };
 
+
+/// Returns "clickhouse_module_init" if the module exports it, nullopt otherwise.
+std::optional<String> tryGetModuleInitFn(const std::shared_ptr<WebAssembly::WasmModule> & module)
+{
+    try
+    {
+        module->getExport("clickhouse_module_init");
+        return "clickhouse_module_init";
+    }
+    catch (...)
+    {
+        return std::nullopt;
+    }
+}
 
 WebAssembly::WasmModule::Config getWasmModuleConfig(ContextPtr context)
 {
@@ -1181,6 +1206,15 @@ bool UserDefinedWebAssemblyFunctionFactory::has(const String & function_name) co
     return registry.contains(function_name);
 }
 
+std::shared_ptr<UserDefinedWebAssemblyFunction> UserDefinedWebAssemblyFunctionFactory::getFunction(const String & function_name) const
+{
+    std::shared_lock lock(registry_mutex);
+    auto it = registry.find(function_name);
+    if (it == registry.end())
+        return nullptr;
+    return it->second.function;
+}
+
 FunctionOverloadResolverPtr UserDefinedWebAssemblyFunctionFactory::get(const String & function_name, ContextPtr context)
 {
     std::shared_ptr<UserDefinedWebAssemblyFunction> wasm_func = nullptr;
@@ -1254,6 +1288,190 @@ UserDefinedWebAssemblyFunctionFactory & UserDefinedWebAssemblyFunctionFactory::i
 {
     static UserDefinedWebAssemblyFunctionFactory factory;
     return factory;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// WASM chain executor
+//
+// Executes a validated SOURCE → XFORM* → SINK chain in a single WASM call via
+// clickhouse_chain_execute.
+//
+// Chain buffer layout (passed to WASM):
+//   [n_funcs: u32][cstr name_0]...[cstr name_n-1][pad to 8B][COLUMNAR_V1 data]
+// ─────────────────────────────────────────────────────────────────────────────
+
+class FunctionUserDefinedWasmChain : public IFunction
+{
+public:
+    FunctionUserDefinedWasmChain(
+        String name_,
+        Strings fn_names_,
+        std::shared_ptr<WebAssembly::WasmModule> wasm_module_,
+        DataTypes source_arg_types_,
+        DataTypePtr result_type_,
+        ContextPtr context_)
+        : name(std::move(name_))
+        , fn_names(std::move(fn_names_))
+        , wasm_module(std::move(wasm_module_))
+        , source_arg_types(std::move(source_arg_types_))
+        , result_type(std::move(result_type_))
+        , context(std::move(context_))
+        , compartment_pool(
+              static_cast<UInt32>(context->getSettingsRef()[Setting::webassembly_udf_max_instances]),
+              wasm_module,
+              getWasmModuleConfig(context),
+              tryGetModuleInitFn(wasm_module))
+    {
+    }
+
+    String getName() const override { return name; }
+    bool isVariadic() const override { return false; }
+    bool isDeterministic() const override { return false; }
+    bool isSuitableForShortCircuitArgumentsExecution(const DataTypesWithConstInfo &) const override { return false; }
+    size_t getNumberOfArguments() const override { return source_arg_types.size(); }
+
+    DataTypePtr getReturnTypeImpl(const DataTypes &) const override { return result_type; }
+
+    bool useDefaultImplementationForNulls() const override
+    {
+        return result_type->canBeInsideNullable();
+    }
+
+    ColumnPtr executeImpl(
+        const ColumnsWithTypeAndName & arguments,
+        const DataTypePtr & /*result_type*/,
+        size_t input_rows_count) const override
+    {
+        ProfileEventTimeIncrement<Microseconds> timer(ProfileEvents::WasmTotalExecuteMicroseconds);
+
+        if (input_rows_count == 0)
+            return result_type->createColumn();
+
+        auto compartment_entry = compartment_pool.acquire();
+        auto * compartment_ptr = &(*compartment_entry);
+        auto stop_token = interrupt_source.get_token();
+
+        auto wmm = std::make_unique<WasmMemoryManagerV01>(compartment_ptr, stop_token);
+
+        // ── Build chain descriptor buffer: [n_funcs: u32][cstr names...] ────
+        const uint32_t n_funcs = static_cast<uint32_t>(fn_names.size());
+        std::vector<uint8_t> chain_bytes;
+        chain_bytes.resize(4);
+        std::memcpy(chain_bytes.data(), &n_funcs, 4);
+        for (const auto & fn : fn_names)
+        {
+            chain_bytes.insert(chain_bytes.end(),
+                reinterpret_cast<const uint8_t *>(fn.c_str()),
+                reinterpret_cast<const uint8_t *>(fn.c_str()) + fn.size() + 1);
+        }
+
+        // ── Build COLUMNAR_V1 row buffer ─────────────────────────────────────
+        const uint32_t num_cols = static_cast<uint32_t>(arguments.size());
+        uint32_t col_cursor = COLUMNAR_HEADER_BYTES + num_cols * COLUMNAR_DESC_BYTES;
+
+        std::vector<ColDescriptor> descs(num_cols);
+        std::vector<const IColumn *> inner_cols(num_cols);
+        std::vector<bool> is_const_flags(num_cols);
+        std::vector<bool> is_nullable_flags(num_cols);
+        std::vector<uint32_t> row_counts(num_cols);
+
+        for (uint32_t ci = 0; ci < num_cols; ++ci)
+        {
+            const IColumn * col = arguments[ci].column.get();
+            bool is_const = false;
+            if (const auto * cc = typeid_cast<const ColumnConst *>(col))
+            {
+                col = &cc->getDataColumn();
+                is_const = true;
+            }
+            bool is_nullable = typeid_cast<const ColumnNullable *>(col) != nullptr;
+            uint32_t nrows = is_const ? 1u : static_cast<uint32_t>(input_rows_count);
+            is_const_flags[ci]    = is_const;
+            is_nullable_flags[ci] = is_nullable;
+            inner_cols[ci]        = col;
+            row_counts[ci]        = nrows;
+            col_cursor = buildColDescriptor(col, is_const, is_nullable, nrows, col_cursor, descs[ci]);
+        }
+
+        {
+            ProfileEventTimeIncrement<Microseconds> timer_ser(ProfileEvents::WasmSerializationMicroseconds);
+
+            // Allocate two separate WASM buffers.
+            WasmMemoryGuard wasm_chain = allocateInWasmMemory(wmm.get(), static_cast<uint32_t>(chain_bytes.size()));
+            std::memcpy(wasm_chain.getMemoryView().data(), chain_bytes.data(), chain_bytes.size());
+
+            WasmMemoryGuard wasm_row = allocateInWasmMemory(wmm.get(), col_cursor);
+            auto row_mem = wasm_row.getMemoryView();
+
+            uint32_t n_rows32 = static_cast<uint32_t>(input_rows_count);
+            std::memcpy(row_mem.data(),     &n_rows32, 4);
+            std::memcpy(row_mem.data() + 4, &num_cols, 4);
+
+            for (uint32_t ci = 0; ci < num_cols; ++ci)
+                std::memcpy(row_mem.data() + COLUMNAR_HEADER_BYTES + ci * COLUMNAR_DESC_BYTES,
+                            &descs[ci], COLUMNAR_DESC_BYTES);
+
+            for (uint32_t ci = 0; ci < num_cols; ++ci)
+                writeColData(inner_cols[ci], is_nullable_flags[ci], row_counts[ci], descs[ci], row_mem);
+
+            // ── Invoke clickhouse_chain_execute(chain_buf, row_buf, n) ───────
+            auto result_ptr = compartment_ptr->invoke<WasmPtr>(
+                "clickhouse_chain_execute",
+                {wasm_chain.getHandle(), wasm_row.getHandle(), static_cast<WasmSizeT>(input_rows_count)},
+                stop_token);
+
+            if (result_ptr == 0)
+                throw Exception(ErrorCodes::WASM_ERROR, "clickhouse_chain_execute returned nullptr");
+
+            WasmMemoryGuard result_guard(wmm.get(), result_ptr);
+
+            {
+                ProfileEventTimeIncrement<Microseconds> timer_de(ProfileEvents::WasmDeserializationMicroseconds);
+                auto out_view = result_guard.getMemoryView();
+                return readColumnarOutput(
+                    {out_view.data(), out_view.size()},
+                    result_type,
+                    input_rows_count);
+            }
+        }
+    }
+
+    void cancelExecution() const override { interrupt_source.request_stop(); }
+
+private:
+    String                                    name;
+    Strings                                   fn_names;
+    std::shared_ptr<WebAssembly::WasmModule>  wasm_module;
+    DataTypes                                 source_arg_types;
+    DataTypePtr                               result_type;
+    ContextPtr                                context;
+    mutable WasmCompartmentPool               compartment_pool;
+    mutable StopSource                        interrupt_source;
+};
+
+FunctionOverloadResolverPtr createWasmChainResolver(
+    Strings fn_names,
+    std::shared_ptr<WebAssembly::WasmModule> wasm_module,
+    DataTypes source_arg_types,
+    DataTypePtr result_type,
+    ContextPtr context)
+{
+    // Synthetic name for logging/explain; not registered in any factory.
+    String chain_name = "__wasm_chain";
+    for (const auto & n : fn_names)
+    {
+        chain_name += '_';
+        chain_name += n;
+    }
+
+    auto fn = std::make_shared<FunctionUserDefinedWasmChain>(
+        std::move(chain_name),
+        std::move(fn_names),
+        std::move(wasm_module),
+        std::move(source_arg_types),
+        std::move(result_type),
+        std::move(context));
+    return std::make_unique<FunctionToOverloadResolverAdaptor>(std::move(fn));
 }
 
 struct WebAssemblyFunctionSettingsConstraits : public IHints<>

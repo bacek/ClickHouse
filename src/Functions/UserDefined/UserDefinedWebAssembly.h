@@ -88,6 +88,20 @@ protected:
 
 class WasmModuleManager;
 
+/// Build a FunctionOverloadResolver that executes a WASM function chain in a
+/// single WASM call via clickhouse_chain_execute.
+///
+/// fn_names: function names in SOURCE → SINK order.
+/// source_arg_types: declared argument types of the SOURCE function.
+/// result_type: return type of the SINK function.
+/// wasm_module: the shared WasmModule (all functions must be from the same module).
+FunctionOverloadResolverPtr createWasmChainResolver(
+    Strings fn_names,
+    std::shared_ptr<WebAssembly::WasmModule> wasm_module,
+    DataTypes source_arg_types,
+    DataTypePtr result_type,
+    ContextPtr context);
+
 class UserDefinedWebAssemblyFunctionFactory
 {
 public:
@@ -103,6 +117,10 @@ public:
 
     bool has(const String & function_name) const;
     FunctionOverloadResolverPtr get(const String & function_name, ContextPtr context);
+
+    /// Returns the underlying WASM function object, or nullptr if not found.
+    /// Used by WasmChainFusionPass to inspect module identity and signatures.
+    std::shared_ptr<UserDefinedWebAssemblyFunction> getFunction(const String & function_name) const;
 
     /// Returns true if the function is an aggregate function (is_aggregate=1).
     bool isAggregate(const String & function_name) const;
