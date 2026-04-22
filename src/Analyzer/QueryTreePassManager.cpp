@@ -30,6 +30,7 @@
 #include <Analyzer/Passes/DisableParallelReplicasPass.h>
 #include <Analyzer/Passes/FunctionToSubcolumnsPass.h>
 #include <Analyzer/Passes/FuseFunctionsPass.h>
+#include <Analyzer/Passes/WasmChainFusionPass.h>
 #include <Analyzer/Passes/GroupingFunctionsResolvePass.h>
 #include <Analyzer/Passes/IfChainToMultiIfPass.h>
 #include <Analyzer/Passes/IfConstantConditionPass.h>
@@ -331,6 +332,7 @@ void addQueryTreePasses(QueryTreePassManager & manager, bool only_analyze)
     manager.addPass(std::make_unique<TruncateOrderByAfterGroupByKeysPass>());
 
     manager.addPass(std::make_unique<FuseFunctionsPass>());
+    manager.addPass(std::make_unique<WasmChainFusionPass>());
 
     manager.addPass(std::make_unique<ConvertOrLikeChainPass>());
 
