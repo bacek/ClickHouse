@@ -318,6 +318,24 @@ bool SpatialRTreeJoin::addBlockToJoin(const Block & block, bool /*check_limits*/
     return true;
 }
 
+void SpatialRTreeJoin::setTotals(const Block & block)
+{
+    /// Multiple FillingRightJoinSideTransform instances call setTotals concurrently
+    /// when supportParallelJoin() = true.  Guard the base-class write with a mutex.
+    /// Skip empty blocks (synthesized when the right source has no WITH TOTALS).
+    if (!block.empty())
+    {
+        std::lock_guard lock(totals_mutex);
+        IJoin::setTotals(block);
+    }
+}
+
+const Block & SpatialRTreeJoin::getTotals() const
+{
+    std::lock_guard lock(totals_mutex);
+    return IJoin::getTotals();
+}
+
 void SpatialRTreeJoin::runPostBuildPhase()
 {
     /// Bulk-load sub-trees in parallel using the packing (STR) algorithm.
@@ -359,12 +377,21 @@ void SpatialRTreeJoin::runPostBuildPhase()
 
     pending_entries.clear();
     pending_entries.shrink_to_fit();
+
+    /// For RIGHT JOIN: allocate per-block matched byte arrays (all 0 = unmatched).
+    if (table_join->kind() == JoinKind::Right)
+    {
+        right_matched_per_block.resize(right_blocks.size());
+        for (size_t i = 0; i < right_blocks.size(); ++i)
+            right_matched_per_block[i].assign(right_blocks[i].rows(), 0);
+    }
 }
 
 JoinResultPtr SpatialRTreeJoin::joinBlock(Block left_block)
 {
     const size_t left_rows = left_block.rows();
-    const bool is_left_join = table_join->kind() == JoinKind::Left;
+    const bool is_left_join  = table_join->kind() == JoinKind::Left;
+    const bool is_right_join = table_join->kind() == JoinKind::Right;
 
     /// Build the output block schema from the columns the planner says are needed
     /// downstream (table_join->resultColumnsFromLeftTable() and columnsAddedByJoin).
@@ -472,6 +499,10 @@ JoinResultPtr SpatialRTreeJoin::joinBlock(Block left_block)
         mutable_cols[i] = IColumn::mutate(output.getByPosition(i).column);
 
     std::vector<bool> left_matched(is_left_join ? left_rows : 0, false);
+    /// For RIGHT JOIN, right_matched_per_block[block][row] is marked with relaxed-atomic
+    /// byte writes.  Multiple probe threads may race to set the same byte to 1, but since
+    /// all writers write the same value the race is benign.  getNonJoinedBlocks() reads
+    /// the bitmap only after all joinBlock() calls have returned (pipeline barrier).
 
     NameSet pre_filter_required;
     if (pre_filter_expr)
@@ -622,6 +653,8 @@ JoinResultPtr SpatialRTreeJoin::joinBlock(Block left_block)
             const auto & c = cands[ci];
             if (is_left_join)
                 left_matched[c.left_row] = true;
+            if (is_right_join)
+                __atomic_store_n(&right_matched_per_block[c.block_idx][c.row_idx], '\1', __ATOMIC_RELAXED);
             for (size_t i = 0; i < n_out_cols; ++i)
             {
                 if (col_sources[i].from_left)
@@ -711,6 +744,8 @@ JoinResultPtr SpatialRTreeJoin::joinBlock(Block left_block)
                 const RightPos & pos = row_hits[hit_idx].second;
                 if (is_left_join)
                     left_matched[li] = true;
+                if (is_right_join)
+                    __atomic_store_n(&right_matched_per_block[pos.block_idx][pos.row_idx], '\1', __ATOMIC_RELAXED);
                 for (size_t ci = 0; ci < n_out_cols; ++ci)
                 {
                     if (col_sources[ci].from_left)
@@ -797,6 +832,76 @@ JoinResultPtr SpatialRTreeJoin::joinBlock(Block left_block)
         appendUnmatched(output, left_matched);
 
     return IJoinResult::createFromBlock(std::move(output));
+}
+
+// ── Right-join non-joined blocks ──────────────────────────────────────────────
+
+/// Returns a lazy stream of all right rows that were NOT matched during any
+/// joinBlock() call.  For RIGHT JOIN semantics: every right row must appear
+/// in output; unmatched right rows get NULL for all left-side columns.
+IBlocksStreamPtr SpatialRTreeJoin::getNonJoinedBlocks(
+    const Block & left_sample_block,
+    const Block & result_sample_block,
+    UInt64 max_block_size) const
+{
+    if (table_join->kind() != JoinKind::Right)
+        return nullptr;
+
+    struct UnmatchedRightStream final : IBlocksStream
+    {
+        const SpatialRTreeJoin & join;
+        const Block left_sample;
+        const Block result_sample;
+        const UInt64 block_size;
+
+        size_t block_idx = 0;
+        size_t row_idx   = 0;
+
+        UnmatchedRightStream(const SpatialRTreeJoin & j, Block ls, Block rs, UInt64 bs)
+            : join(j), left_sample(std::move(ls)), result_sample(std::move(rs)), block_size(bs) {}
+
+        Block nextImpl() override
+        {
+            MutableColumns cols;
+            cols.reserve(result_sample.columns());
+            for (const auto & cd : result_sample)
+                cols.push_back(cd.column->cloneEmpty());
+
+            size_t emitted = 0;
+            while (block_idx < join.right_blocks.size() && emitted < block_size)
+            {
+                const Block & rb = join.right_blocks[block_idx];
+                const auto & matched = join.right_matched_per_block[block_idx];
+                while (row_idx < rb.rows() && emitted < block_size)
+                {
+                    if (!__atomic_load_n(&matched[row_idx], __ATOMIC_RELAXED))
+                    {
+                        for (size_t ci = 0; ci < result_sample.columns(); ++ci)
+                        {
+                            const auto & cd = result_sample.getByPosition(ci);
+                            if (left_sample.has(cd.name))
+                                cols[ci]->insertDefault(); // NULL for left cols
+                            else
+                                cols[ci]->insertFrom(*rb.getByName(cd.name).column, row_idx);
+                        }
+                        ++emitted;
+                    }
+                    ++row_idx;
+                }
+                if (row_idx >= rb.rows()) { ++block_idx; row_idx = 0; }
+            }
+
+            if (emitted == 0)
+                return {};
+
+            Block out = result_sample.cloneEmpty();
+            for (size_t ci = 0; ci < out.columns(); ++ci)
+                out.getByPosition(ci).column = std::move(cols[ci]);
+            return out;
+        }
+    };
+
+    return std::make_unique<UnmatchedRightStream>(*this, left_sample_block, result_sample_block, max_block_size);
 }
 
 }
