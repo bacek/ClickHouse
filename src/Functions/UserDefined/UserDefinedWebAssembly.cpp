@@ -689,6 +689,7 @@ public:
     String getName() const override { return function_name; }
     bool isVariadic() const override { return false; }
     bool isDeterministic() const override { return user_defined_function->getIsDeterministic(); }
+    const DataTypes & getArgumentTypes() const { return user_defined_function->getArguments(); }
     bool isSpatialPredicate() const override
     {
         return user_defined_function->getSettings().getValue("is_spatial_predicate").safeGet<UInt64>() != 0;
@@ -1095,6 +1096,103 @@ private:
     mutable WasmCompartmentPool compartment_pool;
 };
 
+/// Returns true if `actual` argument types are compatible with `expected` for WASM dispatch.
+/// Mirrors the per-argument matching logic in FunctionUserDefinedWasm::getReturnTypeImpl.
+static bool typesMatchOverload(const DataTypes & actual, const DataTypes & expected)
+{
+    if (actual.size() != expected.size())
+        return false;
+    for (size_t i = 0; i < actual.size(); ++i)
+    {
+        if (actual[i]->equals(*expected[i]))
+            continue;
+        const DataTypePtr & stripped = removeNullable(actual[i]);
+        if (stripped->equals(*expected[i]))
+            continue;
+        auto actual_kind   = wasmKindForDataType(stripped.get());
+        auto expected_kind = wasmKindForDataType(expected[i].get());
+        if (actual_kind && expected_kind && *actual_kind == *expected_kind)
+            continue;
+        return false;
+    }
+    return true;
+}
+
+/// Overload resolver for WASM functions registered under the same SQL name with different
+/// argument type signatures.  At planning time it picks the first overload whose declared
+/// argument types match the call-site types; the selected FunctionBase carries exactly that
+/// one overload into executeImpl, so no re-selection is needed at execution time.
+class WasmOverloadResolver : public IFunctionOverloadResolver
+{
+public:
+    WasmOverloadResolver(
+        String name_,
+        std::vector<std::shared_ptr<FunctionUserDefinedWasm>> overloads_,
+        ContextPtr context_)
+        : name(std::move(name_))
+        , overloads(std::move(overloads_))
+        , context(std::move(context_))
+    {}
+
+    String getName() const override { return name; }
+    bool isVariadic() const override { return false; }
+    size_t getNumberOfArguments() const override
+    {
+        return overloads.empty() ? 0 : overloads.front()->getNumberOfArguments();
+    }
+
+    bool isDeterministic() const override
+    {
+        return overloads.empty() || overloads.front()->isDeterministic();
+    }
+    bool useDefaultImplementationForNulls() const override
+    {
+        return overloads.empty() || overloads.front()->useDefaultImplementationForNulls();
+    }
+    bool isSpatialPredicate() const override
+    {
+        return !overloads.empty() && overloads.front()->isSpatialPredicate();
+    }
+
+    DataTypePtr getReturnTypeImpl(const DataTypes & arguments) const override
+    {
+        for (const auto & fn : overloads)
+        {
+            if (typesMatchOverload(arguments, fn->getArgumentTypes()))
+                return fn->getReturnTypeImpl(arguments);
+        }
+        auto get_names = std::views::transform([](const auto & t) { return t->getName(); });
+        throw Exception(
+            ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT,
+            "No matching overload of '{}' for argument types ({})",
+            name,
+            fmt::join(arguments | get_names, ", "));
+    }
+
+    FunctionBasePtr buildImpl(const ColumnsWithTypeAndName & arguments, const DataTypePtr & result_type) const override
+    {
+        DataTypes types;
+        types.reserve(arguments.size());
+        for (const auto & a : arguments)
+            types.push_back(a.type);
+
+        for (const auto & fn : overloads)
+        {
+            if (typesMatchOverload(types, fn->getArgumentTypes()))
+                return std::make_unique<FunctionToFunctionBaseAdaptor>(fn, types, result_type);
+        }
+        throw Exception(
+            ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT,
+            "No matching overload of '{}' during build",
+            name);
+    }
+
+private:
+    String name;
+    std::vector<std::shared_ptr<FunctionUserDefinedWasm>> overloads;
+    ContextPtr context;
+};
+
 UserDefinedWebAssemblyFunctionFactory::RegisteredFunction
 UserDefinedWebAssemblyFunctionFactory::prepareFunction(ASTPtr create_function_query, WasmModuleManager & module_manager) const
 {
@@ -1172,23 +1270,36 @@ UserDefinedWebAssemblyFunctionFactory::addOrReplace(ASTPtr create_function_query
 void UserDefinedWebAssemblyFunctionFactory::addOrReplace(RegisteredFunction registered_function)
 {
     std::unique_lock lock(registry_mutex);
-    registry[registered_function.sql_name] = RegistryEntry{
+    auto & entries = registry[registered_function.sql_name];
+    // Replace an existing overload with the same argument types; otherwise add a new one.
+    for (auto & entry : entries)
+    {
+        if (typesMatchOverload(registered_function.original_arg_types, entry.original_arg_types))
+        {
+            entry = RegistryEntry{
+                std::move(registered_function.function),
+                std::move(registered_function.original_arg_types),
+                std::move(registered_function.create_query),
+                registered_function.is_aggregate};
+            return;
+        }
+    }
+    entries.push_back(RegistryEntry{
         std::move(registered_function.function),
         std::move(registered_function.original_arg_types),
         std::move(registered_function.create_query),
-        registered_function.is_aggregate};
+        registered_function.is_aggregate});
 }
 
 void UserDefinedWebAssemblyFunctionFactory::replaceAll(VectorWithMemoryTracking<RegisteredFunction> registered_functions)
 {
-    UnorderedMapWithMemoryTracking<String, RegistryEntry> new_registry;
-    new_registry.reserve(registered_functions.size());
+    UnorderedMapWithMemoryTracking<String, std::vector<RegistryEntry>> new_registry;
     for (auto & registered_function : registered_functions)
-        new_registry[registered_function.sql_name] = RegistryEntry{
+        new_registry[registered_function.sql_name].push_back(RegistryEntry{
             std::move(registered_function.function),
             std::move(registered_function.original_arg_types),
             std::move(registered_function.create_query),
-            registered_function.is_aggregate};
+            registered_function.is_aggregate});
 
     std::unique_lock lock(registry_mutex);
     registry = std::move(new_registry);
@@ -1197,37 +1308,38 @@ void UserDefinedWebAssemblyFunctionFactory::replaceAll(VectorWithMemoryTracking<
 bool UserDefinedWebAssemblyFunctionFactory::has(const String & function_name) const
 {
     std::shared_lock lock(registry_mutex);
-    return registry.contains(function_name);
+    auto it = registry.find(function_name);
+    return it != registry.end() && !it->second.empty();
 }
 
 std::shared_ptr<UserDefinedWebAssemblyFunction> UserDefinedWebAssemblyFunctionFactory::getFunction(const String & function_name) const
 {
     std::shared_lock lock(registry_mutex);
     auto it = registry.find(function_name);
-    if (it == registry.end())
+    if (it == registry.end() || it->second.empty())
         return nullptr;
-    return it->second.function;
+    return it->second.front().function;
 }
 
 FunctionOverloadResolverPtr UserDefinedWebAssemblyFunctionFactory::get(const String & function_name, ContextPtr context)
 {
-    std::shared_ptr<UserDefinedWebAssemblyFunction> wasm_func = nullptr;
+    std::vector<std::shared_ptr<FunctionUserDefinedWasm>> overload_fns;
     {
         std::shared_lock lock(registry_mutex);
         auto it = registry.find(function_name);
-        if (it == registry.end())
-        {
+        if (it == registry.end() || it->second.empty())
             throw Exception(
                 ErrorCodes::RESOURCE_NOT_FOUND,
                 "WebAssembly function '{}' not found in [{}]",
                 function_name,
                 fmt::join(registry | std::views::transform([](const auto & pair) { return pair.first; }), ", "));
-        }
-        wasm_func = it->second.function;
+        for (const auto & entry : it->second)
+            overload_fns.push_back(std::make_shared<FunctionUserDefinedWasm>(function_name, entry.function, context));
     }
 
-    auto executable_function = std::make_shared<FunctionUserDefinedWasm>(function_name, std::move(wasm_func), std::move(context));
-    return std::make_unique<FunctionToOverloadResolverAdaptor>(std::move(executable_function));
+    if (overload_fns.size() == 1)
+        return std::make_unique<FunctionToOverloadResolverAdaptor>(std::move(overload_fns.front()));
+    return std::make_unique<WasmOverloadResolver>(function_name, std::move(overload_fns), std::move(context));
 }
 
 FunctionOverloadResolverPtr UserDefinedWebAssemblyFunctionFactory::tryGet(const String & function_name, ContextPtr context)
@@ -1238,7 +1350,7 @@ FunctionOverloadResolverPtr UserDefinedWebAssemblyFunctionFactory::tryGet(const 
         auto it = registry.find(function_name);
         if (it == registry.end())
             return nullptr;
-        wasm_func = it->second.function;
+        wasm_func = it->second.front().function;
     }
 
     auto executable_function = std::make_shared<FunctionUserDefinedWasm>(function_name, std::move(wasm_func), std::move(context));
@@ -1249,29 +1361,43 @@ bool UserDefinedWebAssemblyFunctionFactory::isAggregate(const String & function_
 {
     std::shared_lock lock(registry_mutex);
     auto it = registry.find(function_name);
-    return it != registry.end() && it->second.is_aggregate;
+    return it != registry.end() && !it->second.empty() && it->second.front().is_aggregate;
 }
 
 AggregateFunctionPtr UserDefinedWebAssemblyFunctionFactory::getAggregate(
-    const String & function_name, const DataTypes & /*arg_types*/, ContextPtr context) const
+    const String & function_name, const DataTypes & arg_types, ContextPtr context) const
 {
     std::shared_ptr<UserDefinedWebAssemblyFunction> wasm_func;
     DataTypes original_arg_types;
     {
         std::shared_lock lock(registry_mutex);
         auto it = registry.find(function_name);
-        if (it == registry.end())
+        if (it == registry.end() || it->second.empty())
             throw Exception(
                 ErrorCodes::RESOURCE_NOT_FOUND,
                 "WebAssembly aggregate function '{}' not found",
                 function_name);
-        if (!it->second.is_aggregate)
+
+        const RegistryEntry * match = nullptr;
+        for (const auto & entry : it->second)
+        {
+            if (!entry.is_aggregate)
+                continue;
+            if (arg_types.empty() || typesMatchOverload(arg_types, entry.original_arg_types))
+            {
+                match = &entry;
+                break;
+            }
+        }
+        if (!match)
+            match = &it->second.front(); // fallback: first aggregate entry
+        if (!match->is_aggregate)
             throw Exception(
                 ErrorCodes::BAD_ARGUMENTS,
                 "WebAssembly function '{}' is not an aggregate function",
                 function_name);
-        wasm_func = it->second.function;
-        original_arg_types = it->second.original_arg_types;
+        wasm_func = match->function;
+        original_arg_types = match->original_arg_types;
     }
     return std::make_shared<AggregateFunctionUserDefinedWasm>(
         function_name, std::move(wasm_func), std::move(original_arg_types), std::move(context));
@@ -1288,14 +1414,14 @@ VectorWithMemoryTracking<UserDefinedWebAssemblyFunctionFactory::RegisteredFuncti
 {
     std::shared_lock lock(registry_mutex);
     VectorWithMemoryTracking<RegisteredFunction> result;
-    result.reserve(registry.size());
-    for (const auto & [sql_name, entry] : registry)
-        result.push_back(RegisteredFunction{
-            .sql_name = sql_name,
-            .function = entry.function,
-            .original_arg_types = entry.original_arg_types,
-            .create_query = entry.create_query,
-            .is_aggregate = entry.is_aggregate});
+    for (const auto & [sql_name, entries] : registry)
+        for (const auto & entry : entries)
+            result.push_back(RegisteredFunction{
+                .sql_name = sql_name,
+                .function = entry.function,
+                .original_arg_types = entry.original_arg_types,
+                .create_query = entry.create_query,
+                .is_aggregate = entry.is_aggregate});
     return result;
 }
 
