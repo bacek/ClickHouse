@@ -55,6 +55,7 @@ int64_t  identity_raw_i64(int64_t x) { return x; }
 float    identity_raw_f32(float x)   { return x; }
 double   identity_raw_f64(double x)  { return x; }
 int32_t  add(int32_t a, int32_t b)   { return a + b; }
+int32_t  constant42(void)            { return 42; }
 
 /* ---- MsgPack integer decoder: int32 ---- */
 static int32_t read_msgpack_i32(const uint8_t **p)

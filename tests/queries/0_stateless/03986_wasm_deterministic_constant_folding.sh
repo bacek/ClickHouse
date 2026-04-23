@@ -12,6 +12,7 @@ DROP FUNCTION IF EXISTS identity_det;
 DROP FUNCTION IF EXISTS identity_nondet;
 DROP FUNCTION IF EXISTS identity_raw_det;
 DROP FUNCTION IF EXISTS identity_raw_nondet;
+DROP FUNCTION IF EXISTS zero_arg_det;
 DELETE FROM system.webassembly_modules WHERE name = 'identity_cf_test';
 EOF
 
@@ -83,9 +84,24 @@ SELECT sum(identity_raw_det(1)) FROM numbers(1000); -- expected: 1000
 SET webassembly_udf_max_fuel = 1000000;
 SELECT countIf(identity_raw_nondet(number::Int32) != number::Int32) AS wrong FROM numbers(1000); -- expected: 0
 
+-- ── ZERO-ARGUMENT path ───────────────────────────────────────────────────────
+-- useDefaultImplementationForConstants returns nullptr early when args.empty(),
+-- so the ColumnConst wrapping must happen explicitly in executeImplDryRun.
+
+-- DETERMINISTIC + zero arguments: must still be constant-folded
+CREATE OR REPLACE FUNCTION zero_arg_det
+    LANGUAGE WASM FROM 'identity_cf_test' :: 'constant42'
+    ARGUMENTS () RETURNS Int32
+    ABI ROW_DIRECT
+    DETERMINISTIC;
+
+SELECT zero_arg_det();                  -- expected: 42
+SELECT isConstant(zero_arg_det());      -- expected: 1
+
 DROP FUNCTION IF EXISTS identity_det;
 DROP FUNCTION IF EXISTS identity_nondet;
 DROP FUNCTION IF EXISTS identity_raw_det;
 DROP FUNCTION IF EXISTS identity_raw_nondet;
+DROP FUNCTION IF EXISTS zero_arg_det;
 DELETE FROM system.webassembly_modules WHERE name = 'identity_cf_test';
 EOF

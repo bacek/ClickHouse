@@ -3,6 +3,7 @@
 #include <ranges>
 #include <base/hex.h>
 
+#include <Columns/ColumnConst.h>
 #include <Columns/ColumnVector.h>
 
 #include <DataTypes/DataTypesNumber.h>
@@ -586,7 +587,17 @@ public:
         /// Deterministic functions must actually run during dry-run so the Analyzer can constant-fold them.
         /// Non-deterministic functions return defaults to avoid WASM execution at query-analysis time.
         if (user_defined_function->getIsDeterministic())
+        {
+            /// useDefaultImplementationForConstants returns nullptr early when args.empty(), bypassing
+            /// the ColumnConst wrapping that enables the Analyzer's isColumnConst constant-folding check.
+            /// Execute with 1 row and wrap explicitly so zero-argument deterministic functions fold too.
+            if (arguments.empty())
+            {
+                auto result = executeImpl(arguments, result_type, 1);
+                return ColumnConst::create(std::move(result), input_rows_count);
+            }
             return executeImpl(arguments, result_type, input_rows_count);
+        }
 
         MutableColumnPtr result_column = user_defined_function->getResultType()->createColumn();
         result_column->insertManyDefaults(input_rows_count);
