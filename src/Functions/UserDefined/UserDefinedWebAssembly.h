@@ -153,7 +153,7 @@ private:
     };
 
     mutable DB::SharedMutex registry_mutex;
-    std::unordered_map<String, RegistryEntry> registry;
+    std::unordered_map<String, std::vector<RegistryEntry>> registry;
 };
 
 }
