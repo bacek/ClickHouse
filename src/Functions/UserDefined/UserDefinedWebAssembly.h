@@ -161,7 +161,7 @@ private:
     };
 
     mutable DB::SharedMutex registry_mutex;
-    UnorderedMapWithMemoryTracking<String, RegistryEntry> registry;
+    UnorderedMapWithMemoryTracking<String, VectorWithMemoryTracking<RegistryEntry>> registry;
 };
 
 }
