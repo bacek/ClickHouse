@@ -15,6 +15,7 @@
 #include <DataTypes/DataTypeTuple.h>
 #include <DataTypes/DataTypeArray.h>
 #include <DataTypes/DataTypeString.h>
+#include <DataTypes/DataTypeVariant.h>
 #include <Columns/ColumnTuple.h>
 
 #include <AggregateFunctions/IAggregateFunction.h>
@@ -785,6 +786,19 @@ public:
             if (actual_kind && expected_kind && *actual_kind == *expected_kind)
                 continue;
 
+            /// Allow a geo type (or its constant-folded bare structural form) to satisfy a
+            /// Geometry (Variant) parameter — mirrors the check in typesMatchOverload.
+            if (const auto * variant_type = typeid_cast<const DataTypeVariant *>(expected_arguments[i].get()))
+            {
+                if (variant_type->tryGetVariantDiscriminator(stripped->getName()).has_value())
+                    continue;
+                bool structural_match = false;
+                for (const auto & v : variant_type->getVariants())
+                    if (stripped->equals(*v)) { structural_match = true; break; }
+                if (structural_match)
+                    continue;
+            }
+
             auto get_type_names = std::views::transform([](const auto & arg) { return arg->getName(); });
             throw Exception(
                 ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT,
@@ -805,6 +819,13 @@ public:
 
     bool isSuitableForConstantFolding() const override { return user_defined_function->getIsDeterministic(); }
 
+    /// convertLowCardinalityColumnsToFull() inside the default implementation calls
+    /// recursiveRemoveLowCardinality() which creates new DataTypeArray objects without
+    /// preserving custom type names (e.g. "Polygon" → bare Array(Array(Tuple))). This
+    /// breaks our Geometry coercion in executeImpl.  Returning false here bypasses that
+    /// stripping, exactly as wkb() does (see wkb.cpp for the same rationale).
+    bool useDefaultImplementationForLowCardinalityColumns() const override { return false; }
+
     /// Don't let the framework wrap the result in Nullable when inputs are nullable —
     /// Array/Tuple return types cannot be inside Nullable.  WASM UDFs handle null
     /// propagation themselves via the COL_NULL_* column types.
@@ -819,14 +840,46 @@ public:
         auto compartment_entry = compartment_pool.acquire();
         auto * compartment_ptr = &(*compartment_entry);
 
+        // Coerce actual columns to Variant when the function declares a Variant parameter but
+        // received a member type (e.g. Point passed to Geometry).  Lets callers skip the
+        // explicit CAST(x, 'Geometry').
+        // When the input type lacks a custom name (e.g. bare Array(Tuple) not cast to Ring),
+        // we fall back to structural matching against variant members. Note: structurally
+        // ambiguous types (Array(Array(Tuple)) matches both Polygon and MultiLineString) require
+        // the caller to use an explicit geo type cast; without one the first alphabetical match wins.
+        const auto & declared = user_defined_function->getArguments();
+        ColumnsWithTypeAndName coerced = arguments;
+        for (size_t i = 0; i < coerced.size() && i < declared.size(); ++i)
+        {
+            const auto * variant_type = typeid_cast<const DataTypeVariant *>(declared[i].get());
+            if (!variant_type || coerced[i].type->equals(*declared[i]))
+                continue;
+
+            if (!coerced[i].type->hasCustomName())
+            {
+                for (const auto & v : variant_type->getVariants())
+                {
+                    if (coerced[i].type->equals(*v))
+                    {
+                        coerced[i].column = castColumn(coerced[i], v);
+                        coerced[i].type = v;
+                        break;
+                    }
+                }
+            }
+
+            coerced[i].column = castColumn(coerced[i], declared[i]);
+            coerced[i].type = declared[i];
+        }
+
         // COLUMNAR_V1: bypass RowBinary batching, pass columns directly (ColumnConst stays const).
         if (const auto * cv1 = dynamic_cast<const UserDefinedWebAssemblyFunctionColumnarV1 *>(user_defined_function.get()))
         {
             auto stop_token = interrupt_source.get_token();
-            return cv1->executeColumnar(compartment_ptr, arguments, input_rows_count, context, stop_token);
+            return cv1->executeColumnar(compartment_ptr, coerced, input_rows_count, context, stop_token);
         }
 
-        return execute(compartment_ptr, arguments, input_rows_count);
+        return execute(compartment_ptr, coerced, input_rows_count);
     }
 
     ColumnPtr executeImplDryRun(const ColumnsWithTypeAndName & arguments, const DataTypePtr & result_type, size_t input_rows_count) const override
@@ -1153,6 +1206,19 @@ static bool typesMatchOverload(const DataTypes & actual, const DataTypes & expec
         auto expected_kind = wasmKindForDataType(expected[i].get());
         if (actual_kind && expected_kind && *actual_kind == *expected_kind)
             continue;
+        // Allow CH geo types (Point, LineString, …) to satisfy a Geometry (Variant) parameter.
+        // Constant-folded geo literals arrive as bare structural types (e.g. Tuple(Float64,Float64))
+        // without the custom name, so we also accept structural matches against variant members.
+        if (const auto * variant_type = typeid_cast<const DataTypeVariant *>(expected[i].get()))
+        {
+            if (variant_type->tryGetVariantDiscriminator(stripped->getName()).has_value())
+                continue;
+            bool structural_match = false;
+            for (const auto & v : variant_type->getVariants())
+                if (stripped->equals(*v)) { structural_match = true; break; }
+            if (structural_match)
+                continue;
+        }
         return false;
     }
     return true;
@@ -1193,6 +1259,11 @@ public:
     {
         return !overloads.empty() && overloads.front()->isSpatialPredicate();
     }
+
+    // Disable CH's automatic Variant-expansion so that a Geometry argument reaches the
+    // overload that explicitly declares Geometry rather than being fanned out over each
+    // Variant alternative (Point, LineString, …) before we get a chance to match.
+    bool useDefaultImplementationForVariant() const override { return false; }
 
     DataTypePtr getReturnTypeImpl(const DataTypes & arguments) const override
     {

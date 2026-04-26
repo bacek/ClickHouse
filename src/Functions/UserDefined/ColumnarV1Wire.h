@@ -452,8 +452,11 @@ inline void writeColData(
 
     if (is_nullable && null_col && desc.null_offset)
     {
+        // Null sentinel is 0xFF (matches COL_VARIANT discriminator convention).
         const auto & nm = null_col->getNullMapData();
-        std::memcpy(buf.data() + desc.null_offset, nm.data(), num_rows);
+        uint8_t * dst = buf.data() + desc.null_offset;
+        for (uint32_t i = 0; i < num_rows; ++i)
+            dst[i] = nm[i] ? 0xFFu : 0u;
     }
 
     const ColumnString * str_col = typeid_cast<const ColumnString *>(col);
