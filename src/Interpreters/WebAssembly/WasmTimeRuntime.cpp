@@ -505,7 +505,7 @@ std::unique_ptr<WasmModule> WasmTimeRuntime::compileModule(std::string_view modu
 
     pthread_attr_t attr;
     pthread_attr_init(&attr);
-    pthread_attr_setstacksize(&attr, 8 * 1024 * 1024);
+    pthread_attr_setstacksize(&attr, 1024 * 1024);
 
     pthread_t thread;
     pthread_create(&thread, &attr, [](void * arg) -> void *
