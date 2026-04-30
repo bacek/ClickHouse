@@ -41,6 +41,7 @@
 #include <Interpreters/MergeJoin.h>
 #include <Interpreters/PasteJoin.h>
 #include <Interpreters/SpatialRTreeJoin.h>
+#include <Interpreters/SpatialRTreeDoubleJoin.h>
 
 #include <Planner/PlannerActionsVisitor.h>
 #include <Planner/PlannerContext.h>
@@ -1284,6 +1285,9 @@ std::shared_ptr<IJoin> chooseJoinAlgorithm(
             && dag_outputs[0]->function_base
             && dag_outputs[0]->function_base->isSpatialPredicate())
         {
+            if (table_join->isFusedSpatialJoin())
+                return std::make_shared<SpatialRTreeDoubleJoin>(table_join, right_table_expression_header);
+
             String left_col;
             String right_col;
             double bbox_expand = 0.0;

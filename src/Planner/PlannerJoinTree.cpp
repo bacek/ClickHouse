@@ -2397,6 +2397,81 @@ JoinTreeQueryPlan buildQueryPlanForJoinNodeLegacy(
         }
     }
 
+    /// Populate fused double-probe spatial join fields on the TableJoin when this is the
+    /// outer join of a detected chained-spatial-join pattern (SpatialJoinFusePass).
+    /// Navigate the LIVE tree (not stored node pointers) to avoid staleness after cloning.
+    if (join_node.fused_spatial_info)
+    {
+        const auto & fused = *join_node.fused_spatial_info;
+
+        /// The outer join's left child is the fused inner join (is_fused_child = true).
+        const auto * inner_join_node = join_node.getLeftTableExpression()->as<JoinNode>();
+        if (inner_join_node && inner_join_node->is_fused_child)
+        {
+            const auto & probe_node      = inner_join_node->fused_probe_on_right
+                                               ? inner_join_node->getRightTableExpression()
+                                               : inner_join_node->getLeftTableExpression();
+            const auto & inner_dim_node  = inner_join_node->fused_probe_on_right
+                                               ? inner_join_node->getLeftTableExpression()
+                                               : inner_join_node->getRightTableExpression();
+
+            const auto * probe_data      = planner_context->getTableExpressionDataOrNull(probe_node);
+            const auto * inner_dim_data  = planner_context->getTableExpressionDataOrNull(inner_dim_node);
+            const auto * outer_dim_data  = planner_context->getTableExpressionDataOrNull(join_node.getRightTableExpression());
+
+            if (probe_data && inner_dim_data && outer_dim_data)
+            {
+                if (const auto * id = probe_data->getColumnIdentifierOrNull(fused.first_probe_col_name))
+                    table_join->fused_first_probe_left_col = *id;
+
+                /// Map inner-dim columns → outer-dim column identifiers in right_blocks.
+                /// Only include columns actually needed by the outer scope.
+                const auto & id_to_name = inner_dim_data->getColumnIdentifierToColumnName();
+                for (const auto & [inner_id, phys_name] : id_to_name)
+                {
+                    if (!outer_scope_columns.contains(inner_id))
+                        continue;
+                    const auto * outer_id = outer_dim_data->getColumnIdentifierOrNull(phys_name);
+                    if (!outer_id)
+                        continue;
+                    DataTypePtr col_type;
+                    for (const auto & rc : right_plan_output_columns)
+                    {
+                        if (rc.name == *outer_id)
+                        {
+                            col_type = rc.type;
+                            break;
+                        }
+                    }
+                    if (col_type)
+                        table_join->fused_first_probe_output_cols.push_back(
+                            {.right_col = *outer_id, .first_probe_col = inner_id, .type = col_type});
+                }
+            }
+        }
+    }
+
+    /// For the fused double-probe spatial join, the first-probe output columns must appear
+    /// in the join's output header. Inject them as null placeholders into the LEFT (probe)
+    /// plan — NOT the right plan — so the planner cannot push WHERE filters that reference
+    /// these columns into the right-side expression where only constant zeros would be seen.
+    /// SpatialRTreeDoubleJoin::joinBlock replaces the placeholders with real first-probe
+    /// values from right_blocks at runtime.
+    if (!table_join->fused_first_probe_output_cols.empty())
+    {
+        ActionsDAG inject_dag(left_plan.getCurrentHeader()->getColumnsWithTypeAndName());
+        for (const auto & fc : table_join->fused_first_probe_output_cols)
+        {
+            ColumnWithTypeAndName placeholder{fc.type->createColumnConst(0, fc.type->getDefault()), fc.type, fc.first_probe_col};
+            const auto & node = inject_dag.addColumn(std::move(placeholder));
+            inject_dag.addOrReplaceInOutputs(node);
+        }
+        inject_dag.appendInputsForUnusedColumns(*left_plan.getCurrentHeader());
+        auto inject_step = std::make_unique<ExpressionStep>(left_plan.getCurrentHeader(), std::move(inject_dag));
+        inject_step->setStepDescription("Fused spatial join: placeholder first-probe columns");
+        left_plan.addStep(std::move(inject_step));
+    }
+
     auto [result_plan, join_algorithm] = buildJoinQueryPlan(
         std::move(left_plan),
         std::move(right_plan),
@@ -2520,6 +2595,16 @@ JoinTreeQueryPlan buildQueryPlanForJoinNode(
     size_t max_step_description_length)
 {
     auto & join_node = join_table_expression->as<JoinNode &>();
+
+    /// Fused child: the inner join of a double-probe spatial join pattern.
+    /// Return the probe plan directly; the outer fused join handles both probes itself.
+    if (join_node.is_fused_child)
+    {
+        if (join_node.fused_probe_on_right)
+            return right_join_tree_query_plan;
+        return left_join_tree_query_plan;
+    }
+
     if (left_join_tree_query_plan.stage != QueryProcessingStage::FetchColumns)
         throw Exception(ErrorCodes::UNSUPPORTED_METHOD,
             "JOIN {} left table expression expected to process query to fetch columns stage. Actual {}",
@@ -2528,7 +2613,9 @@ JoinTreeQueryPlan buildQueryPlanForJoinNode(
 
     const auto & query_context = planner_context->getQueryContext();
     const auto & settings = query_context->getSettingsRef();
-    if (!settings[Setting::query_plan_use_new_logical_join_step])
+
+    /// Fused spatial joins use SpatialRTreeDoubleJoin which requires the legacy plan path.
+    if (!settings[Setting::query_plan_use_new_logical_join_step] || join_node.fused_spatial_info)
         return buildQueryPlanForJoinNodeLegacy(
             join_table_expression, std::move(left_join_tree_query_plan), std::move(right_join_tree_query_plan), outer_scope_columns, planner_context, select_query_info, max_step_description_length);
 

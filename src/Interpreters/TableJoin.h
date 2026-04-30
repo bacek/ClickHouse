@@ -261,6 +261,17 @@ private:
     getKeysForNullSafeComparion(const ColumnsWithTypeAndName & left_sample_columns, const ColumnsWithTypeAndName & right_sample_columns);
 
 public:
+    /// Set when this is a fused double-probe spatial join (SpatialRTreeDoubleJoin).
+    /// Identifier of the first-probe left geometry column (e.g. "__table2.t_pickuploc").
+    /// Empty means "not fused".
+    String fused_first_probe_left_col;
+
+    /// Output columns from the FIRST probe result.
+    /// right_col: column name in right_blocks (e.g. "__table3.z_zonekey")
+    /// first_probe_col: desired output name (e.g. "__table1.z_zonekey")
+    struct FusedProbeOutputCol { String right_col; String first_probe_col; DataTypePtr type; };
+    std::vector<FusedProbeOutputCol> fused_first_probe_output_cols;
+
     TableJoin() = default;
 
     TableJoin(const Settings & settings, VolumePtr tmp_volume_, TemporaryDataOnDiskScopePtr tmp_data_);
@@ -351,6 +362,8 @@ public:
 
     const std::shared_ptr<ExpressionActions> & getPreSpatialFilterExpression() const { return pre_spatial_filter_expression; }
     std::shared_ptr<ExpressionActions> & getPreSpatialFilterExpression() { return pre_spatial_filter_expression; }
+
+    bool isFusedSpatialJoin() const { return !fused_first_probe_left_col.empty(); }
 
     Names getAllNames(JoinTableSide side) const;
 
