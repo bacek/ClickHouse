@@ -61,6 +61,7 @@ struct HashJoinEntry
     size_t source_rows; // the number of rows in the source table
 };
 
+
 /** Collects observed HashTable-s sizes to avoid redundant intermediate resizes.
   */
 template <typename Entry>

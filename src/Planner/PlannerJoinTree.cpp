@@ -2223,6 +2223,16 @@ JoinTreeQueryPlan buildQueryPlanForJoinNode(
     PlannerContextPtr & planner_context)
 {
     auto & join_node = join_table_expression->as<JoinNode &>();
+
+    /// Fused child: the inner join of a double-probe spatial join pattern.
+    /// Return the probe plan directly; the outer fused join handles both probes itself.
+    if (join_node.is_fused_child)
+    {
+        if (join_node.fused_probe_on_right)
+            return right_join_tree_query_plan;
+        return left_join_tree_query_plan;
+    }
+
     if (left_join_tree_query_plan.stage != QueryProcessingStage::FetchColumns)
         throw Exception(ErrorCodes::UNSUPPORTED_METHOD,
             "JOIN {} left table expression expected to process query to fetch columns stage. Actual {}",
