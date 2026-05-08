@@ -11,6 +11,8 @@
 
 #include <Analyzer/IQueryTreeNode.h>
 
+#include <optional>
+
 namespace DB
 {
 
@@ -163,6 +165,22 @@ public:
      * Expects the current kind to be CROSS (and join expression to be null because of that).
      */
     void crossToInner(const QueryTreeNodePtr & join_expression_);
+
+    /// Optimizer annotation: this JoinNode is the inner (first) join in a fused
+    /// SpatialRTreeDoubleJoin pattern.  When set, the planner discards the dim plan
+    /// and passes the probe plan directly to the outer join.
+    bool is_fused_child = false;
+    bool fused_probe_on_right = false;  /// true when probe table is on RIGHT of inner join
+
+    /// Optimizer annotation set on the OUTER join of a fused pair.
+    /// Contains enough information for the planner to build SpatialRTreeDoubleJoin.
+    struct FusedSpatialInfo
+    {
+        String first_probe_col_name;            /// physical column name in the probe table
+        QueryTreeNodePtr probe_table_node;       /// probe table node (to look up planner column id)
+        QueryTreeNodePtr inner_dim_table_node;   /// inner dimension table node (to look up first-probe output ids)
+    };
+    std::optional<FusedSpatialInfo> fused_spatial_info;
 
     void dumpTreeImpl(WriteBuffer & buffer, FormatState & format_state, size_t indent) const override;
 

@@ -8,6 +8,8 @@
 #include <Columns/ColumnConst.h>
 #include <Columns/ColumnString.h>
 #include <Common/Exception.h>
+#include <Common/logger_useful.h>
+#include <Common/Stopwatch.h>
 #include <IO/ReadBufferFromMemory.h>
 #include <IO/ReadHelpers.h>
 
@@ -513,6 +515,10 @@ JoinResultPtr SpatialRTreeJoin::joinBlock(Block left_block)
     static constexpr size_t kLargeHit      = 4'000'000;   // per-row hit limit before streaming mode
     static constexpr size_t kMaxCandidates = 8'000'000;   // shared buffer overflow guard
 
+    Stopwatch sw_join;
+    UInt64 ns_join_wasm = 0;
+    size_t join_wasm_calls = 0;
+
     struct Candidate { size_t left_row; UInt32 block_idx; UInt32 row_idx; };
     std::vector<Candidate> candidates;
     candidates.reserve(std::min(left_rows * 8, kMaxCandidates));
@@ -605,7 +611,12 @@ JoinResultPtr SpatialRTreeJoin::joinBlock(Block left_block)
                     ColumnPtr single = rb.getByName(rcd.name).column->cut(c0.row_idx, 1);
                     pred_block.insert({ColumnConst::create(std::move(single), k), rcd.type, rcd.name});
                 }
-                table_join->getMixedJoinExpression()->execute(pred_block);
+                {
+                    const UInt64 t0 = clock_gettime_ns();
+                    table_join->getMixedJoinExpression()->execute(pred_block);
+                    ns_join_wasm += clock_gettime_ns() - t0;
+                    ++join_wasm_calls;
+                }
                 const auto & fc = *pred_block.getByName(filter_col_name).column;
                 for (size_t j = 0; j < k; ++j)
                     mask[indices[j]] = fc.getBool(j) ? 1 : 0;
@@ -639,7 +650,12 @@ JoinResultPtr SpatialRTreeJoin::joinBlock(Block left_block)
                             cands[ci].row_idx);
                     pred_block.insert({std::move(data), rcd.type, rcd.name});
                 }
-                table_join->getMixedJoinExpression()->execute(pred_block);
+                {
+                    const UInt64 t0 = clock_gettime_ns();
+                    table_join->getMixedJoinExpression()->execute(pred_block);
+                    ns_join_wasm += clock_gettime_ns() - t0;
+                    ++join_wasm_calls;
+                }
                 const auto & fc = *pred_block.getByName(filter_col_name).column;
                 for (size_t j = 0; j < k; ++j)
                     mask[indices[j]] = fc.getBool(j) ? 1 : 0;
@@ -734,7 +750,12 @@ JoinResultPtr SpatialRTreeJoin::joinBlock(Block left_block)
                         col->insertFrom(*right_blocks[row_hits[j].second.block_idx].getByName(rcd.name).column, row_hits[j].second.row_idx);
                 pred_block.insert({std::move(col), rcd.type, rcd.name});
             }
-            table_join->getMixedJoinExpression()->execute(pred_block);
+            {
+                const UInt64 t0 = clock_gettime_ns();
+                table_join->getMixedJoinExpression()->execute(pred_block);
+                ns_join_wasm += clock_gettime_ns() - t0;
+                ++join_wasm_calls;
+            }
             const auto & fc = *pred_block.getByName(filter_col_name).column;
             for (size_t j = 0; j < eff_k; ++j)
             {
@@ -824,6 +845,11 @@ JoinResultPtr SpatialRTreeJoin::joinBlock(Block left_block)
         }
     }
     evaluateAndEmit(candidates); // emit all accumulated candidates
+
+    LOG_TRACE(getLogger("SpatialRTreeJoin"),
+        "joinBlock: total={:.3f}s wasm={:.3f}s wasm_calls={} left_rows={}",
+        sw_join.elapsedSeconds(), static_cast<double>(ns_join_wasm) / 1e9,
+        join_wasm_calls, left_rows);
 
     for (size_t i = 0; i < n_out_cols; ++i)
         output.getByPosition(i).column = std::move(mutable_cols[i]);

@@ -92,7 +92,7 @@ public:
         int expand_arg_index,
         double & out_bbox_expand);
 
-private:
+protected:
     using BGPoint = boost::geometry::model::d2::point_xy<double>;
     using BGBox   = boost::geometry::model::box<BGPoint>;
 
@@ -106,6 +106,17 @@ private:
         std::pair<BGBox, RightPos>,
         boost::geometry::index::quadratic<16>>;
 
+    /// Scan raw WKB/EWKB bytes and return the bounding box without constructing
+    /// any geometry object. Handles 2D and 3D (Z/M) coordinates, EWKB SRID flag,
+    /// ISO WKB 3D type codes (1001-3007), and recursive multi-geometries.
+    static BGBox wkbBBox(std::string_view wkb);
+
+    const Block & getRightBlock(size_t idx) const { return right_blocks[idx]; }
+    size_t rightBlocksCount() const { return right_blocks.size(); }
+    SharedHeader getRightHeader() const { return right_header; }
+    const std::vector<RTree> & getSubTrees() const { return sub_trees; }
+
+private:
     std::shared_ptr<TableJoin> table_join;
     SharedHeader right_header;
 
@@ -152,11 +163,6 @@ private:
     /// (a) all writers write the same value and (b) getNonJoinedBlocks() is called only
     /// after all joinBlock() invocations have completed (pipeline synchronisation barrier).
     std::vector<std::vector<char>> right_matched_per_block;
-
-    /// Scan raw WKB/EWKB bytes and return the bounding box without constructing
-    /// any geometry object. Handles 2D and 3D (Z/M) coordinates, EWKB SRID flag,
-    /// ISO WKB 3D type codes (1001-3007), and recursive multi-geometries.
-    static BGBox wkbBBox(std::string_view wkb);
 };
 
 }
