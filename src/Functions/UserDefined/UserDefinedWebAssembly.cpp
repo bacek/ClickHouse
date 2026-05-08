@@ -1306,13 +1306,27 @@ UserDefinedWebAssemblyFunctionFactory::prepareFunction(ASTPtr create_function_qu
 
     /// For aggregate functions, the WASM export receives Array(T) arguments — one array per declared
     /// argument type containing all accumulated rows for the group.
-    /// Wrap the declared argument types before creating the WASM function so signature validation
-    /// checks the actual types the WASM export must accept.
+    /// If the declared type is already Array(T), use T as the accumulator element type and keep
+    /// the WASM signature as Array(T) (no double-wrapping).
+    /// If the declared type is scalar T, wrap to Array(T) for the WASM signature.
     DataTypes wasm_arg_types = function_def.argument_types;
+    DataTypes accumulator_arg_types;
     if (is_aggregate)
     {
+        accumulator_arg_types.reserve(wasm_arg_types.size());
         for (auto & type : wasm_arg_types)
-            type = std::make_shared<DataTypeArray>(type);
+        {
+            if (const auto * array_type = typeid_cast<const DataTypeArray *>(type.get()))
+            {
+                accumulator_arg_types.push_back(array_type->getNestedType());
+                /// type is already Array(T) — leave wasm_arg_types entry unchanged
+            }
+            else
+            {
+                accumulator_arg_types.push_back(type);
+                type = std::make_shared<DataTypeArray>(type);
+            }
+        }
     }
 
     std::shared_ptr<UserDefinedWebAssemblyFunction> wasm_func = UserDefinedWebAssemblyFunction::create(
@@ -1326,7 +1340,12 @@ UserDefinedWebAssemblyFunctionFactory::prepareFunction(ASTPtr create_function_qu
         function_def.is_deterministic);
 
     return RegisteredFunction{
-        function_def.function_name, std::move(wasm_func), function_def.argument_types, std::move(create_function_query), is_aggregate};
+        function_def.function_name,
+        std::move(wasm_func),
+        function_def.argument_types,
+        std::move(create_function_query),
+        is_aggregate,
+        accumulator_arg_types};
 }
 
 std::shared_ptr<UserDefinedWebAssemblyFunction>
@@ -1351,7 +1370,8 @@ void UserDefinedWebAssemblyFunctionFactory::addOrReplace(RegisteredFunction regi
                 std::move(registered_function.function),
                 std::move(registered_function.original_arg_types),
                 std::move(registered_function.create_query),
-                registered_function.is_aggregate};
+                registered_function.is_aggregate,
+                std::move(registered_function.accumulator_arg_types)};
             return;
         }
     }
@@ -1359,7 +1379,8 @@ void UserDefinedWebAssemblyFunctionFactory::addOrReplace(RegisteredFunction regi
         std::move(registered_function.function),
         std::move(registered_function.original_arg_types),
         std::move(registered_function.create_query),
-        registered_function.is_aggregate});
+        registered_function.is_aggregate,
+        std::move(registered_function.accumulator_arg_types)});
 }
 
 void UserDefinedWebAssemblyFunctionFactory::replaceAll(VectorWithMemoryTracking<RegisteredFunction> registered_functions)
@@ -1370,7 +1391,8 @@ void UserDefinedWebAssemblyFunctionFactory::replaceAll(VectorWithMemoryTracking<
             std::move(registered_function.function),
             std::move(registered_function.original_arg_types),
             std::move(registered_function.create_query),
-            registered_function.is_aggregate});
+            registered_function.is_aggregate,
+            std::move(registered_function.accumulator_arg_types)});
 
     std::unique_lock lock(registry_mutex);
     registry = std::move(new_registry);
@@ -1466,7 +1488,7 @@ AggregateFunctionPtr UserDefinedWebAssemblyFunctionFactory::getAggregate(
         {
             if (!entry.is_aggregate)
                 continue;
-            if (arg_types.empty() || typesMatchOverload(arg_types, entry.original_arg_types))
+            if (arg_types.empty() || typesMatchOverload(arg_types, entry.accumulator_arg_types))
             {
                 match = &entry;
                 break;
@@ -1480,7 +1502,7 @@ AggregateFunctionPtr UserDefinedWebAssemblyFunctionFactory::getAggregate(
                 "WebAssembly function '{}' is not an aggregate function",
                 function_name);
         wasm_func = match->function;
-        original_arg_types = match->original_arg_types;
+        original_arg_types = match->accumulator_arg_types;
     }
     return std::make_shared<AggregateFunctionUserDefinedWasm>(
         function_name, std::move(wasm_func), std::move(original_arg_types), std::move(context));
@@ -1542,7 +1564,8 @@ VectorWithMemoryTracking<UserDefinedWebAssemblyFunctionFactory::RegisteredFuncti
                 .function = entry.function,
                 .original_arg_types = entry.original_arg_types,
                 .create_query = entry.create_query,
-                .is_aggregate = entry.is_aggregate});
+                .is_aggregate = entry.is_aggregate,
+                .accumulator_arg_types = entry.accumulator_arg_types});
     return result;
 }
 

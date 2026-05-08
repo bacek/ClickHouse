@@ -122,9 +122,14 @@ public:
     {
         String sql_name;
         std::shared_ptr<UserDefinedWebAssemblyFunction> function;
-        DataTypes original_arg_types; /// declared types before Array wrapping for aggregates
+        DataTypes original_arg_types; /// declared types as written in CREATE FUNCTION
         ASTPtr create_query;
         bool is_aggregate = false;
+        /// For is_aggregate=1 entries: element types used by the accumulator.
+        /// When declared type is already Array(T), this holds T (not Array(T)).
+        /// When declared type is scalar T, this equals original_arg_types.
+        /// Empty for non-aggregate entries.
+        DataTypes accumulator_arg_types;
     };
 
     RegisteredFunction prepareFunction(ASTPtr create_function_query, WasmModuleManager & module_manager) const;
@@ -167,9 +172,14 @@ private:
     struct RegistryEntry
     {
         std::shared_ptr<UserDefinedWebAssemblyFunction> function;
-        DataTypes original_arg_types; /// declared types before Array wrapping for aggregates
+        DataTypes original_arg_types;     /// declared types as written in CREATE FUNCTION
         ASTPtr create_query;
         bool is_aggregate = false;
+        /// For is_aggregate=1 entries: element types used by the accumulator.
+        /// When declared type is already Array(T), this holds T (not Array(T)).
+        /// When declared type is scalar T, this equals original_arg_types.
+        /// Empty for non-aggregate entries.
+        DataTypes accumulator_arg_types;
     };
 
     mutable DB::SharedMutex registry_mutex;
