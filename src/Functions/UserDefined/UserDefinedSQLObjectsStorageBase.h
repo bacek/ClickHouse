@@ -1,5 +1,6 @@
 #pragma once
 
+#include <map>
 #include <unordered_map>
 #include <mutex>
 
@@ -41,6 +42,7 @@ public:
         const ContextPtr & current_context,
         UserDefinedSQLObjectType object_type,
         const String & object_name,
+        const Strings & argument_type_names,
         bool throw_if_not_exists) override;
 
 protected:
@@ -57,6 +59,7 @@ protected:
         const ContextPtr & current_context,
         UserDefinedSQLObjectType object_type,
         const String & object_name,
+        const Strings & argument_type_names,
         bool throw_if_not_exists) = 0;
 
     std::unique_lock<std::recursive_mutex> getLock() const;
@@ -65,10 +68,15 @@ protected:
     void removeObject(const String & object_name);
     void removeAllObjectsExcept(const Strings & object_names_to_keep);
 
-    std::unordered_map<String, ASTPtr> object_name_to_create_object_map;
+    /// name → (argument-type signature → AST)
+    /// SQL lambdas use an empty signature {}; WASM functions use {type1, type2, ...}.
+    std::unordered_map<String, std::map<Strings, ASTPtr>> object_overloads_map;
     mutable std::recursive_mutex mutex;
 
     ContextPtr global_context;
+
+protected:
+    static Strings extractSignatureFromAST(const IAST & ast);
 };
 
 }

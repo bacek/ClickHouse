@@ -45,7 +45,11 @@ BlockIO InterpreterDropFunctionQuery::execute()
 
     bool throw_if_not_exists = !drop_function_query.if_exists;
 
-    UserDefinedSQLFunctionFactory::instance().unregisterFunction(current_context, drop_function_query.function_name, throw_if_not_exists);
+    UserDefinedSQLFunctionFactory::instance().unregisterFunction(
+        current_context,
+        drop_function_query.function_name,
+        drop_function_query.argument_type_names,
+        throw_if_not_exists);
 
     return {};
 }
