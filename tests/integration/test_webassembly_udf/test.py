@@ -177,3 +177,67 @@ def test_enabled(start_cluster):
     node1.query("DROP FUNCTION IF EXISTS add_or_sub")
     node1.query("DELETE FROM system.webassembly_modules WHERE name = 'isprime'")
     node1.query("DELETE FROM system.webassembly_modules WHERE name = 'add_or_sub'")
+
+
+def test_overload_persistence_after_restart(start_cluster):
+    """Test that multiple overloads of a user-defined WASM function survive a server restart.
+
+    This exercises the disk persistence path: CREATE stores each overload as a
+    separate statement in a single function_<name>.sql file, and on restart the
+    loader re-parses the file and registers all overloads back into the
+    overload-aware in-memory map.
+    """
+
+    if node1.is_built_with_memory_sanitizer():
+        pytest.skip("Wasmtime is disabled in MSAN builds")
+
+    # Cleanup from previous runs
+    node1.query("DROP FUNCTION IF EXISTS wasm_mul")
+    node1.query("DELETE FROM system.webassembly_modules WHERE name = 'mul_i32_module'")
+    node1.query("DELETE FROM system.webassembly_modules WHERE name = 'mul_i64_module'")
+
+    # Load two WASM modules with different signatures
+    node1.query(
+        "INSERT INTO system.webassembly_modules (name, code) "
+        "SELECT 'mul_i32_module', base64Decode('AGFzbQEAAAABBwFgAn9/AX8DAgEABwcBA211bAAACgkBBwAgACABags=')"
+    )
+    node1.query(
+        "INSERT INTO system.webassembly_modules (name, code) "
+        "SELECT 'mul_i64_module', base64Decode('AGFzbQEAAAABBwFgAn5+AX4DAgEABwcBA211bAAACgkBBwAgACABfAs=')"
+    )
+
+    # Create two overloads
+    node1.query(
+        "CREATE FUNCTION wasm_mul LANGUAGE WASM ABI ROW_DIRECT "
+        "FROM 'mul_i32_module' :: 'mul' ARGUMENTS (Int32, Int32) RETURNS Int32"
+    )
+    node1.query(
+        "CREATE FUNCTION wasm_mul LANGUAGE WASM ABI ROW_DIRECT "
+        "FROM 'mul_i64_module' :: 'mul' ARGUMENTS (Int64, Int64) RETURNS Int64"
+    )
+
+    # Verify both overloads work before restart
+    result = node1.query(
+        "SELECT wasm_mul(toInt32(3), toInt32(4)), wasm_mul(toInt64(3), toInt64(4))"
+    )
+    assert result == "12\t12\n"
+
+    # Restart and verify all overloads survive
+    node1.restart_clickhouse()
+
+    result = node1.query(
+        "SELECT wasm_mul(toInt32(3), toInt32(4)), wasm_mul(toInt64(3), toInt64(4))"
+    )
+    assert result == "12\t12\n"
+
+    # Verify all overloads are visible in system functions
+    result = node1.query(
+        "SELECT name, arguments FROM system.functions WHERE name = 'wasm_mul' ORDER BY arguments"
+    )
+    # Two overloads should be present
+    assert result.count("\n") == 1, f"Expected 2 overloads in system.functions, got:\n{result}"
+
+    # Cleanup
+    node1.query("DROP FUNCTION IF EXISTS wasm_mul")
+    node1.query("DELETE FROM system.webassembly_modules WHERE name = 'mul_i32_module'")
+    node1.query("DELETE FROM system.webassembly_modules WHERE name = 'mul_i64_module'")

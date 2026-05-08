@@ -434,7 +434,7 @@ ASTPtr UserDefinedSQLObjectsZooKeeperStorage::tryLoadObject(
         tryLogCurrentException(log, fmt::format("while loading user defined SQL object {}", backQuote(object_name)));
         return nullptr; /// Non-hardware Keeper errors — treat as missing
     }
-   catch (...)
+    catch (...)
     {
         tryLogCurrentException(log, fmt::format("while loading user defined SQL object {}", backQuote(object_name)));
         return nullptr; /// Failed to load this sql object, will ignore it
@@ -486,7 +486,19 @@ void UserDefinedSQLObjectsZooKeeperStorage::refreshObject(
     if (ast)
         setObject(object_name, *ast);
     else
-        removeObject(object_name);
+    {
+        /// Overload is missing from ZooKeeper — remove only this specific
+        /// overload from the in-memory map. The disk file is the source of
+        /// truth and must not be modified by ZK sync operations.
+        std::lock_guard lock(mutex);
+        auto outer_it = object_overloads_map.find(object_name);
+        if (outer_it != object_overloads_map.end())
+        {
+            outer_it->second.erase(signature);
+            if (outer_it->second.empty())
+                object_overloads_map.erase(outer_it);
+        }
+    }
 }
 
 Strings UserDefinedSQLObjectsZooKeeperStorage::getObjectNamesAndSetWatch(

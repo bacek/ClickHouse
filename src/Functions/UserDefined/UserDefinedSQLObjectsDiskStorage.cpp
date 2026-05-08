@@ -72,7 +72,7 @@ UserDefinedSQLObjectsDiskStorage::UserDefinedSQLObjectsDiskStorage(const Context
 }
 
 
-static std::vector<ASTPtr> parseAllCreateFunctionStatements(const String & content, const ContextPtr & global_context)
+static std::vector<ASTPtr> parseAllCreateFunctionStatements(const String & content, const ContextPtr & global_context, bool warn_on_truncation = true)
 {
     std::vector<ASTPtr> result;
 
@@ -94,6 +94,9 @@ static std::vector<ASTPtr> parseAllCreateFunctionStatements(const String & conte
         expected = Expected();
         ast = nullptr;
     }
+
+    if (warn_on_truncation && pos.get().type != TokenType::EndOfStream)
+        tryLogCurrentException("UserDefinedSQLObjectsDiskStorage", "Trailing content after parsing user-defined function statements");
 
     return result;
 }
@@ -318,6 +321,7 @@ bool UserDefinedSQLObjectsDiskStorage::storeObjectImpl(
     String create_statement = create_statement_buf.str();
 
     String existing_content;
+    bool statement_in_file = false;
 
     if (fs::exists(file_path))
     {
@@ -328,14 +332,47 @@ bool UserDefinedSQLObjectsDiskStorage::storeObjectImpl(
         /// For overloads (e.g. WASM functions with different signatures), the file
         /// may contain multiple CREATE statements — only throw if this exact one
         /// is already present.
-        if (throw_if_exists && existing_content.find(create_statement) != String::npos)
-            throw Exception(ErrorCodes::FUNCTION_ALREADY_EXISTS, "User-defined function '{}' already exists", object_name);
+        statement_in_file = (existing_content.find(create_statement) != String::npos);
+        if (statement_in_file)
+        {
+            if (throw_if_exists)
+                throw Exception(ErrorCodes::FUNCTION_ALREADY_EXISTS, "User-defined function '{}' already exists", object_name);
 
-        if (!replace_if_exists)
-            return false;
+            if (!replace_if_exists)
+                return false;
+
+            /// replace_if_exists: strip the old statement before writing the replacement.
+            auto old_asts = parseAllCreateFunctionStatements(existing_content, global_context);
+            std::vector<ASTPtr> remaining;
+            IAST::FormatSettings fmt_settings(/*one_line=*/false);
+            for (const auto & old_ast : old_asts)
+            {
+                WriteBufferFromOwnString buf;
+                old_ast->format(buf, fmt_settings);
+                writeChar('\n', buf);
+                if (buf.str() != create_statement)
+                    remaining.push_back(old_ast);
+            }
+            if (remaining.empty())
+            {
+                /// All matching statements were replaced — file is now empty.
+                existing_content.clear();
+            }
+            else
+            {
+                WriteBufferFromOwnString buf;
+                for (const auto & ast : remaining)
+                {
+                    ast->format(buf, fmt_settings);
+                    writeChar('\n', buf);
+                }
+                existing_content = buf.str();
+            }
+        }
     }
 
-    String combined_content = existing_content + create_statement;
+    /// New overload (not already in file): always append.
+    String combined_content = existing_content + "\n" + create_statement;
     String temp_file_path = file_path + ".tmp";
 
     try
@@ -392,6 +429,7 @@ bool UserDefinedSQLObjectsDiskStorage::removeObjectImpl(
     auto asts = parseAllCreateFunctionStatements(file_content, getContext());
     std::vector<ASTPtr> remaining;
     bool found = false;
+    bool overload_found = false;
     for (const auto & ast : asts)
     {
         String name = extractFunctionName(ast);
@@ -405,11 +443,19 @@ bool UserDefinedSQLObjectsDiskStorage::removeObjectImpl(
         /// If dropping all overloads, remove this statement.
         /// If dropping a specific overload, only remove if signature matches.
         if (argument_type_names.empty())
+        {
+            overload_found = true;
             continue;
+        }
 
         auto query_types = extractArgumentTypeNames(ast);
-        if (!argumentsMatch(query_types, argument_type_names))
-            remaining.push_back(ast);
+        if (argumentsMatch(query_types, argument_type_names))
+        {
+            overload_found = true;
+            continue;
+        }
+
+        remaining.push_back(ast);
     }
 
     if (!found)
@@ -419,21 +465,53 @@ bool UserDefinedSQLObjectsDiskStorage::removeObjectImpl(
         return false;
     }
 
-    if (remaining.empty())
+    if (argument_type_names.empty() && !found)
+    {
+        if (throw_if_not_exists)
+            throw Exception(ErrorCodes::UNKNOWN_FUNCTION, "User-defined function '{}' doesn't exist", object_name);
+        return false;
+    }
+    if (!argument_type_names.empty() && !overload_found)
+    {
+        if (throw_if_not_exists)
+            throw Exception(ErrorCodes::UNKNOWN_FUNCTION, "User-defined function '{}' doesn't exist", object_name);
+        return false;
+    }
+
+    if (overload_found && remaining.empty())
     {
         fs::remove(file_path);
     }
-    else
+    else if (overload_found && !remaining.empty())
     {
-        WriteBufferFromFile out(file_path, remaining.size() * 128);
-        IAST::FormatSettings format_settings(/*one_line=*/false);
-        for (const auto & ast : remaining)
+        /// Rewrite remaining overloads to a temp file and atomically rename.
+        String temp_file_path = file_path + ".tmp";
+        String combined_content;
         {
-            ast->format(out, format_settings);
-            writeChar('\n', out);
+            WriteBufferFromOwnString buf;
+            IAST::FormatSettings format_settings(/*one_line=*/false);
+            for (const auto & ast : remaining)
+            {
+                ast->format(buf, format_settings);
+                writeChar('\n', buf);
+            }
+            combined_content = buf.str();
         }
-        out.next();
-        out.close();
+
+        try
+        {
+            WriteBufferFromFile out(temp_file_path, combined_content.size());
+            writeString(combined_content, out);
+            out.next();
+            out.close();
+
+            fs::rename(temp_file_path, file_path);
+        }
+        catch (...)
+        {
+            fs::remove(temp_file_path);
+            throw;
+        }
     }
 
     LOG_TRACE(log, "Object {} removed", backQuote(object_name));
