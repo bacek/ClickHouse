@@ -148,8 +148,15 @@ public:
     /// arg_types must match the declared (non-Array) argument types.
     AggregateFunctionPtr getAggregate(const String & function_name, const DataTypes & arg_types, ContextPtr context) const;
 
-    /// Returns true if function was removed
+    /// Returns true if function was removed.
+    /// Empty argument_type_names = drop all overloads; non-empty = drop specific overload by signature.
+    bool dropIfExists(const String & function_name, const Strings & argument_type_names);
+
+    /// Backward compatibility for scripts that call dropIfExists without argument_type_names.
     bool dropIfExists(const String & function_name);
+
+    /// Returns true if an overload with the exact argument-type signature exists.
+    bool hasOverload(const String & function_name, const DataTypes & arg_types) const;
 
     /// Returns all registered WASM functions with their metadata for introspection (e.g. system.functions).
     VectorWithMemoryTracking<RegisteredFunction> getAllFunctions() const;

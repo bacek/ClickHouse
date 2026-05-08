@@ -57,6 +57,55 @@ namespace
         return root_path + "/" + String{getNodePrefix(object_type)} + escapeForFileName(object_name) + String{sql_extension};
     }
 
+    String getNodePath(
+        const String & root_path, UserDefinedSQLObjectType object_type, const String & object_name, const Strings & signature)
+    {
+        String filename = escapeForFileName(object_name);
+        if (!signature.empty())
+        {
+            filename += "__";  /// Double underscore — unambiguous since _ is allowed in names but __ is not (escaped).
+            for (const auto & sig_part : signature)
+                filename += escapeForFileName(sig_part) + "_";
+        }
+        return root_path + "/" + String{getNodePrefix(object_type)} + filename + String{sql_extension};
+    }
+
+    UserDefinedSQLObjectsZooKeeperStorage::ObjectNameWithSignature parseNodeName(
+        std::string_view node_name, std::string_view prefix, std::string_view ext)
+    {
+        UserDefinedSQLObjectsZooKeeperStorage::ObjectNameWithSignature result;
+
+        /// Strip prefix and extension.
+        auto stripped = node_name.substr(prefix.length(), node_name.length() - prefix.length() - ext.length());
+        String unescaped = unescapeForFileName(String(stripped));
+
+        /// Find signature separator "__" from the right.
+        auto sep_pos = unescaped.rfind("__");
+        if (sep_pos == String::npos)
+        {
+            result.name = unescaped;
+        }
+        else
+        {
+            result.name = unescaped.substr(0, sep_pos);
+            String sig_str = unescaped.substr(sep_pos + 2);
+            /// Split signature by "_".
+            size_t start = 0;
+            while (start < sig_str.size())
+            {
+                auto dot = sig_str.find('_', start);
+                if (dot == String::npos)
+                {
+                    result.signature.push_back(sig_str.substr(start));
+                    break;
+                }
+                result.signature.push_back(sig_str.substr(start, dot - start));
+                start = dot + 1;
+            }
+        }
+        return result;
+    }
+
     String makeWatchIdFromName(const String & name)
     {
         return fmt::format("UserDefinedSQLObjectsZooKeeperStorage(name={})", name);
@@ -235,7 +284,8 @@ bool UserDefinedSQLObjectsZooKeeperStorage::storeObjectImpl(
     const Settings &)
 {
     auto component_guard = Coordination::setCurrentComponent("UserDefinedSQLObjectsZooKeeperStorage::storeObjectImpl");
-    String path = getNodePath(zookeeper_path, object_type, object_name);
+    auto sig = extractSignatureFromAST(*create_object_query);
+    String path = getNodePath(zookeeper_path, object_type, object_name, sig);
     LOG_DEBUG(log, "Storing user-defined object {} at zk path {}", backQuote(object_name), path);
 
     WriteBufferFromOwnString create_statement_buf;
@@ -284,10 +334,11 @@ bool UserDefinedSQLObjectsZooKeeperStorage::removeObjectImpl(
     const ContextPtr & /*current_context*/,
     UserDefinedSQLObjectType object_type,
     const String & object_name,
+    const Strings & argument_type_names,
     bool throw_if_not_exists)
 {
     auto component_guard = Coordination::setCurrentComponent("UserDefinedSQLObjectsZooKeeperStorage::removeObjectImpl");
-    String path = getNodePath(zookeeper_path, object_type, object_name);
+    String path = getNodePath(zookeeper_path, object_type, object_name, argument_type_names);
     LOG_DEBUG(log, "Removing user-defined object {} at zk path {}", backQuote(object_name), path);
 
     auto zookeeper = getZooKeeper();
@@ -383,11 +434,59 @@ ASTPtr UserDefinedSQLObjectsZooKeeperStorage::tryLoadObject(
         tryLogCurrentException(log, fmt::format("while loading user defined SQL object {}", backQuote(object_name)));
         return nullptr; /// Non-hardware Keeper errors — treat as missing
     }
-    catch (...)
+   catch (...)
     {
         tryLogCurrentException(log, fmt::format("while loading user defined SQL object {}", backQuote(object_name)));
         return nullptr; /// Failed to load this sql object, will ignore it
     }
+}
+
+ASTPtr UserDefinedSQLObjectsZooKeeperStorage::tryLoadObject(
+    const zkutil::ZooKeeperPtr & zookeeper, UserDefinedSQLObjectType object_type, const String & object_name, const Strings & signature)
+{
+    String path = getNodePath(zookeeper_path, object_type, object_name, signature);
+    LOG_DEBUG(log, "Loading user defined object {} (sig={}) from zk path {}", backQuote(object_name), fmt::join(signature, ","), path);
+
+    try
+    {
+        String object_data;
+        bool exists = getObjectDataAndSetWatch(zookeeper, object_data, path, object_type, object_name);
+
+        if (!exists)
+        {
+            LOG_INFO(log, "User-defined object '{}' can't be loaded from path {}, because it doesn't exist", backQuote(object_name), path);
+            return nullptr;
+        }
+
+        return parseObjectData(object_data, object_type);
+    }
+    catch (const zkutil::KeeperException & e)
+    {
+        if (Coordination::isHardwareError(e.code))
+        {
+            LOG_WARNING(log, "Keeper hardware error while loading user defined SQL object {}: {}",
+                backQuote(object_name), e.message());
+            throw;
+        }
+        tryLogCurrentException(log, fmt::format("while loading user defined SQL object {}", backQuote(object_name)));
+        return nullptr;
+    }
+    catch (...)
+    {
+        tryLogCurrentException(log, fmt::format("while loading user defined SQL object {}", backQuote(object_name)));
+        return nullptr;
+    }
+}
+
+void UserDefinedSQLObjectsZooKeeperStorage::refreshObject(
+    const zkutil::ZooKeeperPtr & zookeeper, UserDefinedSQLObjectType object_type, const String & object_name, const Strings & signature)
+{
+    auto ast = tryLoadObject(zookeeper, object_type, object_name, signature);
+
+    if (ast)
+        setObject(object_name, *ast);
+    else
+        removeObject(object_name);
 }
 
 Strings UserDefinedSQLObjectsZooKeeperStorage::getObjectNamesAndSetWatch(
@@ -420,6 +519,38 @@ Strings UserDefinedSQLObjectsZooKeeperStorage::getObjectNamesAndSetWatch(
     }
 
     return object_names;
+}
+
+std::vector<UserDefinedSQLObjectsZooKeeperStorage::ObjectNameWithSignature>
+UserDefinedSQLObjectsZooKeeperStorage::getObjectNamesAndSetWatch(
+    const zkutil::ZooKeeperPtr & zookeeper, UserDefinedSQLObjectType object_type, bool /*include_signatures*/)
+{
+    auto object_list_watcher = zookeeper->createWatchFromRawCallback(makeWatchIdFromType(object_type), [&] -> Coordination::WatchCallback
+    {
+        return [my_watch_queue = watch_queue, object_type](const Coordination::WatchResponse &)
+        {
+            [[maybe_unused]] bool inserted = my_watch_queue->emplace(object_type, "");
+            /// `inserted` can be false if `watch_queue` was already finalized (which happens when stopWatching() is called).
+        };
+    });
+
+    Coordination::Stat stat;
+    const auto node_names = zookeeper->getChildrenWatch(zookeeper_path, &stat, object_list_watcher);
+    const auto prefix = getNodePrefix(object_type);
+
+    std::vector<ObjectNameWithSignature> result;
+    result.reserve(node_names.size());
+    for (const auto & node_name : node_names)
+    {
+        if (node_name.starts_with(prefix) && node_name.ends_with(sql_extension))
+        {
+            auto [name, signature] = parseNodeName(node_name, prefix, sql_extension);
+            if (!name.empty())
+                result.push_back({name, std::move(signature)});
+        }
+    }
+
+    return result;
 }
 
 void UserDefinedSQLObjectsZooKeeperStorage::refreshAllObjects(const zkutil::ZooKeeperPtr & zookeeper)
@@ -460,13 +591,13 @@ void UserDefinedSQLObjectsZooKeeperStorage::refreshObjects(const zkutil::ZooKeep
         if (retries_ctl.isRetry())
             current_zookeeper = zookeeper_getter.getZooKeeper().first;
 
-        Strings object_names = getObjectNamesAndSetWatch(current_zookeeper, object_type);
+        auto object_names = getObjectNamesAndSetWatch(current_zookeeper, object_type, /*include_signatures=*/true);
 
         function_names_and_asts.clear();
-        for (const auto & function_name : object_names)
+        for (const auto & [name, signature] : object_names)
         {
-            if (auto ast = tryLoadObject(current_zookeeper, UserDefinedSQLObjectType::Function, function_name))
-                function_names_and_asts.emplace_back(function_name, ast);
+            if (auto ast = tryLoadObject(current_zookeeper, UserDefinedSQLObjectType::Function, name, signature))
+                function_names_and_asts.emplace_back(name, ast);
         }
     });
 
@@ -478,17 +609,25 @@ void UserDefinedSQLObjectsZooKeeperStorage::refreshObjects(const zkutil::ZooKeep
 void UserDefinedSQLObjectsZooKeeperStorage::syncObjects(const zkutil::ZooKeeperPtr & zookeeper, UserDefinedSQLObjectType object_type)
 {
     LOG_DEBUG(log, "Syncing user-defined {} objects", object_type);
-    Strings object_names = getObjectNamesAndSetWatch(zookeeper, object_type);
+    auto objects = getObjectNamesAndSetWatch(zookeeper, object_type, /*include_signatures=*/true);
 
     auto lock = getLock();
+
+    Strings object_names;
+    object_names.reserve(objects.size());
+    for (const auto & [name, unused_sig] : objects)
+    {
+        (void)unused_sig;
+        object_names.push_back(name);
+    }
 
     /// Remove stale objects
     removeAllObjectsExcept(object_names);
     /// Read & parse only new SQL objects from ZooKeeper
-    for (const auto & function_name : object_names)
+    for (const auto & [function_name, signature] : objects)
     {
         if (!UserDefinedSQLFunctionFactory::instance().has(function_name))
-            refreshObject(zookeeper, UserDefinedSQLObjectType::Function, function_name);
+            refreshObject(zookeeper, UserDefinedSQLObjectType::Function, function_name, signature);
     }
 
     LOG_DEBUG(log, "User-defined {} objects synced", object_type);

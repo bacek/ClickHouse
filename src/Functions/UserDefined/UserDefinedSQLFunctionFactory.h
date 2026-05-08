@@ -23,7 +23,12 @@ public:
     bool registerFunction(const ContextMutablePtr & current_context, const String & function_name, ASTPtr create_function_query, bool throw_if_exists, bool replace_if_exists);
 
     /// Unregister function for function_name.
-    bool unregisterFunction(const ContextMutablePtr & current_context, const String & function_name, bool throw_if_not_exists);
+    /// Empty argument_type_names = drop all overloads; non-empty = drop specific overload by signature.
+    bool unregisterFunction(
+        const ContextMutablePtr & context,
+        const String & function_name,
+        const Strings & argument_type_names,
+        bool throw_if_not_exists);
 
     /// Get function create query for function_name. If no function registered with function_name throws exception.
     ASTPtr get(const String & function_name) const;

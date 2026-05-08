@@ -3,6 +3,7 @@
 #include <base/types.h>
 #include <Core/Types.h>
 
+#include <Core/Types.h>
 #include <Interpreters/Context_fwd.h>
 
 #include <Parsers/IAST_fwd.h>
@@ -68,10 +69,12 @@ public:
         const Settings & settings) = 0;
 
     /// Removes an object (must be called only by UserDefinedSQLFunctionFactory::unregisterFunction).
+    /// Empty argument_type_names = remove all overloads; non-empty = remove specific overload by signature.
     virtual bool removeObject(
         const ContextPtr & current_context,
         UserDefinedSQLObjectType object_type,
         const String & object_name,
+        const Strings & argument_type_names,
         bool throw_if_not_exists) = 0;
 };
 }

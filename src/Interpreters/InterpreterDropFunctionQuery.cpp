@@ -151,12 +151,17 @@ BlockIO InterpreterDropFunctionQuery::execute()
                 current_context,
                 UserDefinedSQLObjectType::Function,
                 drop_function_query.function_name,
+                drop_function_query.argument_type_names,
                 throw_if_not_exists);
             return {};
         }
     }
 
-    UserDefinedSQLFunctionFactory::instance().unregisterFunction(current_context, drop_function_query.function_name, throw_if_not_exists);
+    UserDefinedSQLFunctionFactory::instance().unregisterFunction(
+        current_context,
+        drop_function_query.function_name,
+        drop_function_query.argument_type_names,
+        throw_if_not_exists);
 
     return {};
 }

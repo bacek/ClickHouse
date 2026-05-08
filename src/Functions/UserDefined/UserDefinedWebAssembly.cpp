@@ -1383,6 +1383,18 @@ bool UserDefinedWebAssemblyFunctionFactory::has(const String & function_name) co
     return it != registry.end() && !it->second.empty();
 }
 
+bool UserDefinedWebAssemblyFunctionFactory::hasOverload(const String & function_name, const DataTypes & arg_types) const
+{
+    std::shared_lock lock(registry_mutex);
+    auto it = registry.find(function_name);
+    if (it == registry.end() || it->second.empty())
+        return false;
+    for (const auto & entry : it->second)
+        if (typesMatchOverload(arg_types, entry.original_arg_types))
+            return true;
+    return false;
+}
+
 std::shared_ptr<UserDefinedWebAssemblyFunction> UserDefinedWebAssemblyFunctionFactory::getFunction(const String & function_name) const
 {
     std::shared_lock lock(registry_mutex);
@@ -1477,8 +1489,46 @@ AggregateFunctionPtr UserDefinedWebAssemblyFunctionFactory::getAggregate(
 
 bool UserDefinedWebAssemblyFunctionFactory::dropIfExists(const String & function_name)
 {
+    // Backward compatibility: call the new method with empty argument types
+    return dropIfExists(function_name, {});
+}
+
+bool UserDefinedWebAssemblyFunctionFactory::dropIfExists(const String & function_name, const Strings & argument_type_names)
+{
     std::unique_lock lock(registry_mutex);
-    return registry.erase(function_name) > 0;
+    auto it = registry.find(function_name);
+    if (it == registry.end())
+        return false;
+
+    auto & entries = it->second;
+
+    if (argument_type_names.empty())
+    {
+        /// Drop all overloads
+        registry.erase(it);
+        return true;
+    }
+
+    /// Drop only the overload matching the signature
+    auto new_end = std::remove_if(entries.begin(), entries.end(),
+        [&argument_type_names](const RegistryEntry & entry)
+    {
+        if (entry.original_arg_types.size() != argument_type_names.size())
+            return false;
+        for (size_t i = 0; i < argument_type_names.size(); ++i)
+            if (entry.original_arg_types[i]->getName() != argument_type_names[i])
+                return false;
+        return true;
+    });
+
+    bool removed = (new_end != entries.end());
+    if (removed)
+    {
+        entries.erase(new_end, entries.end());
+        if (entries.empty())
+            registry.erase(it);
+    }
+    return removed;
 }
 
 VectorWithMemoryTracking<UserDefinedWebAssemblyFunctionFactory::RegisteredFunction> UserDefinedWebAssemblyFunctionFactory::getAllFunctions() const

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <Core/Types.h>
 #include <Functions/UserDefined/UserDefinedSQLObjectsStorageBase.h>
 #include <Interpreters/Context_fwd.h>
 #include <Parsers/IAST_fwd.h>
@@ -26,6 +27,12 @@ public:
     void reloadObjects() override;
     void reloadObject(UserDefinedSQLObjectType object_type, const String & object_name) override;
 
+    struct ObjectNameWithSignature
+    {
+        String name;
+        Strings signature;
+    };
+
 private:
     bool storeObjectImpl(
         const ContextPtr & current_context,
@@ -39,6 +46,7 @@ private:
         const ContextPtr & current_context,
         UserDefinedSQLObjectType object_type,
         const String & object_name,
+        const Strings & argument_type_names,
         bool throw_if_not_exists) override;
 
     void processWatchQueue();
@@ -53,7 +61,12 @@ private:
     void createRootNodes(const zkutil::ZooKeeperPtr & zookeeper);
 
     ASTPtr tryLoadObject(const zkutil::ZooKeeperPtr & zookeeper, UserDefinedSQLObjectType object_type, const String & object_name);
+    ASTPtr tryLoadObject(
+        const zkutil::ZooKeeperPtr & zookeeper, UserDefinedSQLObjectType object_type, const String & object_name, const Strings & signature);
+
     void refreshObject(const zkutil::ZooKeeperPtr & zookeeper, UserDefinedSQLObjectType object_type, const String & object_name);
+    void refreshObject(
+        const zkutil::ZooKeeperPtr & zookeeper, UserDefinedSQLObjectType object_type, const String & object_name, const Strings & signature);
 
     bool getObjectDataAndSetWatch(
         const zkutil::ZooKeeperPtr & zookeeper,
@@ -62,6 +75,8 @@ private:
         UserDefinedSQLObjectType object_type,
         const String & object_name);
     Strings getObjectNamesAndSetWatch(const zkutil::ZooKeeperPtr & zookeeper, UserDefinedSQLObjectType object_type);
+    std::vector<ObjectNameWithSignature> getObjectNamesAndSetWatch(
+        const zkutil::ZooKeeperPtr & zookeeper, UserDefinedSQLObjectType object_type, bool include_signatures);
     ASTPtr parseObjectData(const String & object_data, UserDefinedSQLObjectType object_type);
 
     void refreshAllObjects(const zkutil::ZooKeeperPtr & zookeeper);

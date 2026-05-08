@@ -299,7 +299,11 @@ public:
 
     size_t getLinearMemorySize() const override
     {
-        return const_cast<WasmTimeCompartment *>(this)->getMemory().data(
+        auto memory_result = const_cast<WasmTimeCompartment *>(this)->instance.get(
+            const_cast<wasmtime::Store &>(store), "memory");
+        if (!memory_result || !std::holds_alternative<wasmtime::Memory>(memory_result.value()))
+            return 0;
+        return std::get<wasmtime::Memory>(memory_result.value()).data(
             const_cast<wasmtime::Store &>(store)).size();
     }
 
@@ -527,6 +531,19 @@ public:
         });
 
         wasmtime::Linker linker(engine);
+
+#ifdef WASMTIME_FEATURE_WASI
+        /// Provide WASI preview1 stubs for modules linked with wasi-libc.
+        wasmtime::WasiConfig wasi_config;
+        auto set_wasi_result = store.context().set_wasi(std::move(wasi_config));
+        if (!set_wasi_result)
+            throw Exception(ErrorCodes::WASM_ERROR, "Failed to set WASI config: {}", set_wasi_result.err().message());
+        auto define_wasi_result = linker.define_wasi();
+        if (!define_wasi_result)
+            throw Exception(ErrorCodes::WASM_ERROR, "Failed to define WASI: {}", define_wasi_result.err().message());
+
+#endif
+
         for (const auto & host_function : host_functions)
         {
             const auto & func_decl = host_function.getFunctionDeclaration();
