@@ -24,7 +24,6 @@ namespace DB
 
 class IFunctionOverloadResolver;
 using FunctionOverloadResolverPtr = std::shared_ptr<IFunctionOverloadResolver>;
-using AggregateFunctionPtr = std::shared_ptr<IAggregateFunction>;
 
 enum class WasmAbiVersion : uint8_t
 {
@@ -56,8 +55,6 @@ public:
     virtual MutableColumnPtr executeOnBlock(WebAssembly::WasmCompartment * compartment, const Block & block, ContextPtr context, size_t num_rows, StopToken stop_token) const = 0;
 
     virtual ~UserDefinedWebAssemblyFunction() = default;
-
-    bool getIsDeterministic() const { return is_deterministic; }
 
     static std::unique_ptr<UserDefinedWebAssemblyFunction> create(
         std::shared_ptr<WebAssembly::WasmModule> wasm_module_,
