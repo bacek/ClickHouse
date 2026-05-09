@@ -30,6 +30,18 @@ namespace DB::Iceberg
 struct ProcessedManifestFileEntry;
 class ManifestFileIterator;
 
+struct SpatialBboxPruneInfo
+{
+    Int32 xmin_col_id = -1;
+    Int32 ymin_col_id = -1;
+    Int32 xmax_col_id = -1;
+    Int32 ymax_col_id = -1;
+    double query_xmin = 0;
+    double query_ymin = 0;
+    double query_xmax = 0;
+    double query_ymax = 0;
+};
+
 DB::ASTPtr getASTFromTransform(const String & transform_name_src, const String & column_name);
 
 /// Per-geometry-column spatial pruner built from covering.bbox column IDs.
