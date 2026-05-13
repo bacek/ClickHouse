@@ -75,6 +75,7 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
             {"use_top_k_dynamic_filtering_for_variable_length_types", true, false, "Disable `use_top_k_dynamic_filtering` for variable-length sort columns (e.g. `String`) by default; the previous behavior had the optimization apply unconditionally and is preserved under `compatibility`."},
             {"page_cache_max_coalesced_bytes", 16777216, 16777216, "New setting to bound the size of a single coalesced read used to populate the userspace page cache on cache miss."},
             {"input_format_column_name_matching_mode", "match_case", "auto", "Match input column names case-sensitively first and fall back to case-insensitive matching, instead of requiring an exact case match."},
+            {"input_format_parquet_spatial_filter_push_down", true, true, "New setting: skip GeoParquet row groups based on spatial predicates and bounding box statistics"},
         });
         addSettingsChanges(settings_changes_history, "26.4",
         {
@@ -402,7 +403,6 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
             {"input_format_parquet_memory_low_watermark", 2ul << 20, 2ul << 20, "New setting"},
             {"input_format_parquet_memory_high_watermark", 4ul << 30, 4ul << 30, "New setting"},
             {"input_format_parquet_page_filter_push_down", true, true, "New setting (no effect when input_format_parquet_use_native_reader_v3 is disabled)"},
-            {"input_format_parquet_spatial_filter_push_down", true, true, "New setting: skip GeoParquet row groups based on spatial predicates and bounding box statistics"},
             {"input_format_parquet_use_offset_index", true, true, "New setting (no effect when input_format_parquet_use_native_reader_v3 is disabled)"},
             {"output_format_parquet_enum_as_byte_array", false, true, "Enable writing Enum as byte array in Parquet by default"},
             {"json_type_escape_dots_in_keys", false, false, "Add new setting that allows to escape dots in JSON keys during JSON type parsing"},
