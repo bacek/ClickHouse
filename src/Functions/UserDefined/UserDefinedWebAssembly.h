@@ -43,7 +43,6 @@ public:
     Field getValue(const String & name) const;
     bool isFuelEnabled() const;
     WebAssembly::FuelMode getFuelMode() const;
-    bool isAggregate() const;
 
 private:
     UnorderedMapWithMemoryTracking<String, Field> settings;
@@ -72,6 +71,7 @@ public:
     const DataTypePtr & getResultType() const { return result_type; }
     std::shared_ptr<WebAssembly::WasmModule> getModule() const { return wasm_module; }
     const WebAssemblyFunctionSettings & getSettings() const { return settings; }
+    bool getIsDeterministic() const { return is_deterministic; }
 
 protected:
 

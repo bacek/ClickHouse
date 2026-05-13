@@ -799,7 +799,7 @@ public:
             /// Pairs with different WASM kinds (e.g. Float64 vs Int32) are rejected.
             auto actual_kind = wasmKindForDataType(stripped.get());
             auto expected_kind = wasmKindForDataType(expected_arguments[i].get());
-            if (actual_kind && expected_kind && *actual_kind == *expected_kind)
+            if (actual_kind && expected_kind && canCoerce(*actual_kind, *expected_kind))
                 continue;
 
             /// Allow a geo type (or its constant-folded bare structural form) to satisfy a
@@ -1404,7 +1404,7 @@ UserDefinedWebAssemblyFunctionFactory::prepareFunction(ASTPtr create_function_qu
         wasm_module,
         internal_function_name,
         function_def.argument_names,
-        wasm_arg_types,
+        function_def.argument_types,
         function_def.result_type,
         function_def.abi_version,
         function_def.settings,
@@ -1980,10 +1980,6 @@ struct WebAssemblyFunctionSettingsConstraits : public IHints<>
         /// Serialization format for input/output data for ABI what uses serialization
         {"serialization_format", SettingStringFromSet{{"MsgPack", "JSONEachRow", "CSV", "TSV", "TSVRaw", "RowBinary", "Buffers", "ColumnBinary"}}.withDefault("MsgPack")},
         {"webassembly_udf_enable_fuel", SettingBool{}.withDefault(true)},
-        /// When true, the function is registered as an aggregate function.
-        /// ClickHouse accumulates argument rows per group and calls the WASM function once at finalize
-        /// with Array-wrapped arguments (one Array per declared argument type).
-        {"is_aggregate", SettingBool{}.withDefault(false)},
         /// Whether bbox-disjoint pruning is safe for this function (see IFunctionBase::isSpatialPredicate).
         {"is_spatial_predicate", SettingBool{}.withDefault(false)},
         /// For distance predicates (e.g. st_dwithin): 0-based index of the constant distance
@@ -2046,11 +2042,6 @@ bool WebAssemblyFunctionSettings::isFuelEnabled() const
 WebAssembly::FuelMode WebAssemblyFunctionSettings::getFuelMode() const
 {
     return isFuelEnabled() ? WebAssembly::FuelMode::Enabled : WebAssembly::FuelMode::Disabled;
-}
-
-bool WebAssemblyFunctionSettings::isAggregate() const
-{
-    return getValue("is_aggregate").safeGet<bool>();
 }
 
 
