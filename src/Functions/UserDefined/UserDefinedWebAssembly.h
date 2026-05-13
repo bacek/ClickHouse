@@ -1,9 +1,6 @@
 #pragma once
 
 #include <Core/Block.h>
-#include <Core/ColumnsWithTypeAndName.h>
-
-#include <AggregateFunctions/IAggregateFunction.h>
 
 #include <DataTypes/IDataType.h>
 #include <Interpreters/Context_fwd.h>
@@ -34,7 +31,6 @@ class WebAssemblyFunctionSettings
 public:
     void trySet(const String & name, Field value);
     Field getValue(const String & name) const;
-    bool isAggregate() const;
 
 private:
     std::unordered_map<String, Field> settings;
@@ -46,8 +42,6 @@ public:
     virtual MutableColumnPtr executeOnBlock(WebAssembly::WasmCompartment * compartment, const Block & block, ContextPtr context, size_t num_rows, StopToken stop_token) const = 0;
 
     virtual ~UserDefinedWebAssemblyFunction() = default;
-
-    bool getIsDeterministic() const { return is_deterministic; }
 
     static std::unique_ptr<UserDefinedWebAssemblyFunction> create(
         std::shared_ptr<WebAssembly::WasmModule> wasm_module_,
@@ -65,6 +59,7 @@ public:
     const DataTypePtr & getResultType() const { return result_type; }
     std::shared_ptr<WebAssembly::WasmModule> getModule() const { return wasm_module; }
     const WebAssemblyFunctionSettings & getSettings() const { return settings; }
+    bool getIsDeterministic() const { return is_deterministic; }
 
 protected:
 

@@ -75,7 +75,6 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
             {"use_top_k_dynamic_filtering_for_variable_length_types", true, false, "Disable `use_top_k_dynamic_filtering` for variable-length sort columns (e.g. `String`) by default; the previous behavior had the optimization apply unconditionally and is preserved under `compatibility`."},
             {"page_cache_max_coalesced_bytes", 16777216, 16777216, "New setting to bound the size of a single coalesced read used to populate the userspace page cache on cache miss."},
             {"input_format_column_name_matching_mode", "match_case", "auto", "Match input column names case-sensitively first and fall back to case-insensitive matching, instead of requiring an exact case match."},
-            {"is_aggregate", false, false, "New setting to register a WebAssembly UDF as an aggregate function."},
             {"is_spatial_predicate", false, false, "New setting to mark a WebAssembly UDF as a spatial predicate for pruning."},
         });
         addSettingsChanges(settings_changes_history, "26.4",
@@ -1190,6 +1189,10 @@ const VersionToSettingsChangesMap & getMergeTreeSettingsChangesHistory()
     std::call_once(initialized_flag, [&]
     {
         addSettingsChanges(merge_tree_settings_changes_history, "26.5",
+        {
+
+        });
+        addSettingsChanges(merge_tree_settings_changes_history, "26.4",
         {
             {"share_nested_offsets", true, true, "When set to false, Array columns with dotted names that share a common prefix are treated as independent columns instead of sharing offset files as part of legacy Nested semantics"},
             {"shared_merge_tree_merge_coordinator_merges_prepare_count", 100, "auto", "Make setting auto: max merge tasks per replica * number of active replicas"},
