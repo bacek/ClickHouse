@@ -21,6 +21,8 @@
 #include <Columns/ColumnTuple.h>
 
 #include <AggregateFunctions/IAggregateFunction.h>
+#include <AggregateFunctions/AggregateFunctionFactory.h>
+#include <Common/CurrentThread.h>
 #include <IO/VarInt.h>
 
 #include <Functions/IFunction.h>
@@ -669,6 +671,33 @@ static WebAssembly::WasmModule::Config getWasmModuleConfig(ContextPtr context, W
     return cfg;
 }
 
+static bool computePreserveConstColumns(const ContextPtr & context, const std::shared_ptr<UserDefinedWebAssemblyFunction> & udf)
+{
+    const String fmt = udf->getSettings().getValue("serialization_format").safeGet<String>();
+    StringWithMemoryTracking dummy_buf;
+    WriteBufferFromStringWithMemoryTracking dummy_writer(dummy_buf);
+    Block sample_block;
+    size_t arg_idx = 0;
+    for (const auto & arg : udf->getArguments())
+        sample_block.insert(ColumnWithTypeAndName(arg->createColumn(), arg, "arg" + std::to_string(arg_idx++)));
+    auto format = context->getOutputFormat(fmt, dummy_writer, sample_block);
+    return !format->expectMaterializedColumns() || format->supportsColumnSchema();
+}
+
+static bool computeSupportsColumnSchema(const ContextPtr & context, const std::shared_ptr<UserDefinedWebAssemblyFunction> & udf)
+{
+    const String fmt = udf->getSettings().getValue("serialization_format").safeGet<String>();
+    StringWithMemoryTracking dummy_buf;
+    WriteBufferFromStringWithMemoryTracking dummy_writer(dummy_buf);
+    Block sample_block;
+    size_t arg_idx = 0;
+    for (const auto & arg : udf->getArguments())
+        sample_block.insert(ColumnWithTypeAndName(arg->createColumn(), arg, "arg" + std::to_string(arg_idx++)));
+    auto format = context->getOutputFormat(fmt, dummy_writer, sample_block);
+    return format->supportsColumnSchema();
+}
+
+
 class FunctionUserDefinedWasm final : public IFunction
 {
 public:
@@ -678,6 +707,8 @@ public:
         , function_name(std::move(function_name_))
         , argument_names(user_defined_function->getArgumentNames())
         , context(std::move(context_))
+        , preserve_const_columns(computePreserveConstColumns(context, user_defined_function))
+        , supports_column_schema(computeSupportsColumnSchema(context, user_defined_function))
         , interrupt_source()
         , compartment_pool(
               static_cast<UInt32>(context->getSettingsRef()[Setting::webassembly_udf_max_instances]),
@@ -905,16 +936,12 @@ private:
         size_t batch_start = 0;
         size_t batch_bytes = 0;
 
-        // Buffers format handles const columns natively; RowBinary/MsgPack need them materialized.
-        const bool buffers_format = user_defined_function->getSettings().getValue("serialization_format").safeGet<String>() == "Buffers";
-        const bool preserve_const = buffers_format;
-
         auto flush_batch = [&](size_t end_idx)
         {
             if (end_idx <= batch_start)
                 return;
             size_t batch_size = end_idx - batch_start;
-            auto block = getArgumentsBlock(arguments, batch_start, batch_size, preserve_const);
+            auto block = getArgumentsBlock(arguments, batch_start, batch_size, preserve_const_columns);
             auto stop_token = interrupt_source.get_token();
             auto col = user_defined_function->executeOnBlock(compartment, block, context, batch_size, stop_token);
 
@@ -968,8 +995,11 @@ private:
             /// Cast to the declared type so serialization uses the correct width.
             /// Without this, e.g. Int8 passed to an Int32 parameter would be serialized
             /// as 1 byte by RowBinary instead of 4, causing the WASM module to read garbage.
+            /// For formats that support column schema (e.g. ColumnBinary), skip the cast
+            /// to allow type narrowing — the format writes the actual type tag and the
+            /// WASM side casts up as needed.
             const DataTypePtr & declared_type = declared_arguments[i];
-            if (!arguments[i].type->equals(*declared_type))
+            if (!supports_column_schema && !arguments[i].type->equals(*declared_type))
                 column = castColumn(ColumnWithTypeAndName(column, arguments[i].type, column_name), declared_type);
             arguments_block.insert(ColumnWithTypeAndName(column, declared_type, column_name));
         }
@@ -981,6 +1011,8 @@ private:
     String function_name;
     Strings argument_names;
     ContextPtr context;
+    bool preserve_const_columns;
+    bool supports_column_schema;
 
     mutable StopSource interrupt_source;
     mutable WasmCompartmentPool compartment_pool;
@@ -1382,12 +1414,30 @@ void UserDefinedWebAssemblyFunctionFactory::addOrReplace(RegisteredFunction regi
             return;
         }
     }
+    const bool is_aggregate = registered_function.is_aggregate;
+    const String sql_name = registered_function.sql_name;
+    DataTypes accumulator_arg_types = registered_function.accumulator_arg_types;
     entries.push_back(RegistryEntry{
         std::move(registered_function.function),
         std::move(registered_function.original_arg_types),
         std::move(registered_function.create_query),
-        registered_function.is_aggregate,
+        is_aggregate,
         std::move(registered_function.accumulator_arg_types)});
+
+    if (is_aggregate && !AggregateFunctionFactory::instance().hasNameOrAlias(sql_name))
+    {
+        AggregateFunctionCreator wasm_aggregate_creator =
+            {[sql_name, accumulator_arg_types](const String &, const DataTypes &, const Array &, const Settings *) -> AggregateFunctionPtr
+             {
+                 ContextPtr ctx;
+                 if (CurrentThread::isInitialized())
+                     ctx = CurrentThread::get().tryGetQueryContext();
+                 return UserDefinedWebAssemblyFunctionFactory::instance().getAggregate(sql_name, accumulator_arg_types, ctx);
+             }};
+        AggregateFunctionFactory::instance().registerFunction(
+            sql_name,
+            AggregateFunctionWithProperties{wasm_aggregate_creator, FunctionDocumentation{}, AggregateFunctionProperties{}});
+    }
 }
 
 void UserDefinedWebAssemblyFunctionFactory::replaceAll(VectorWithMemoryTracking<RegisteredFunction> registered_functions)
