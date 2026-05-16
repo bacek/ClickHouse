@@ -68,7 +68,6 @@ public:
     virtual bool expectMaterializedColumns() const { return true; }
     virtual bool supportsColumnSchema() const { return false; }
     virtual bool supportsSpecialSerializationKinds() const { return false; }
-
     /// If the format can predict its total serialized size for a given block, it may implement this
     /// to allow the output WriteBuffer to preallocate the exact space needed, avoiding reallocation.
     /// Returns std::nullopt if precomputation is not supported or not beneficial for this chunk.
