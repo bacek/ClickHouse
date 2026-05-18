@@ -1011,13 +1011,11 @@ private:
             column = column->cut(start_idx, length);
             String column_name = i < argument_names.size() && !argument_names[i].empty() ? argument_names[i] : arguments[i].name;
             /// Cast to the declared type so serialization uses the correct width.
-            /// Without this, e.g. Int8 passed to an Int32 parameter would be serialized
-            /// as 1 byte by RowBinary instead of 4, causing the WASM module to read garbage.
-            /// For formats that support column schema (e.g. ColumnBinary), skip the cast
-            /// to allow type narrowing — the format writes the actual type tag and the
-            /// WASM side casts up as needed.
+            /// Without this, e.g. UInt8 passed to a UInt32 parameter would be serialized
+            /// as 1 byte instead of 4, causing the WASM module to read garbage.
+            /// ColumnBinary does not embed type tags, so the cast is required regardless of format.
             const DataTypePtr & declared_type = declared_arguments[i];
-            if (!supports_column_schema && !arguments[i].type->equals(*declared_type))
+            if (!arguments[i].type->equals(*declared_type))
                 column = castColumn(ColumnWithTypeAndName(column, arguments[i].type, column_name), declared_type);
             arguments_block.insert(ColumnWithTypeAndName(column, declared_type, column_name));
         }
