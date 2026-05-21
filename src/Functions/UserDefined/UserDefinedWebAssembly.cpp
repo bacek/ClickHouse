@@ -760,7 +760,10 @@ public:
     const DataTypes & getArgumentTypes() const { return user_defined_function->getArguments(); }
     bool isSpatialPredicate() const override
     {
-        return user_defined_function->getSettings().getValue("is_spatial_predicate").safeGet<UInt64>() != 0;
+        auto val = user_defined_function->getSettings().getValue("is_spatial_predicate");
+        if (val.getType() == Field::Types::Bool)
+            return static_cast<bool>(val);
+        return val.safeGet<UInt64>() != 0;
     }
     int getSpatialExpandArg() const override
     {
