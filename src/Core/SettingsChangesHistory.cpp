@@ -110,6 +110,10 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
             {"query_plan_max_limit_for_join_lazy_indexing", 1000, 1000, "Added new setting to control maximum limit value that allows to use query plan for lazy join indexing optimization. If zero, there is no limit"},
         });
 
+        addSettingsChanges(settings_changes_history, "26.6",
+        {
+            {"input_format_parquet_spatial_filter_push_down", false, true, "New setting: skip GeoParquet row groups based on spatial predicates and bounding box statistics"},
+        });
         addSettingsChanges(settings_changes_history, "26.5",
         {
             {"defer_partition_pruning_after_final", true, true, "Setting newly added in 26.5 to gate the FINAL partition-pruning behavior that shipped silently in 26.3 (https://github.com/ClickHouse/ClickHouse/pull/98242). The meaningful semantic change is registered under the 26.3 block so `compatibility = '26.2'` reverts it; this entry exists so the upgrade-from-26.4 check accepts the newly-introduced name."},
