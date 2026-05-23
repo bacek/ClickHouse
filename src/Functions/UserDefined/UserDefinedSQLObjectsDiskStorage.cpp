@@ -342,7 +342,7 @@ bool UserDefinedSQLObjectsDiskStorage::storeObjectImpl(
                 return false;
 
             /// replace_if_exists: strip the old statement before writing the replacement.
-            auto old_asts = parseAllCreateFunctionStatements(existing_content, global_context);
+            auto old_asts = parseAllCreateFunctionStatements(existing_content, getContext());
             std::vector<ASTPtr> remaining;
             IAST::FormatSettings fmt_settings(/*one_line=*/false);
             for (const auto & old_ast : old_asts)

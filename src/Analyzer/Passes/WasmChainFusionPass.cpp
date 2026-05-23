@@ -60,10 +60,10 @@ bool validateChainViaWasm(WasmModule & module, const Strings & fn_names)
     cfg.memory_limit = 64u * 1024u * 1024u;
     cfg.fuel_limit   = 1u << 24;
 
-    auto compartment = module.instantiate(cfg);
-
     StopSource stop_source;
     StopToken  stop_token = stop_source.get_token();
+
+    auto compartment = module.instantiate(cfg, stop_token);
 
     // Build names buffer: [cstr name_0][cstr name_1]...[cstr name_n-1]
     std::vector<uint8_t> names_bytes;
