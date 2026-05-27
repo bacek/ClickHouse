@@ -136,6 +136,7 @@ FormatSettings getFormatSettings(const ContextPtr & context, const Settings & se
     format_settings.csv.use_default_on_bad_values = settings[Setting::input_format_csv_use_default_on_bad_values];
     format_settings.csv.try_infer_numbers_from_strings = settings[Setting::input_format_csv_try_infer_numbers_from_strings];
     format_settings.csv.try_infer_strings_from_quoted_tuples = settings[Setting::input_format_csv_try_infer_strings_from_quoted_tuples];
+    format_settings.column_binary.disable_preallocation = settings[Setting::column_binary_disable_preallocation];
     format_settings.hive_text.fields_delimiter = settings[Setting::input_format_hive_text_fields_delimiter];
     format_settings.hive_text.collection_items_delimiter = settings[Setting::input_format_hive_text_collection_items_delimiter];
     format_settings.hive_text.map_keys_delimiter = settings[Setting::input_format_hive_text_map_keys_delimiter];
@@ -212,6 +213,7 @@ FormatSettings getFormatSettings(const ContextPtr & context, const Settings & se
     format_settings.parquet.filter_push_down = settings[Setting::input_format_parquet_filter_push_down];
     format_settings.parquet.bloom_filter_push_down = settings[Setting::input_format_parquet_bloom_filter_push_down];
     format_settings.parquet.page_filter_push_down = settings[Setting::input_format_parquet_page_filter_push_down];
+    format_settings.parquet.spatial_filter_push_down = settings[Setting::input_format_parquet_spatial_filter_push_down];
     format_settings.parquet.use_offset_index = settings[Setting::input_format_parquet_use_offset_index];
 
     format_settings.parquet.enable_json_parsing = settings[Setting::input_format_parquet_enable_json_parsing];
@@ -800,6 +802,15 @@ OutputFormatPtr FormatFactory::getDefaultJSONEachRowOutputFormat(WriteBuffer & b
 {
     const auto & output_getter = getCreators("JSONEachRow").output_creator;
     chassert(output_getter);
+    return output_getter(buf, sample, {}, {});
+}
+
+OutputFormatPtr FormatFactory::getOutputFormatWithDefaultSettings(
+    const String & name, WriteBuffer & buf, const Block & sample) const
+{
+    const auto & output_getter = getCreators(name).output_creator;
+    if (!output_getter)
+        throw Exception(ErrorCodes::FORMAT_IS_NOT_SUITABLE_FOR_OUTPUT, "Format {} is not suitable for output", name);
     return output_getter(buf, sample, {}, {});
 }
 
