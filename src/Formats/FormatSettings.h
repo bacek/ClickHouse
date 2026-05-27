@@ -625,6 +625,12 @@ struct FormatSettings
         bool validate_geometry = true;
     } geojson{};
 
+    // ColumnBinary format settings
+    struct
+    {
+        bool disable_preallocation = false;
+    } column_binary{};
+
 };
 
 }
