@@ -799,7 +799,7 @@ struct WebAssemblyFunctionSettingsConstraits : public IHints<>
 
     const UnorderedMapWithMemoryTracking<String, SettingDefinition> settings_def = {
         /// Serialization format for input/output data for ABI what uses serialization
-        {"serialization_format", SettingStringFromSet{{"MsgPack", "JSONEachRow", "CSV", "TSV", "TSVRaw", "RowBinary", "Buffers"}}.withDefault("MsgPack")},
+        {"serialization_format", SettingStringFromSet{{"MsgPack", "JSONEachRow", "CSV", "TSV", "TSVRaw", "RowBinary", "Buffers", "ColumnBinary"}}.withDefault("MsgPack")},
         {"webassembly_udf_enable_fuel", SettingBool{}.withDefault(true)},
     };
 
