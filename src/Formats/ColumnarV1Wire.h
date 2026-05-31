@@ -6,8 +6,8 @@
 /// COLUMNAR_V1 is a flat columnar encoding used by the ColumnBinary I/O format
 /// and the WASM UDF ABI. It is designed for low-overhead host↔guest transfer:
 /// fixed-width columns serialize as a single memcpy; variable-width columns
-/// (strings) pay only the unavoidable UInt64→UInt32 offset conversion plus one
-/// null-terminator byte per string. All functions are inline — safe to include
+/// (strings) pay only the unavoidable UInt64→UInt32 offset conversion.
+/// All functions are inline — safe to include
 /// from multiple TUs.
 ///
 /// ── Wire layout ─────────────────────────────────────────────────────────────
@@ -56,8 +56,8 @@
 /// String offset narrowing: ColumnString stores offsets as uint64; the wire
 /// format uses uint32. The conversion is explicit and checked implicitly by
 /// the 4 GiB column-data limit imposed by the uint32 descriptor fields.
-/// Strings also gain a null terminator on the wire (absent in the CH
-/// representation) so that WASM guests can use C-string APIs directly.
+/// COL_BYTES wire layout omits null terminators. ColumnString internally has
+/// no null terminators (see ColumnString.h); the wire matches exactly.
 
 #include <cstring>
 #include <span>
@@ -142,7 +142,7 @@ inline uint32_t complexDataSize(const IColumn & col, uint32_t n)
     if (typeid_cast<const ColumnString *>(&col))
     {
         const auto & str = assert_cast<const ColumnString &>(col);
-        uint32_t chars = static_cast<uint32_t>(str.getChars().size()) + n;
+        uint32_t chars = static_cast<uint32_t>(str.getChars().size());
         return (n + 1u) * 4u + chars;
     }
     // Fixed-width fallback (ColumnVector<T>, ColumnUInt8, etc.)
@@ -188,7 +188,6 @@ inline void writeComplexData(const IColumn & col, uint32_t n, uint8_t * dst)
             uint32_t len = end - ch_pos;
             std::memcpy(chars_dst + wire_pos, chars.data() + ch_pos, len);
             wire_pos += len;
-            chars_dst[wire_pos++] = '\0';
             wire_offs[i + 1u] = wire_pos;
             ch_pos = end;
         }
@@ -316,7 +315,7 @@ inline uint32_t buildColDescriptor(
         write_cursor += (num_rows + 1u) * sizeof(uint32_t);
 
         desc.data_offset = write_cursor;
-        uint32_t total_chars = static_cast<uint32_t>(str_col->getChars().size()) + num_rows;
+        uint32_t total_chars = static_cast<uint32_t>(str_col->getChars().size());
         desc.data_size = total_chars;
         write_cursor += total_chars;
         return write_cursor;
@@ -465,7 +464,6 @@ inline void writeColData(
             uint32_t str_len = str_end - ch_pos;
             std::memcpy(data_dst + wire_pos, chars.data() + ch_pos, str_len);
             wire_pos += str_len;
-            data_dst[wire_pos++] = '\0';
             wire_offsets[i + 1] = wire_pos;
             ch_pos = str_end;
         }
@@ -540,7 +538,6 @@ inline MutableColumnPtr readColumnFromDesc(
                 uint32_t wire_end   = wire_offs[i + 1u];
                 uint32_t wire_start = wire_offs[i];
                 uint32_t str_len    = wire_end - wire_start;
-                if (str_len > 0u) str_len--;
                 chars.resize(ch_pos + str_len);
                 std::memcpy(chars.data() + ch_pos, chars_src + wire_start, str_len);
                 ch_pos += str_len;
@@ -584,7 +581,6 @@ inline MutableColumnPtr readColumnFromDesc(
             uint32_t wire_end   = wire_offsets[i + 1];
             uint32_t wire_start = wire_offsets[i];
             uint32_t str_len    = wire_end - wire_start;
-            if (str_len > 0) str_len--;
             chars.resize(ch_pos + str_len);
             std::memcpy(chars.data() + ch_pos, data + wire_start, str_len);
             ch_pos += str_len;
