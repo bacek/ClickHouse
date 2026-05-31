@@ -2,8 +2,62 @@
 
 /// Wire format helpers for the COLUMNAR_V1 binary format.
 ///
-/// COLUMNAR_V1 is a flat, zero-copy columnar encoding used by the ColumnBinary
-/// I/O format. All functions are inline — safe to include from multiple TUs.
+/// ── Purpose ─────────────────────────────────────────────────────────────────
+/// COLUMNAR_V1 is a flat columnar encoding used by the ColumnBinary I/O format
+/// and the WASM UDF ABI. It is designed for low-overhead host↔guest transfer:
+/// fixed-width columns serialize as a single memcpy; variable-width columns
+/// (strings) pay only the unavoidable UInt64→UInt32 offset conversion.
+/// All functions are inline — safe to include
+/// from multiple TUs.
+///
+/// ── Wire layout ─────────────────────────────────────────────────────────────
+///
+///   [ 4 B num_rows | 4 B num_cols ]       ← COLUMNAR_HEADER_BYTES = 8
+///   [ ColDescriptor × num_cols    ]       ← COLUMNAR_DESC_BYTES = 20 each
+///   [ column data blobs ...       ]       ← at offsets given by descriptors
+///
+/// ColDescriptor holds five uint32 fields (absolute byte offsets into the
+/// buffer): type, null_offset, offsets_offset, data_offset, data_size.
+/// Offsets are 0 when the field is absent (e.g. null_offset=0 → not nullable).
+///
+/// ── Column types ─────────────────────────────────────────────────────────────
+///   COL_BYTES   (0) — variable-length byte strings (ColumnString)
+///   COL_FIXED8/16/32/64 (1-4) — fixed-width scalars, one memcpy per column
+///   COL_COMPLEX (5) — Array(T) or Tuple(T…), recursive layout
+///   COL_VARIANT (6) — Variant(…), discriminated union with per-row offsets
+///
+/// Modifier bits (OR'd onto the base type):
+///   COL_IS_NULLABLE (0x20) — null map at null_offset: u8[num_rows], 1=null 0=non-null
+///   COL_IS_CONST    (0x80) — column is constant; only 1 row of data stored
+///
+/// ── Key design decisions ────────────────────────────────────────────────────
+///
+/// Minimal serialization: fixed-width columns (int, float, UUID…) are stored
+/// as their raw PaddedPODArray bytes — one memcpy on both write and read.
+/// There is no per-row metadata for these types.
+///
+/// Const column compaction: ClickHouse represents repeated values as
+/// ColumnConst (a single stored value + a logical row count). COLUMNAR_V1
+/// preserves this: COL_IS_CONST sets data for 1 row; the reader replicates it
+/// to the full row count on decode. This avoids materializing, e.g., a million
+/// identical literals just to serialize them.
+///
+/// Null map convention: nullable columns carry a u8[num_rows] map where
+/// 1 means null and 0 means non-null — identical to ColumnNullable::getNullMapData().
+/// This allows the null map to be memcpy'd directly on both read and write.
+/// Zeroed memory reads as "all non-null" by default.
+///
+/// O(1) size precomputation: buildColDescriptor computes the exact byte size
+/// of each column in O(1) without scanning rows — ColumnString uses
+/// getChars().size() directly; fixed-width uses sizeOfValueIfFixed(). This
+/// allows ColumnBinaryOutputFormat to pre-allocate the output buffer in a
+/// single pass before writing, avoiding reallocation.
+///
+/// String offset narrowing: ColumnString stores offsets as uint64; the wire
+/// format uses uint32. The conversion is explicit and checked implicitly by
+/// the 4 GiB column-data limit imposed by the uint32 descriptor fields.
+/// COL_BYTES wire layout omits null terminators. ColumnString internally has
+/// no null terminators (see ColumnString.h); the wire matches exactly.
 
 #include <cstring>
 #include <span>
@@ -88,7 +142,7 @@ inline uint32_t complexDataSize(const IColumn & col, uint32_t n)
     if (typeid_cast<const ColumnString *>(&col))
     {
         const auto & str = assert_cast<const ColumnString &>(col);
-        uint32_t chars = static_cast<uint32_t>(str.getChars().size()) + n;
+        uint32_t chars = static_cast<uint32_t>(str.getChars().size());
         return (n + 1u) * 4u + chars;
     }
     // Fixed-width fallback (ColumnVector<T>, ColumnUInt8, etc.)
@@ -134,7 +188,6 @@ inline void writeComplexData(const IColumn & col, uint32_t n, uint8_t * dst)
             uint32_t len = end - ch_pos;
             std::memcpy(chars_dst + wire_pos, chars.data() + ch_pos, len);
             wire_pos += len;
-            chars_dst[wire_pos++] = '\0';
             wire_offs[i + 1u] = wire_pos;
             ch_pos = end;
         }
@@ -262,7 +315,7 @@ inline uint32_t buildColDescriptor(
         write_cursor += (num_rows + 1u) * sizeof(uint32_t);
 
         desc.data_offset = write_cursor;
-        uint32_t total_chars = static_cast<uint32_t>(str_col->getChars().size()) + num_rows;
+        uint32_t total_chars = static_cast<uint32_t>(str_col->getChars().size());
         desc.data_size = total_chars;
         write_cursor += total_chars;
         return write_cursor;
@@ -388,11 +441,9 @@ inline void writeColData(
 
     if (is_nullable && null_col && desc.null_offset)
     {
-        // Null sentinel is 0xFF (matches COL_VARIANT discriminator convention).
+        // Null map: 1=null, 0=non-null — identical to ColumnNullable::getNullMapData().
         const auto & nm = null_col->getNullMapData();
-        uint8_t * dst = buf.data() + desc.null_offset;
-        for (uint32_t i = 0; i < num_rows; ++i)
-            dst[i] = nm[i] ? 0xFFu : 0u;
+        std::memcpy(buf.data() + desc.null_offset, nm.data(), num_rows);
     }
 
     const ColumnString * str_col = typeid_cast<const ColumnString *>(col);
@@ -413,7 +464,6 @@ inline void writeColData(
             uint32_t str_len = str_end - ch_pos;
             std::memcpy(data_dst + wire_pos, chars.data() + ch_pos, str_len);
             wire_pos += str_len;
-            data_dst[wire_pos++] = '\0';
             wire_offsets[i + 1] = wire_pos;
             ch_pos = str_end;
         }
@@ -488,7 +538,6 @@ inline MutableColumnPtr readColumnFromDesc(
                 uint32_t wire_end   = wire_offs[i + 1u];
                 uint32_t wire_start = wire_offs[i];
                 uint32_t str_len    = wire_end - wire_start;
-                if (str_len > 0u) str_len--;
                 chars.resize(ch_pos + str_len);
                 std::memcpy(chars.data() + ch_pos, chars_src + wire_start, str_len);
                 ch_pos += str_len;
@@ -508,13 +557,9 @@ inline MutableColumnPtr readColumnFromDesc(
     {
         if (is_nullable_wire && desc.null_offset)
         {
-            const uint8_t * raw_nulls = buf.data() + desc.null_offset;
+            // Null map: 1=null, 0=non-null — identical to ColumnNullable layout; direct copy.
             auto null_col = ColumnUInt8::create(rows_to_dec);
-            auto & null_data = null_col->getData();
-            // Normalize: wire encodes null as any non-zero (typically 0xFF);
-            // ColumnNullable null map uses 1 for null, 0 for non-null.
-            for (uint32_t i = 0; i < rows_to_dec; ++i)
-                null_data[i] = raw_nulls[i] ? 1u : 0u;
+            std::memcpy(null_col->getData().data(), buf.data() + desc.null_offset, rows_to_dec);
             return ColumnNullable::create(std::move(inner), std::move(null_col));
         }
         return inner;
@@ -536,7 +581,6 @@ inline MutableColumnPtr readColumnFromDesc(
             uint32_t wire_end   = wire_offsets[i + 1];
             uint32_t wire_start = wire_offsets[i];
             uint32_t str_len    = wire_end - wire_start;
-            if (str_len > 0) str_len--;
             chars.resize(ch_pos + str_len);
             std::memcpy(chars.data() + ch_pos, data + wire_start, str_len);
             ch_pos += str_len;
