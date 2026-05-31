@@ -113,7 +113,8 @@ FunctionOverloadResolverPtr createWasmChainResolver(
     DataTypePtr result_type,
     std::vector<std::vector<Field>> fn_scalar_values,
     std::vector<DataTypes>          fn_scalar_types,
-    ContextPtr context);
+    ContextPtr context,
+    WebAssembly::FuelMode fuel_mode);
 
 class UserDefinedWebAssemblyFunctionFactory
 {

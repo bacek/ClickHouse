@@ -56,7 +56,7 @@ bool moduleSupportsChaining(const WasmModule & module)
 /// call clickhouse_can_chain_execute, and return true if the chain is valid.
 bool validateChainViaWasm(WasmModule & module, const Strings & fn_names)
 {
-    WasmModule::Config cfg;
+    WasmModule::Config cfg(WebAssembly::FuelMode::Enabled);
     cfg.memory_limit = 64u * 1024u * 1024u;
     cfg.fuel_limit   = 1u << 24;
 
@@ -119,6 +119,8 @@ struct ChainCandidate
     QueryTreeNodes                   source_args;       // arguments fed into chain SOURCE
     DataTypes                        source_arg_types;
     DataTypePtr                      result_type;       // return type of the SINK function
+    // Fuel mode is uniform across all functions in the chain (same module).
+    WebAssembly::FuelMode            fuel_mode = WebAssembly::FuelMode::Disabled;
     // Scalar constants per function, indexed same as fn_names.
     // SOURCE (index 0) and SINK (last index) have empty inner vectors.
     std::vector<std::vector<Field>>  fn_scalar_values;
@@ -232,6 +234,7 @@ std::optional<ChainCandidate> tryCollectChain(QueryTreeNodePtr & node)
     candidate.fn_scalar_types  = std::move(fn_scalar_types);
     candidate.fn_nodes         = std::move(fn_node_ptrs);
     candidate.wasm_module      = sink_wasm->getModule();
+    candidate.fuel_mode        = sink_wasm->getSettings().getFuelMode();
     // Use the base (non-nullable) result type so the chain function can rely on
     // useDefaultImplementationForNulls() for external null propagation.  The sink's
     // query-tree result type may be Nullable(T) if it is called with a nullable
@@ -327,7 +330,8 @@ public:
             std::move(candidate->result_type),
             std::move(candidate->fn_scalar_values),
             std::move(candidate->fn_scalar_types),
-            getContext());
+            getContext(),
+            candidate->fuel_mode);
 
         auto original_alias = node->getAlias();
 
