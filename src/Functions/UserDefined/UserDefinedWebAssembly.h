@@ -1,6 +1,7 @@
 #pragma once
 
 #include <Core/Block.h>
+#include <Core/Field.h>
 
 #include <DataTypes/IDataType.h>
 #include <Interpreters/Context_fwd.h>
@@ -10,6 +11,7 @@
 
 #include <Common/SharedMutex.h>
 #include <Common/StopToken.h>
+#include <AggregateFunctions/IAggregateFunction_fwd.h>
 #include <Common/UnorderedMapWithMemoryTracking.h>
 #include <Common/UnorderedSetWithMemoryTracking.h>
 #include <Common/VectorWithMemoryTracking.h>
@@ -25,6 +27,7 @@ enum class WasmAbiVersion : uint8_t
     RowDirect,
     BufferedV1,
     AssemblyScript,
+    ColumnarV1,
 };
 
 String toString(WasmAbiVersion abi_type);
@@ -37,6 +40,7 @@ public:
     Field getValue(const String & name) const;
     bool isFuelEnabled() const;
     WebAssembly::FuelMode getFuelMode() const;
+    bool isAggregate() const;
 
 private:
     UnorderedMapWithMemoryTracking<String, Field> settings;
@@ -91,6 +95,27 @@ protected:
 
 class WasmModuleManager;
 
+/// Build a FunctionOverloadResolver that executes a WASM function chain in a
+/// single WASM call via clickhouse_chain_execute.
+///
+/// fn_names: function names in SOURCE → SINK order.
+/// source_arg_types: declared argument types of the SOURCE function.
+/// result_type: return type of the SINK function.
+/// wasm_module: the shared WasmModule (all functions must be from the same module).
+/// fn_scalar_values / fn_scalar_types: per-function scalar constants (indexed same as
+///   fn_names); SOURCE and SINK have empty inner vectors. XFORMs may carry compile-time
+///   constant args (e.g. the radius in st_buffer) that are appended to row_buf as
+///   COL_IS_CONST columns so the WASM side can read them without extra protocol fields.
+FunctionOverloadResolverPtr createWasmChainResolver(
+    Strings fn_names,
+    std::shared_ptr<WebAssembly::WasmModule> wasm_module,
+    DataTypes source_arg_types,
+    DataTypePtr result_type,
+    std::vector<std::vector<Field>> fn_scalar_values,
+    std::vector<DataTypes>          fn_scalar_types,
+    ContextPtr context,
+    WebAssembly::FuelMode fuel_mode);
+
 class UserDefinedWebAssemblyFunctionFactory
 {
 public:
@@ -99,6 +124,7 @@ public:
         String sql_name;
         std::shared_ptr<UserDefinedWebAssemblyFunction> function;
         ASTPtr create_query;
+        bool is_aggregate = false;
     };
 
     std::shared_ptr<UserDefinedWebAssemblyFunction> addOrReplace(ASTPtr create_function_query, WasmModuleManager & module_manager);
@@ -108,22 +134,48 @@ public:
     /// Returns nullptr if the function is not registered. Useful for non-throwing rewrite-candidate checks.
     FunctionOverloadResolverPtr tryGet(const String & function_name, ContextPtr context);
 
-    /// Returns true if function was removed
+    /// Returns the underlying WASM function object, or nullptr if not found.
+    /// Used by WasmChainFusionPass to inspect module identity and signatures.
+    std::shared_ptr<UserDefinedWebAssemblyFunction> getFunction(const String & function_name) const;
+
+    /// Returns true if the function is an aggregate function (is_aggregate=1).
+    bool isAggregate(const String & function_name) const;
+
+    /// Returns an AggregateFunctionPtr for use in the query analyzer.
+    /// arg_types must match the declared (non-Array) argument types.
+    AggregateFunctionPtr getAggregate(const String & function_name, const DataTypes & arg_types, ContextPtr context) const;
+
+    /// Returns true if function was removed.
+    /// Empty argument_type_names = drop all overloads; non-empty = drop specific overload by signature.
+    bool dropIfExists(const String & function_name, const Strings & argument_type_names);
+
+    /// Backward compatibility for scripts that call dropIfExists without argument_type_names.
     bool dropIfExists(const String & function_name);
+
+    /// Returns true if an overload with the exact argument-type signature exists.
+    bool hasOverload(const String & function_name, const DataTypes & arg_types) const;
 
     /// Returns all registered WASM functions with their metadata for introspection (e.g. system.functions).
     VectorWithMemoryTracking<RegisteredFunction> getAllFunctions() const;
+
 
     static UserDefinedWebAssemblyFunctionFactory & instance();
 private:
     struct RegistryEntry
     {
         std::shared_ptr<UserDefinedWebAssemblyFunction> function;
+        DataTypes original_arg_types;     /// declared types as written in CREATE FUNCTION
         ASTPtr create_query;
+        bool is_aggregate = false;
+        /// For is_aggregate=1 entries: element types used by the accumulator.
+        /// When declared type is already Array(T), this holds T (not Array(T)).
+        /// When declared type is scalar T, this equals original_arg_types.
+        /// Empty for non-aggregate entries.
+        DataTypes accumulator_arg_types;
     };
 
     mutable DB::SharedMutex registry_mutex;
-    UnorderedMapWithMemoryTracking<String, RegistryEntry> registry;
+    UnorderedMapWithMemoryTracking<String, std::vector<RegistryEntry>> registry;
 };
 
 }
