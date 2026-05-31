@@ -130,8 +130,6 @@ bool canDumpIcebergStats(const Field & field, DataTypePtr type)
         case TypeIndex::Int64:
         case TypeIndex::DateTime64:
         case TypeIndex::String:
-        case TypeIndex::Float32:
-        case TypeIndex::Float64:
             return true;
         default:
             return false;
@@ -171,7 +169,7 @@ std::vector<uint8_t> dumpFieldToBytes(const Field & field, DataTypePtr type)
         case TypeIndex::Float64:
             return dumpValue(field.safeGet<Float64>());
         case TypeIndex::Float32:
-            return dumpValue(static_cast<Float32>(field.safeGet<Float64>()));
+            return dumpValue(field.safeGet<Float32>());
         default:
         {
             throw Exception(ErrorCodes::LOGICAL_ERROR, "Can not dump such stats");
@@ -179,20 +177,21 @@ std::vector<uint8_t> dumpFieldToBytes(const Field & field, DataTypePtr type)
     }
 }
 
-/// Filter statistics to only writable (supported type) entries.
-/// Unsupported types (e.g. Tuple, Array) are silently skipped.
-std::vector<std::pair<size_t, Field>> filterWritableStatistics(
-    std::vector<std::pair<size_t, Field>> statistics,
+bool canWriteStatistics(
+    const std::vector<std::pair<size_t, Field>> & statistics,
     const std::unordered_map<size_t, size_t> & field_id_to_column_index,
     SharedHeader sample_block)
 {
-    auto it = std::remove_if(statistics.begin(), statistics.end(), [&](const auto & p)
+    if (statistics.empty())
+        return false;
+
+    for (const auto & [field_id, stat] : statistics)
     {
-        auto type = sample_block->getDataTypes()[field_id_to_column_index.at(p.first)];
-        return !canDumpIcebergStats(p.second, type);
-    });
-    statistics.erase(it, statistics.end());
-    return statistics;
+        auto type = sample_block->getDataTypes()[field_id_to_column_index.at(field_id)];
+        if (!canDumpIcebergStats(stat, type))
+            return false;
+    }
+    return true;
 }
 
 }
@@ -375,13 +374,11 @@ void generateManifestFile(
             auto dump_fields = [&](size_t field_id, Field value)
             { return dumpFieldToBytes(value, sample_block->getDataTypes()[field_id_to_column_index.at(field_id)]); };
 
-            auto lower_statistics = filterWritableStatistics(
-                data_file_statistics->getLowerBounds(), field_id_to_column_index, sample_block);
-            if (!lower_statistics.empty())
+            auto lower_statistics = data_file_statistics->getLowerBounds();
+            if (canWriteStatistics(lower_statistics, field_id_to_column_index, sample_block))
                 set_fields(lower_statistics, Iceberg::f_lower_bounds, dump_fields);
-            auto upper_statistics = filterWritableStatistics(
-                data_file_statistics->getUpperBounds(), field_id_to_column_index, sample_block);
-            if (!upper_statistics.empty())
+            auto upper_statistics = data_file_statistics->getUpperBounds();
+            if (canWriteStatistics(upper_statistics, field_id_to_column_index, sample_block))
                 set_fields(upper_statistics, Iceberg::f_upper_bounds, dump_fields);
         }
         data_file.field(Iceberg::f_record_count) = avro::GenericDatum(static_cast<Int64>(data_file_row_counts[file_idx]));
