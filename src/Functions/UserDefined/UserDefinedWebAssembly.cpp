@@ -467,7 +467,7 @@ public:
 
         // ── Build the columnar input buffer ──────────────────────────────────
         const uint32_t num_cols = static_cast<uint32_t>(cols.size());
-        uint32_t cursor = COLUMNAR_HEADER_BYTES + num_cols * COLUMNAR_DESC_BYTES;
+        uint64_t cursor = COLUMNAR_HEADER_BYTES + num_cols * COLUMNAR_DESC_BYTES;
 
         std::vector<ColDescriptor> descs(num_cols);
         std::vector<const IColumn *> inner_cols(num_cols);
@@ -497,7 +497,7 @@ public:
             cursor = buildColDescriptor(col, is_const, is_nullable, nrows, cursor, descs[ci]);
         }
 
-        uint32_t total_buf_size = cursor;
+        uint64_t total_buf_size = cursor;
 
         // ── Allocate buffer in WASM memory ───────────────────────────────────
         {
@@ -1770,7 +1770,7 @@ public:
             }
 
         const uint32_t num_cols = num_src_cols + total_scalar_cols;
-        uint32_t col_cursor = COLUMNAR_HEADER_BYTES + num_cols * COLUMNAR_DESC_BYTES;
+        uint64_t col_cursor = COLUMNAR_HEADER_BYTES + num_cols * COLUMNAR_DESC_BYTES;
 
         std::vector<ColDescriptor> descs(num_cols);
         std::vector<const IColumn *> inner_cols(num_cols);
