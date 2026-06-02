@@ -14,6 +14,11 @@
 namespace DB
 {
 
+// TODO(ColumnBinary settings): add a FormatSettings knob for diagnostics/benchmarking:
+//   column_binary_disable_preallocation  — return std::nullopt here to fall through to
+//     CH's normal heap-allocation path (eliminates the conservative-size scan entirely;
+//     useful to measure the overhead of the two-phase layout vs. a plain WriteBuffer).
+
 std::optional<uint64_t> ColumnBinaryOutputFormat::precomputeSerializedSize(const Block & block, size_t rows) const
 {
     if (disable_preallocation_)
