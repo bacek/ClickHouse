@@ -376,7 +376,6 @@ Supported column types:
 Type values can be combined with flags:
 
 - `COL_IS_CONST` (0x80) — column is constant (all rows have the same value)
-- `COL_IS_REPEAT` (0x40) — column is periodic with period R stored in `offsets_offset`; row `i` maps to stored row `i % R`
 
 Example usage:
 
