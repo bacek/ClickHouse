@@ -943,7 +943,7 @@ private:
             else if (arg.type->isValueUnambiguouslyRepresentedInFixedSizeContiguousMemoryRegion())
                 total += arg.type->getSizeOfValueInMemory() * row_count;
             else
-                total += 256 * row_count; // conservative fallback
+                total += col->byteSize(); // actual allocation size for nested types (Array, etc.)
         }
         return total;
     }
