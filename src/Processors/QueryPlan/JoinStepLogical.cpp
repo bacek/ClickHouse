@@ -2,8 +2,15 @@
 #include <DataTypes/IDataType.h>
 #include <Processors/QueryPlan/JoinStepLogical.h>
 #include <Processors/QueryPlan/QueryPlanFormat.h>
+#include <Processors/QueryPlan/QueryPlanStepRegistry.h>
 
 #include <base/scope_guard.h>
+
+namespace DB
+{
+class QueryPlanStepRegistry;
+void registerJoinStep(QueryPlanStepRegistry & registry);
+}
 
 #include <Common/JSONBuilder.h>
 #include <Common/safe_cast.h>
@@ -1191,9 +1198,12 @@ static QueryPlanNode buildPhysicalJoinImpl(
 
                 if (is_spatial_predicate_join)
                 {
-                    /// Add an empty-key clause; the predicate stays in join_expression
-                    /// and will be moved to residual_filter + mixed_join_expression below.
-                    table_join_clauses.emplace_back();
+                    table_join_clauses.emplace_back(); /// empty-key clause for SpatialRTreeJoin
+                    JoinActionRef spatial_pred = join_expression[0];
+                    join_expression.clear();
+                    auto spatial_dag = JoinExpressionActions::getSubDAG(std::views::single(spatial_pred));
+                    table_join->getMixedJoinExpression() = std::make_shared<ExpressionActions>(
+                        std::move(spatial_dag), optimization_settings.actions_settings);
                 }
                 else
                 {

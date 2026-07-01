@@ -215,9 +215,7 @@ bool SpatialRTreeJoin::identifyGeomColumns(
         out_left_col  = in0->result_name;
     }
     else
-    {
         return false;
-    }
 
     /// Extract the constant distance value from the designated argument index.
     /// If it is not a compile-time constant we fall back to hash join (returning false)
@@ -229,9 +227,7 @@ bool SpatialRTreeJoin::identifyGeomColumns(
         if (idx >= fn->children.size())
             return false;
         const auto * dist_node = fn->children[idx];
-        if (dist_node->type != ActionsDAG::ActionType::COLUMN
-            || !dist_node->column
-            || dist_node->column->size() == 0)
+        if (dist_node->type != ActionsDAG::ActionType::COLUMN || !dist_node->column)
             return false;
         try
         {
