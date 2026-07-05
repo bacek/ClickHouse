@@ -1,6 +1,7 @@
 #include <Processors/Formats/Impl/ColumnBinaryInputFormat.h>
 
 #include <algorithm>
+#include <limits>
 #include <vector>
 
 #include <Core/Block.h>
@@ -20,9 +21,10 @@ ColumnBinaryInputFormat::ColumnBinaryInputFormat(
     ReadBuffer & buf,
     const Block & header,
     const RowInputFormatParams & /*params*/,
-    const FormatSettings & /*settings*/)
+    const FormatSettings & settings)
     : IInputFormat(std::make_shared<const Block>(header), &buf)
     , header_(std::make_shared<const Block>(header))
+    , format_settings_(settings)
 {
 }
 
@@ -48,6 +50,18 @@ Chunk ColumnBinaryInputFormat::read()
     std::memcpy(&num_rows, hdr_buf, 4);
     std::memcpy(&num_cols, hdr_buf + 4, 4);
 
+    // num_cols comes straight from the (network-facing) frame and is otherwise
+    // untrusted; reject it before sizing any buffer off of it. ColumnBinary is
+    // schema-driven, so anything other than an exact match is invalid: fewer
+    // columns silently drops trailing schema columns from the Chunk (turning a
+    // malformed frame into a structural mismatch further downstream instead of
+    // a clear parse error here), and more columns is the same untrusted-size
+    // problem this check exists to prevent in the first place.
+    if (num_cols != header_->columns())
+        throw Exception(ErrorCodes::INCORRECT_DATA,
+            "ColumnBinary: frame declares {} columns, expected {}",
+            num_cols, header_->columns());
+
     // Read header + descriptor table into a single buffer.
     const size_t desc_total = static_cast<size_t>(num_cols) * ColumnarV1::COLUMNAR_DESC_BYTES;
     const size_t hdr_desc_size = ColumnarV1::COLUMNAR_HEADER_BYTES + desc_total;
@@ -59,7 +73,11 @@ Chunk ColumnBinaryInputFormat::read()
         in->readStrict(reinterpret_cast<char *>(frame.data() + ColumnarV1::COLUMNAR_HEADER_BYTES), desc_total);
 
     // Compute the furthest byte referenced by any descriptor to get the total frame size.
-    // Descriptors use absolute byte offsets from the start of the frame buffer.
+    // Descriptors use absolute byte offsets from the start of the frame buffer and are
+    // otherwise untrusted (network-facing): a hostile frame could set data_offset/data_size
+    // to overflow the addition, or to a huge-but-non-overflowing value (e.g. 1 << 40) to
+    // make the frame.resize() below try to reserve an absurd amount of host memory before
+    // any of the actual column data has even been validated. Reject both.
     uint64_t data_end = static_cast<uint64_t>(hdr_desc_size);
     for (uint32_t i = 0; i < num_cols; ++i)
     {
@@ -67,12 +85,21 @@ Chunk ColumnBinaryInputFormat::read()
         std::memcpy(&desc,
                     frame.data() + ColumnarV1::COLUMNAR_HEADER_BYTES + i * ColumnarV1::COLUMNAR_DESC_BYTES,
                     sizeof(desc));
+        if (desc.data_offset > std::numeric_limits<uint64_t>::max() - desc.data_size)
+            throw Exception(ErrorCodes::INCORRECT_DATA,
+                "ColumnBinary: descriptor data_offset + data_size overflows: offset={}, size={}",
+                desc.data_offset, desc.data_size);
         data_end = std::max(data_end, desc.data_offset + desc.data_size);
     }
 
     if (data_end < static_cast<uint64_t>(hdr_desc_size))
         throw Exception(ErrorCodes::INCORRECT_DATA,
             "ColumnBinary: descriptor references data before descriptor table end");
+
+    if (data_end - static_cast<uint64_t>(hdr_desc_size) > format_settings_.column_binary.max_frame_size)
+        throw Exception(ErrorCodes::INCORRECT_DATA,
+            "ColumnBinary: frame data size {} exceeds column_binary_max_frame_size limit {}",
+            data_end - hdr_desc_size, format_settings_.column_binary.max_frame_size);
 
     // Read the column data section exactly.
     if (data_end > static_cast<uint64_t>(hdr_desc_size))
@@ -84,10 +111,9 @@ Chunk ColumnBinaryInputFormat::read()
 
     // Decode columns from the complete in-memory frame.
     const std::span<const uint8_t> buf{frame};
-    const uint32_t cols_to_read = std::min(num_cols, static_cast<uint32_t>(header_->columns()));
     MutableColumns result;
-    result.reserve(cols_to_read);
-    for (uint32_t i = 0; i < cols_to_read; ++i)
+    result.reserve(num_cols);
+    for (uint32_t i = 0; i < num_cols; ++i)
     {
         ColumnarV1::ColDescriptor desc{};
         std::memcpy(&desc,

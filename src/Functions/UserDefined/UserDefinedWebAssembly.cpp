@@ -15,9 +15,7 @@
 
 #include <DataTypes/DataTypesNumber.h>
 #include <DataTypes/DataTypeTuple.h>
-#include <DataTypes/DataTypeArray.h>
 #include <DataTypes/DataTypeString.h>
-#include <DataTypes/DataTypeVariant.h>
 #include <Columns/ColumnTuple.h>
 
 #include <AggregateFunctions/IAggregateFunction.h>
@@ -465,6 +463,9 @@ public:
         if (input_rows_count == 0)
             return result_type->createColumn();
 
+        if (input_rows_count >= std::numeric_limits<uint32_t>::max())
+            throw Exception(ErrorCodes::TOO_LARGE_STRING_SIZE, "Too large number of rows: {}", input_rows_count);
+
         // ── Build the columnar input buffer ──────────────────────────────────
         const uint32_t num_cols = static_cast<uint32_t>(cols.size());
         uint64_t cursor = COLUMNAR_HEADER_BYTES + num_cols * COLUMNAR_DESC_BYTES;
@@ -720,20 +721,6 @@ static bool computePreserveConstColumns(const ContextPtr & context, const std::s
     return !format->expectMaterializedColumns() || format->supportsColumnSchema();
 }
 
-static bool computeSupportsColumnSchema(const ContextPtr & context, const std::shared_ptr<UserDefinedWebAssemblyFunction> & udf)
-{
-    const String fmt = udf->getSettings().getValue("serialization_format").safeGet<String>();
-    StringWithMemoryTracking dummy_buf;
-    WriteBufferFromStringWithMemoryTracking dummy_writer(dummy_buf);
-    Block sample_block;
-    size_t arg_idx = 0;
-    for (const auto & arg : udf->getArguments())
-        sample_block.insert(ColumnWithTypeAndName(arg->createColumn(), arg, "arg" + std::to_string(arg_idx++)));
-    auto format = context->getOutputFormat(fmt, dummy_writer, sample_block);
-    return format->supportsColumnSchema();
-}
-
-
 class FunctionUserDefinedWasm final : public IFunction
 {
 public:
@@ -744,7 +731,6 @@ public:
         , argument_names(user_defined_function->getArgumentNames())
         , context(std::move(context_))
         , preserve_const_columns(computePreserveConstColumns(context, user_defined_function))
-        , supports_column_schema(computeSupportsColumnSchema(context, user_defined_function))
         , interrupt_source()
         , compartment_pool(
               static_cast<UInt32>(context->getSettingsRef()[Setting::webassembly_udf_max_instances]),
@@ -797,9 +783,7 @@ public:
             if (stripped->equals(*expected_arguments[i]))
                 continue;
 
-            /// Allow implicit coercion between types that map to the same WASM kind
-            /// (e.g. Int8/UInt8/Int16/UInt16/Int32 all map to i32, so they are interchangeable).
-            /// Pairs with different WASM kinds (e.g. Float64 vs Int32) are rejected.
+            /// Allow implicit coercions: same kind, i32→i64, any int→any float, f32→f64.
             auto actual_kind = wasmKindForDataType(stripped.get());
             auto expected_kind = wasmKindForDataType(expected_arguments[i].get());
             if (actual_kind && expected_kind && canCoerce(*actual_kind, *expected_kind))
@@ -837,13 +821,6 @@ public:
     ColumnNumbers getArgumentsThatAreAlwaysConstant() const override { return {}; }
 
     bool isSuitableForConstantFolding() const override { return user_defined_function->getIsDeterministic(); }
-
-    /// convertLowCardinalityColumnsToFull() inside the default implementation calls
-    /// recursiveRemoveLowCardinality() which creates new DataTypeArray objects without
-    /// preserving custom type names (e.g. "Polygon" → bare Array(Array(Tuple))). This
-    /// breaks our Geometry coercion in executeImpl.  Returning false here bypasses that
-    /// stripping, exactly as wkb() does (see wkb.cpp for the same rationale).
-    bool useDefaultImplementationForLowCardinalityColumns() const override { return false; }
 
     /// Don't let the framework wrap the result in Nullable when inputs are nullable —
     /// Array/Tuple return types cannot be inside Nullable.  WASM UDFs handle null
@@ -894,12 +871,27 @@ public:
         // COLUMNAR_V1: bypass RowBinary batching, pass columns directly (ColumnConst stays const).
         try
         {
+            // COLUMNAR_V1: bypass RowBinary batching, pass columns directly (ColumnConst stays const).
             if (const auto * cv1 = dynamic_cast<const UserDefinedWebAssemblyFunctionColumnarV1 *>(user_defined_function.get()))
             {
                 auto stop_token = interrupt_source.get_token();
-                return cv1->executeColumnar(compartment_ptr, coerced, input_rows_count, context, stop_token);
+                auto result = cv1->executeColumnar(compartment_ptr, arguments, input_rows_count, context, stop_token);
+                auto expected_col = user_defined_function->getResultType()->createColumn();
+                // A guest that set COL_IS_CONST legitimately returns a ColumnConst; structureEquals
+                // only holds between two ColumnConst instances, so compare the unwrapped nested
+                // column against expected_col instead of rejecting every valid const result.
+                const IColumn * result_for_check = result.get();
+                if (const auto * result_const = typeid_cast<const ColumnConst *>(result_for_check))
+                    result_for_check = &result_const->getDataColumn();
+                if (!result_for_check->structureEquals(*expected_col))
+                    throw Exception(ErrorCodes::WASM_ERROR,
+                        "COLUMNAR_V1: returned column structure {} does not match declared type {}",
+                        result->dumpStructure(),
+                        user_defined_function->getResultType()->getName());
+                return result;
             }
-            return execute(compartment_ptr, coerced, input_rows_count);
+
+            return execute(compartment_ptr, arguments, input_rows_count);
         }
         catch (...)
         {
@@ -930,23 +922,63 @@ public:
 private:
     /// Estimate total serialized byte size of argument columns for an entire block.
     /// Used for dynamic block splitting when webassembly_udf_max_input_block_size = 0.
-    /// ColumnConst columns are excluded: they are serialized once per batch (COL_IS_CONST),
-    /// so they contribute a fixed overhead regardless of batch size and must not drive splits.
+    /// preserve_const must match the same decision getArgumentsBlock/flush_batch will use:
+    /// only skip a ColumnConst's contribution when it actually stays const on the wire
+    /// (COL_IS_CONST / the Buffers format); for formats that materialize const columns
+    /// (MsgPack, RowBinary, CSV, ...) a large constant broadcast batch_size times must
+    /// count towards the estimate, or the splitter can miss a needed split.
     /// Runs in O(1) — reads column metadata, no per-row scanning.
-    size_t estimateTotalSerializedSize(const ColumnsWithTypeAndName & arguments, size_t row_count) const
+    size_t estimateTotalSerializedSize(const ColumnsWithTypeAndName & arguments, size_t row_count, bool preserve_const) const
     {
         size_t total = 0;
         for (const auto & arg : arguments)
         {
             const IColumn * col = arg.column.get();
-            if (typeid_cast<const ColumnConst *>(col))
-                continue; // fixed per-batch cost, not per-row
+            bool materialized_const = false;
+            if (const auto * const_col = typeid_cast<const ColumnConst *>(col))
+            {
+                if (preserve_const)
+                    continue; // fixed per-batch cost, not per-row
+                col = &const_col->getDataColumn();
+                materialized_const = true;
+            }
             if (const auto * s = typeid_cast<const ColumnString *>(col))
-                total += s->getChars().size(); // raw bytes including null terminators
+            {
+                size_t bytes = s->getChars().size(); // raw bytes including null terminators
+                total += materialized_const ? bytes * row_count : bytes;
+            }
             else if (arg.type->isValueUnambiguouslyRepresentedInFixedSizeContiguousMemoryRegion())
                 total += arg.type->getSizeOfValueInMemory() * row_count;
             else
-                total += col->byteSize(); // actual allocation size for nested types (Array, etc.)
+                total += 256 * row_count; // conservative fallback
+        }
+        return total;
+    }
+
+    /// Estimate the serialized byte size of a single row across all argument columns.
+    /// Used for the cumulative flush pass below: a fixed stride derived from the average
+    /// row size can still put an oversized row in the same batch as its neighbors and
+    /// blow the input budget on a skewed block (e.g. one huge string among many tiny ones).
+    size_t estimateRowSerializedSize(const ColumnsWithTypeAndName & arguments, size_t row, bool preserve_const) const
+    {
+        size_t total = 0;
+        for (const auto & arg : arguments)
+        {
+            const IColumn * col = arg.column.get();
+            size_t row_index = row;
+            if (typeid_cast<const ColumnConst *>(col))
+            {
+                if (preserve_const)
+                    continue; // fixed per-batch cost, not per-row
+                col = &typeid_cast<const ColumnConst &>(*col).getDataColumn();
+                row_index = 0; // materialized const columns only ever have row 0
+            }
+            if (const auto * s = typeid_cast<const ColumnString *>(col))
+                total += s->getOffsets()[row_index] - (row_index > 0 ? s->getOffsets()[row_index - 1] : 0);
+            else if (arg.type->isValueUnambiguouslyRepresentedInFixedSizeContiguousMemoryRegion())
+                total += arg.type->getSizeOfValueInMemory();
+            else
+                total += 256; // conservative fallback
         }
         return total;
     }
@@ -968,12 +1000,17 @@ private:
 
         size_t batch_start = 0;
 
+        // Buffers and ColumnBinary carry a native COL_IS_CONST marker and handle const columns
+        // without materializing them; RowBinary/MsgPack/CSV/etc. need them materialized.
+        const String serialization_format = user_defined_function->getSettings().getValue("serialization_format").safeGet<String>();
+        const bool preserve_const = serialization_format == "Buffers" || serialization_format == "ColumnBinary";
+
         auto flush_batch = [&](size_t end_idx)
         {
             if (end_idx <= batch_start)
                 return;
             size_t batch_size = end_idx - batch_start;
-            auto block = getArgumentsBlock(arguments, batch_start, batch_size, preserve_const_columns);
+            auto block = getArgumentsBlock(arguments, batch_start, batch_size, preserve_const);
             auto stop_token = interrupt_source.get_token();
             auto col = user_defined_function->executeOnBlock(compartment, block, context, batch_size, stop_token);
 
@@ -996,14 +1033,30 @@ private:
         {
             // O(1) block-level check: only scan per-row when splits are actually needed.
             // The common case (block fits in budget) pays zero per-row overhead.
-            // When splits are required, use a fixed stride derived from the average row size.
-            size_t total_bytes = estimateTotalSerializedSize(arguments, input_rows_count);
+            size_t total_bytes = estimateTotalSerializedSize(arguments, input_rows_count, preserve_const);
             if (total_bytes > input_budget)
             {
-                size_t avg_row_bytes = std::max(size_t(1), total_bytes / input_rows_count);
-                size_t stride = std::max(size_t(1), input_budget / avg_row_bytes);
-                for (size_t row = stride; row < input_rows_count; row += stride)
-                    flush_batch(row);
+                // Cumulative per-row pass: flush before the next row would cross the
+                // budget. A fixed stride derived from the average row size cannot bound
+                // a skewed block (e.g. one huge string among many tiny ones) — the
+                // oversized row would still land in a batch together with its neighbors.
+                size_t running_bytes = 0;
+                for (size_t row = 0; row < input_rows_count; ++row)
+                {
+                    size_t row_bytes = estimateRowSerializedSize(arguments, row, preserve_const);
+                    if (row_bytes > input_budget)
+                        throw Exception(ErrorCodes::WASM_ERROR,
+                            "WASM UDF input row {} alone requires an estimated {} bytes, exceeding the "
+                            "{} byte input budget derived from the module's linear memory; it cannot be "
+                            "split into a smaller batch",
+                            row, row_bytes, input_budget);
+                    if (row > batch_start && running_bytes + row_bytes > input_budget)
+                    {
+                        flush_batch(row);
+                        running_bytes = 0;
+                    }
+                    running_bytes += row_bytes;
+                }
             }
         }
         else if (fixed_block_size > 0)
@@ -1028,9 +1081,13 @@ private:
             column = column->cut(start_idx, length);
             String column_name = i < argument_names.size() && !argument_names[i].empty() ? argument_names[i] : arguments[i].name;
             /// Cast to the declared type so serialization uses the correct width.
-            /// Without this, e.g. UInt8 passed to a UInt32 parameter would be serialized
-            /// as 1 byte instead of 4, causing the WASM module to read garbage.
-            /// ColumnBinary does not embed type tags, so the cast is required regardless of format.
+            /// Without this, e.g. Int8 passed to an Int32 parameter would be serialized
+            /// as 1 byte by RowBinary instead of 4, causing the WASM module to read garbage.
+            /// ColumnBinary's descriptor only encodes a coarse width class (COL_FIXED8/16/32/64),
+            /// not exact signedness — a UInt8(255) and an Int8(-1) both serialize to the same
+            /// single 0xff byte, so a guest reading a declared Int32 has no way to tell them
+            /// apart. Always cast here regardless of format until the wire format carries
+            /// real logical type/signedness information.
             const DataTypePtr & declared_type = declared_arguments[i];
             if (!arguments[i].type->equals(*declared_type))
                 column = castColumn(ColumnWithTypeAndName(column, arguments[i].type, column_name), declared_type);
@@ -1045,7 +1102,6 @@ private:
     Strings argument_names;
     ContextPtr context;
     bool preserve_const_columns;
-    bool supports_column_schema;
 
     mutable StopSource interrupt_source;
     mutable WasmCompartmentPool compartment_pool;

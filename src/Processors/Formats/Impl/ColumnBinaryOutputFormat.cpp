@@ -52,7 +52,7 @@ void ColumnBinaryOutputFormat::consume(Chunk chunk)
         return;
 
     uint32_t num_rows = static_cast<uint32_t>(chunk.getNumRows());
-    uint32_t num_cols = static_cast<uint32_t>(std::min(chunk.getNumColumns(), header_->columns()));
+    uint32_t num_cols = static_cast<uint32_t>(std::min<size_t>(chunk.getNumColumns(), header_->columns()));
 
     // Layout pass: build descriptors (compute offsets and total size).
     uint64_t cursor = ColumnarV1::COLUMNAR_HEADER_BYTES + num_cols * ColumnarV1::COLUMNAR_DESC_BYTES;
@@ -84,7 +84,13 @@ void ColumnBinaryOutputFormat::consume(Chunk chunk)
     }
     else
     {
+        // Unlike tmp_buf (std::vector::resize value-initializes to 0), the
+        // WriteBuffer's internal buffer is not zeroed. Alignment padding gaps
+        // between COL_COMPLEX/COL_VARIANT sub-blocks are intentionally never
+        // written by writeColData, so they must be zeroed here to avoid
+        // leaking uninitialized memory into the output stream.
         buf = reinterpret_cast<uint8_t *>(out.position());
+        std::memset(buf, 0, cursor);
     }
 
     // Write header and descriptor table.

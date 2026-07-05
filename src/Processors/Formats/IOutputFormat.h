@@ -73,6 +73,7 @@ public:
     /// Returns std::nullopt if precomputation is not supported or not beneficial for this chunk.
     virtual std::optional<uint64_t> precomputeSerializedSize(const Block & /*block*/, size_t /*rows*/) const { return std::nullopt; }
 
+
     void setTotals(const Block & totals);
     void setExtremes(const Block & extremes);
 

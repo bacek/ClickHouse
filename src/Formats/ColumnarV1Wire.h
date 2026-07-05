@@ -61,7 +61,10 @@
 #include <cstring>
 #include <span>
 #include <functional>
+#include <utility>
+#include <vector>
 
+#include <base/unaligned.h>
 #include <Columns/ColumnArray.h>
 #include <Columns/ColumnConst.h>
 #include <Columns/ColumnNullable.h>
@@ -73,6 +76,7 @@
 #include <DataTypes/DataTypeNullable.h>
 #include <DataTypes/DataTypeString.h>
 #include <DataTypes/DataTypeTuple.h>
+#include <DataTypes/DataTypeVariant.h>
 #include <Common/Exception.h>
 #include <Common/assert_cast.h>
 
@@ -121,19 +125,25 @@ static_assert(sizeof(ColDescriptor) == COLUMNAR_DESC_BYTES);
 
 // Forward declaration — complexDataSize and writeComplexData are mutually recursive
 // only via lambdas; we declare the inline wrappers here.
-inline uint32_t complexDataSize(const IColumn & col, uint32_t n);
+//
+// complexDataSize/writeComplexData return/take byte *sizes* as uint64_t even though
+// element counts (n) stay uint32_t: a single String or Array column can legitimately
+// carry more than 4 GiB of payload in one row without needing a huge row count, so
+// any uint32_t size intermediate here would silently wrap and underallocate the
+// output frame.
+inline uint64_t complexDataSize(const IColumn & col, uint32_t n);
 inline void     writeComplexData(const IColumn & col, uint32_t n, uint8_t * dst);
 
-inline uint32_t complexDataSize(const IColumn & col, uint32_t n)
+inline uint64_t complexDataSize(const IColumn & col, uint32_t n)
 {
     if (const auto * arr = typeid_cast<const ColumnArray *>(&col))
     {
         uint32_t total = static_cast<uint32_t>(arr->getData().size());
-        return (n + 1u) * 8u + complexDataSize(arr->getData(), total);
+        return (static_cast<uint64_t>(n) + 1u) * 8u + complexDataSize(arr->getData(), total);
     }
     if (const auto * tup = typeid_cast<const ColumnTuple *>(&col))
     {
-        uint32_t sz = 0;
+        uint64_t sz = 0;
         for (const auto & field : tup->getColumns())
             sz += complexDataSize(*field, n);
         return sz;
@@ -141,11 +151,19 @@ inline uint32_t complexDataSize(const IColumn & col, uint32_t n)
     if (typeid_cast<const ColumnString *>(&col))
     {
         const auto & str = assert_cast<const ColumnString &>(col);
-        uint32_t chars = static_cast<uint32_t>(str.getChars().size());
-        return (n + 1u) * 8u + chars;
+        uint64_t chars = str.getChars().size();
+        return (static_cast<uint64_t>(n) + 1u) * 8u + chars;
     }
+    if (typeid_cast<const ColumnNullable *>(&col))
+        throw Exception(ErrorCodes::INCORRECT_DATA,
+            "COLUMNAR_V1: nested Nullable inside Array/Tuple is not supported in COL_COMPLEX; "
+            "use a flat nullable column or a different format");
+    if (typeid_cast<const ColumnVariant *>(&col))
+        throw Exception(ErrorCodes::INCORRECT_DATA,
+            "COLUMNAR_V1: nested Variant inside Array/Tuple is not supported in COL_COMPLEX; "
+            "use a flat variant column or a different format");
     // Fixed-width fallback (ColumnVector<T>, ColumnUInt8, etc.)
-    return n * static_cast<uint32_t>(col.sizeOfValueIfFixed());
+    return static_cast<uint64_t>(n) * col.sizeOfValueIfFixed();
 }
 
 inline void writeComplexData(const IColumn & col, uint32_t n, uint8_t * dst)
@@ -153,20 +171,19 @@ inline void writeComplexData(const IColumn & col, uint32_t n, uint8_t * dst)
     if (const auto * arr = typeid_cast<const ColumnArray *>(&col))
     {
         const auto & ch_offs = arr->getOffsets();
-        uint64_t * wire_offs = reinterpret_cast<uint64_t *>(dst);
-        wire_offs[0] = 0ull;
+        unalignedStore<uint64_t>(dst, 0ull);
         for (uint32_t i = 0; i < n; ++i)
-            wire_offs[i + 1u] = static_cast<uint64_t>(ch_offs[i]);
+            unalignedStore<uint64_t>(dst + (static_cast<uint64_t>(i) + 1u) * 8u, static_cast<uint64_t>(ch_offs[i]));
         uint32_t total = static_cast<uint32_t>(arr->getData().size());
-        writeComplexData(arr->getData(), total, dst + (n + 1u) * 8u);
+        writeComplexData(arr->getData(), total, dst + (static_cast<uint64_t>(n) + 1u) * 8u);
         return;
     }
     if (const auto * tup = typeid_cast<const ColumnTuple *>(&col))
     {
-        uint32_t pos = 0;
+        uint64_t pos = 0;
         for (const auto & field : tup->getColumns())
         {
-            uint32_t field_sz = complexDataSize(*field, n);
+            uint64_t field_sz = complexDataSize(*field, n);
             writeComplexData(*field, n, dst + pos);
             pos += field_sz;
         }
@@ -176,9 +193,8 @@ inline void writeComplexData(const IColumn & col, uint32_t n, uint8_t * dst)
     {
         const auto & ch_offs = str->getOffsets();
         const auto & chars   = str->getChars();
-        uint64_t * wire_offs = reinterpret_cast<uint64_t *>(dst);
-        uint8_t  * chars_dst = dst + (n + 1u) * 8u;
-        wire_offs[0] = 0ull;
+        uint8_t  * chars_dst = dst + (static_cast<uint64_t>(n) + 1u) * 8u;
+        unalignedStore<uint64_t>(dst, 0ull);
         uint64_t wire_pos = 0ull;
         uint64_t ch_pos   = 0ull;
         for (uint32_t i = 0; i < n; ++i)
@@ -187,11 +203,19 @@ inline void writeComplexData(const IColumn & col, uint32_t n, uint8_t * dst)
             uint64_t len = end - ch_pos;
             std::memcpy(chars_dst + wire_pos, chars.data() + ch_pos, len);
             wire_pos += len;
-            wire_offs[i + 1u] = wire_pos;
+            unalignedStore<uint64_t>(dst + (static_cast<uint64_t>(i) + 1u) * 8u, wire_pos);
             ch_pos = end;
         }
         return;
     }
+    if (typeid_cast<const ColumnNullable *>(&col))
+        throw Exception(ErrorCodes::INCORRECT_DATA,
+            "COLUMNAR_V1: nested Nullable inside Array/Tuple is not supported in COL_COMPLEX; "
+            "use a flat nullable column or a different format");
+    if (typeid_cast<const ColumnVariant *>(&col))
+        throw Exception(ErrorCodes::INCORRECT_DATA,
+            "COLUMNAR_V1: nested Variant inside Array/Tuple is not supported in COL_COMPLEX; "
+            "use a flat variant column or a different format");
     // Fixed-width fallback
     std::memcpy(dst, col.getRawData().data(), n * col.sizeOfValueIfFixed());
 }
@@ -327,7 +351,7 @@ inline uint64_t buildColDescriptor(
         write_cursor += (num_rows + 1u) * sizeof(uint64_t);
 
         desc.data_offset = write_cursor;
-        uint32_t total_chars = static_cast<uint32_t>(str_col->getChars().size());
+        uint64_t total_chars = str_col->getChars().size();
         desc.data_size = total_chars;
         write_cursor += total_chars;
         return write_cursor;
@@ -361,8 +385,8 @@ inline uint64_t buildColDescriptor(
     }
     desc.offsets_offset = 0;
     desc.data_offset    = write_cursor;
-    desc.data_size      = num_rows * wire_elem_size;
-    write_cursor       += num_rows * wire_elem_size;
+    desc.data_size      = static_cast<uint64_t>(num_rows) * wire_elem_size;
+    write_cursor       += desc.data_size;
     return write_cursor;
 }
 
@@ -436,10 +460,10 @@ inline void writeColData(
         uint32_t total_elems = static_cast<uint32_t>(nested.size());
 
         // Sequential layout: outer offsets at data_offset, nested data immediately after.
-        uint64_t * wire_outer = reinterpret_cast<uint64_t *>(buf.data() + desc.data_offset);
-        wire_outer[0] = 0ull;
+        uint8_t * wire_outer = buf.data() + desc.data_offset;
+        unalignedStore<uint64_t>(wire_outer, 0ull);
         for (uint32_t i = 0; i < num_rows; ++i)
-            wire_outer[i + 1u] = static_cast<uint64_t>(ch_offsets[i]);
+            unalignedStore<uint64_t>(wire_outer + (i + 1u) * 8u, static_cast<uint64_t>(ch_offsets[i]));
 
         writeComplexData(nested, total_elems, buf.data() + desc.data_offset + (num_rows + 1u) * sizeof(uint64_t));
         return;
@@ -469,10 +493,10 @@ inline void writeColData(
         const auto & ch_offsets = str_col->getOffsets();
         const auto & chars = str_col->getChars();
 
-        uint64_t * wire_offsets = reinterpret_cast<uint64_t *>(buf.data() + desc.offsets_offset);
+        uint8_t * wire_offsets = buf.data() + desc.offsets_offset;
         uint8_t * data_dst = buf.data() + desc.data_offset;
 
-        wire_offsets[0] = 0ull;
+        unalignedStore<uint64_t>(wire_offsets, 0ull);
         uint64_t wire_pos = 0ull;
         uint64_t ch_pos = 0ull;
         for (uint32_t i = 0; i < num_rows; ++i)
@@ -481,7 +505,7 @@ inline void writeColData(
             uint64_t str_len = str_end - ch_pos;
             std::memcpy(data_dst + wire_pos, chars.data() + ch_pos, str_len);
             wire_pos += str_len;
-            wire_offsets[i + 1] = wire_pos;
+            unalignedStore<uint64_t>(wire_offsets + (i + 1u) * 8u, wire_pos);
             ch_pos = str_end;
         }
         return;
@@ -514,6 +538,16 @@ inline MutableColumnPtr readColumnFromDesc(
         ? dynamic_cast<const DataTypeNullable &>(*result_type).getNestedType()
         : result_type;
 
+    // desc comes straight from guest/network memory and is otherwise untrusted:
+    // validate data_offset/data_size against buf.size() before forming any
+    // pointer from them (data_end below, and every buf.data() + desc.data_offset
+    // in the branches further down), or a malformed descriptor can build an
+    // out-of-bounds pointer that later bounds checks then compare against.
+    if (desc.data_offset > buf.size() || desc.data_size > buf.size() - desc.data_offset)
+        throw Exception(ErrorCodes::INCORRECT_DATA,
+            "COLUMNAR_V1: column data range out of bounds: offset={}, size={}, buf={}",
+            desc.data_offset, desc.data_size, buf.size());
+
     const uint8_t * const data_end = buf.data() + desc.data_offset + desc.data_size;
 
     // Recursive decoder for COL_COMPLEX (Array / Tuple / nested scalars).
@@ -526,13 +560,28 @@ inline MutableColumnPtr readColumnFromDesc(
             if (p + outer_bytes > data_end)
                 throw Exception(ErrorCodes::INCORRECT_DATA,
                     "COLUMNAR_V1: COL_COMPLEX nested Array outer offsets out of bounds");
-            const uint64_t * outer_offs = reinterpret_cast<const uint64_t *>(p);
+            const uint8_t * outer_offs = p;
             p += outer_bytes;
-            uint32_t total_elems = static_cast<uint32_t>(outer_offs[n]);
+            uint32_t total_elems = static_cast<uint32_t>(unalignedLoad<uint64_t>(outer_offs + n * 8u));
+            // outer_offs holds n+1 cumulative counts (offs[0]==0, offs[n]==total_elems); the
+            // module fully controls these, so reject anything non-monotonic or not starting
+            // at 0 before using them as ColumnArray offsets, or a crafted [0, 3, 1]-style frame
+            // can make later offset differences underflow into a huge size downstream.
+            if (unalignedLoad<uint64_t>(outer_offs) != 0)
+                throw Exception(ErrorCodes::INCORRECT_DATA,
+                    "COLUMNAR_V1: COL_COMPLEX Array offsets must start at 0");
             auto nested_col = decode(p, arr_type->getNestedType(), total_elems);
             auto offsets_col = ColumnUInt64::create(n);
+            uint64_t prev_off = 0;
             for (uint32_t i = 0; i < n; ++i)
-                offsets_col->getData()[i] = outer_offs[i + 1u];
+            {
+                uint64_t off = unalignedLoad<uint64_t>(outer_offs + (i + 1u) * 8u);
+                if (off < prev_off)
+                    throw Exception(ErrorCodes::INCORRECT_DATA,
+                        "COLUMNAR_V1: COL_COMPLEX Array offsets must be non-decreasing");
+                offsets_col->getData()[i] = off;
+                prev_off = off;
+            }
             return ColumnArray::create(std::move(nested_col), std::move(offsets_col));
         }
         if (const auto * tup_type = typeid_cast<const DataTypeTuple *>(type.get()))
@@ -550,23 +599,35 @@ inline MutableColumnPtr readColumnFromDesc(
             if (p + off_bytes > data_end)
                 throw Exception(ErrorCodes::INCORRECT_DATA,
                     "COLUMNAR_V1: COL_COMPLEX String offsets out of bounds");
-            const uint64_t * wire_offs = reinterpret_cast<const uint64_t *>(p);
+            const uint8_t * wire_offs = p;
             p += off_bytes;
-            uint64_t total_chars = wire_offs[n];
+            uint64_t total_chars = unalignedLoad<uint64_t>(wire_offs + n * 8u);
             if (p + total_chars > data_end)
                 throw Exception(ErrorCodes::INCORRECT_DATA,
                     "COLUMNAR_V1: COL_COMPLEX String chars out of bounds");
             const uint8_t * chars_src = p;
             p += total_chars;
+            // wire_offs holds n+1 cumulative byte offsets (offs[0]==0, offs[n]==total_chars);
+            // the module fully controls these, so reject anything non-monotonic before using
+            // them to slice chars_src, or a crafted offset pair can underflow str_len into a
+            // huge size and drive an out-of-bounds memcpy.
+            if (unalignedLoad<uint64_t>(wire_offs) != 0)
+                throw Exception(ErrorCodes::INCORRECT_DATA,
+                    "COLUMNAR_V1: COL_COMPLEX String offsets must start at 0");
             auto col_str = ColumnString::create();
             auto & chars   = col_str->getChars();
             auto & offsets = col_str->getOffsets();
             offsets.resize(n);
             uint64_t ch_pos = 0ull;
+            uint64_t prev_wire_end = 0;
             for (uint32_t i = 0; i < n; ++i)
             {
-                uint64_t wire_end   = wire_offs[i + 1u];
-                uint64_t wire_start = wire_offs[i];
+                uint64_t wire_end   = unalignedLoad<uint64_t>(wire_offs + (i + 1u) * 8u);
+                uint64_t wire_start = unalignedLoad<uint64_t>(wire_offs + i * 8u);
+                if (wire_start != prev_wire_end || wire_end < wire_start)
+                    throw Exception(ErrorCodes::INCORRECT_DATA,
+                        "COLUMNAR_V1: COL_COMPLEX String offsets must be non-decreasing and contiguous");
+                prev_wire_end = wire_end;
                 uint64_t str_len    = wire_end - wire_start;
                 chars.resize(ch_pos + str_len);
                 std::memcpy(chars.data() + ch_pos, chars_src + wire_start, str_len);
@@ -575,6 +636,14 @@ inline MutableColumnPtr readColumnFromDesc(
             }
             return col_str;
         }
+        if (typeid_cast<const DataTypeNullable *>(type.get()))
+            throw Exception(ErrorCodes::INCORRECT_DATA,
+                "COLUMNAR_V1: nested Nullable inside Array/Tuple is not supported in COL_COMPLEX; "
+                "use a flat nullable column or a different format");
+        if (typeid_cast<const DataTypeVariant *>(type.get()))
+            throw Exception(ErrorCodes::INCORRECT_DATA,
+                "COLUMNAR_V1: nested Variant inside Array/Tuple is not supported in COL_COMPLEX; "
+                "use a flat variant column or a different format");
         uint32_t elem_bytes = static_cast<uint32_t>(type->getSizeOfValueInMemory());
         if (p + static_cast<uint64_t>(n) * elem_bytes > data_end)
             throw Exception(ErrorCodes::INCORRECT_DATA,
@@ -615,7 +684,7 @@ inline MutableColumnPtr readColumnFromDesc(
                 "COLUMNAR_V1: COL_BYTES data out of bounds: offset={}, size={}, buf={}",
                 desc.data_offset, desc.data_size, buf.size());
 
-        const uint64_t * wire_offsets = reinterpret_cast<const uint64_t *>(buf.data() + desc.offsets_offset);
+        const uint8_t  * wire_offsets = buf.data() + desc.offsets_offset;
         const uint8_t  * data         = buf.data() + desc.data_offset;
         auto col_str = ColumnString::create();
         auto & chars   = col_str->getChars();
@@ -624,8 +693,8 @@ inline MutableColumnPtr readColumnFromDesc(
         uint64_t ch_pos = 0ull;
         for (uint32_t i = 0; i < rows_to_dec; ++i)
         {
-            uint64_t wire_end   = wire_offsets[i + 1];
-            uint64_t wire_start = wire_offsets[i];
+            uint64_t wire_end   = unalignedLoad<uint64_t>(wire_offsets + (i + 1u) * 8u);
+            uint64_t wire_start = unalignedLoad<uint64_t>(wire_offsets + i * 8u);
             if (wire_start > wire_end || wire_end > desc.data_size)
                 throw Exception(ErrorCodes::INCORRECT_DATA,
                     "COLUMNAR_V1: COL_BYTES invalid string offsets at row {}: [{}, {}), data_size={}",
@@ -715,13 +784,29 @@ inline MutableColumnPtr readColumnFromDesc(
                     "COLUMNAR_V1: COL_COMPLEX outer offsets exceed data_size: need={}, data_size={}",
                     outer_offset_bytes, desc.data_size);
             const uint8_t * p = buf.data() + desc.data_offset;
-            const uint64_t * outer_offs = reinterpret_cast<const uint64_t *>(p);
+            const uint8_t * outer_offs = p;
             p += outer_offset_bytes;
-            uint32_t total_elems = static_cast<uint32_t>(outer_offs[rows_to_dec]);
+            uint32_t total_elems = static_cast<uint32_t>(unalignedLoad<uint64_t>(outer_offs + rows_to_dec * 8u));
+            // Same guest-controlled offsets as the nested decode() branch above: reject
+            // anything not starting at 0 or non-monotonic before trusting total_elems for
+            // the nested allocation/decode, or a crafted [0, 3, 1]-style frame can build a
+            // ColumnArray whose per-row size underflows into a huge value downstream.
+            if (unalignedLoad<uint64_t>(outer_offs) != 0)
+                throw Exception(ErrorCodes::INCORRECT_DATA,
+                    "COLUMNAR_V1: COL_COMPLEX Array offsets must start at 0");
+            uint64_t prev_off = 0;
+            for (uint32_t i = 0; i < rows_to_dec; ++i)
+            {
+                uint64_t off = unalignedLoad<uint64_t>(outer_offs + (i + 1u) * 8u);
+                if (off < prev_off)
+                    throw Exception(ErrorCodes::INCORRECT_DATA,
+                        "COLUMNAR_V1: COL_COMPLEX Array offsets must be non-decreasing");
+                prev_off = off;
+            }
             auto nested_col = decode(p, arr_type->getNestedType(), total_elems);
             auto offsets_col = ColumnUInt64::create(rows_to_dec);
             for (uint32_t i = 0; i < rows_to_dec; ++i)
-                offsets_col->getData()[i] = outer_offs[i + 1u];
+                offsets_col->getData()[i] = unalignedLoad<uint64_t>(outer_offs + (i + 1u) * 8u);
             col = maybe_nullable(ColumnArray::create(std::move(nested_col), std::move(offsets_col)));
         }
         else
@@ -730,6 +815,107 @@ inline MutableColumnPtr readColumnFromDesc(
             const uint8_t * data_ptr = buf.data() + desc.data_offset;
             col = maybe_nullable(decode(data_ptr, base_type, rows_to_dec));
         }
+    }
+    else if (raw_type == COL_VARIANT)
+    {
+        const auto * variant_type = typeid_cast<const DataTypeVariant *>(base_type.get());
+        if (!variant_type)
+            throw Exception(ErrorCodes::INCORRECT_DATA,
+                "COLUMNAR_V1: COL_VARIANT descriptor does not match declared type {}", base_type->getName());
+
+        const auto & alt_types = variant_type->getVariants();
+        if (alt_types.size() > ColumnVariant::MAX_NESTED_COLUMNS)
+            throw Exception(ErrorCodes::INCORRECT_DATA,
+                "COLUMNAR_V1: COL_VARIANT declared type has too many alternatives: {}", alt_types.size());
+
+        // Discriminators: uint8[rows_to_dec] at null_offset (NULL_DISCRIMINATOR=0xFF for NULL rows).
+        if (desc.null_offset + static_cast<uint64_t>(rows_to_dec) > buf.size())
+            throw Exception(ErrorCodes::INCORRECT_DATA,
+                "COLUMNAR_V1: COL_VARIANT discriminators out of bounds: offset={}, rows={}, buf={}",
+                desc.null_offset, rows_to_dec, buf.size());
+        const uint8_t * disc_src = buf.data() + desc.null_offset;
+
+        // Row offsets: uint32[rows_to_dec] at offsets_offset (position within the row's sub-column).
+        if (desc.offsets_offset + static_cast<uint64_t>(rows_to_dec) * 4u > buf.size())
+            throw Exception(ErrorCodes::INCORRECT_DATA,
+                "COLUMNAR_V1: COL_VARIANT row offsets out of bounds: offset={}, rows={}, buf={}",
+                desc.offsets_offset, rows_to_dec, buf.size());
+        const uint8_t * offs_src = buf.data() + desc.offsets_offset;
+
+        // Header: uint32 K + K x { uint8 global_discriminator, uint8[3] pad, ColDescriptor }.
+        if (desc.data_size < 4u)
+            throw Exception(ErrorCodes::INCORRECT_DATA,
+                "COLUMNAR_V1: COL_VARIANT header truncated: data_size={}", desc.data_size);
+        const uint8_t * header = buf.data() + desc.data_offset;
+        uint32_t k = unalignedLoad<uint32_t>(header);
+        constexpr uint64_t record_bytes = 4u + COLUMNAR_DESC_BYTES;
+        if (static_cast<uint64_t>(k) * record_bytes > desc.data_size - 4u)
+            throw Exception(ErrorCodes::INCORRECT_DATA,
+                "COLUMNAR_V1: COL_VARIANT header declares {} sub-variants, exceeding data_size={}",
+                k, desc.data_size);
+
+        // Map global discriminator -> (inner descriptor, row count in that sub-column).
+        std::vector<std::pair<ColDescriptor, uint32_t>> sub_by_global(alt_types.size(), {ColDescriptor{}, 0u});
+        std::vector<bool> sub_present(alt_types.size(), false);
+        const uint8_t * record_ptr = header + 4u;
+        for (uint32_t r = 0; r < k; ++r)
+        {
+            uint8_t global_d = record_ptr[0];
+            if (global_d >= alt_types.size())
+                throw Exception(ErrorCodes::INCORRECT_DATA,
+                    "COLUMNAR_V1: COL_VARIANT sub-variant global discriminator {} out of range [0, {})",
+                    static_cast<uint32_t>(global_d), alt_types.size());
+            if (sub_present[global_d])
+                throw Exception(ErrorCodes::INCORRECT_DATA,
+                    "COLUMNAR_V1: COL_VARIANT duplicate global discriminator {}", static_cast<uint32_t>(global_d));
+
+            ColDescriptor inner_desc{};
+            std::memcpy(&inner_desc, record_ptr + 4u, COLUMNAR_DESC_BYTES);
+            // null_offset was repurposed by the writer to carry this sub-column's row count.
+            uint32_t sub_rows = static_cast<uint32_t>(inner_desc.null_offset);
+            sub_by_global[global_d] = {inner_desc, sub_rows};
+            sub_present[global_d] = true;
+            record_ptr += record_bytes;
+        }
+
+        // Decode each alternative's sub-column (empty if absent from the header).
+        MutableColumns variant_cols;
+        variant_cols.reserve(alt_types.size());
+        for (size_t g = 0; g < alt_types.size(); ++g)
+        {
+            if (sub_present[g])
+            {
+                const auto & [inner_desc, sub_rows] = sub_by_global[g];
+                variant_cols.push_back(readColumnFromDesc(buf, inner_desc, sub_rows, alt_types[g]));
+            }
+            else
+            {
+                variant_cols.push_back(alt_types[g]->createColumn());
+            }
+        }
+
+        // Discriminators/offsets are local == global here since variant_cols is built in
+        // the declared type's global order (see ColumnVariant.h for the local/global distinction).
+        auto discr_col = ColumnVariant::ColumnDiscriminators::create(rows_to_dec);
+        auto offs_col  = ColumnVariant::ColumnOffsets::create(rows_to_dec);
+        std::vector<uint32_t> next_offset(alt_types.size(), 0);
+        for (uint32_t i = 0; i < rows_to_dec; ++i)
+        {
+            uint8_t d = disc_src[i];
+            uint32_t row_off = unalignedLoad<uint32_t>(offs_src + i * 4u);
+            if (d != ColumnVariant::NULL_DISCRIMINATOR)
+            {
+                if (d >= alt_types.size() || row_off != next_offset[d] || row_off >= sub_by_global[d].second)
+                    throw Exception(ErrorCodes::INCORRECT_DATA,
+                        "COLUMNAR_V1: COL_VARIANT row {} has invalid discriminator/offset: discr={}, offset={}",
+                        i, static_cast<uint32_t>(d), row_off);
+                ++next_offset[d];
+            }
+            discr_col->getData()[i] = d;
+            offs_col->getData()[i] = row_off;
+        }
+
+        col = ColumnVariant::create(std::move(discr_col), std::move(offs_col), std::move(variant_cols));
     }
     else
     {

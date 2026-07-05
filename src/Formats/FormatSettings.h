@@ -618,6 +618,13 @@ struct FormatSettings
         bool escape_special_characters = false;
     } markdown{};
 
+    // ColumnBinary format settings
+    struct
+    {
+        bool disable_preallocation = false;
+        UInt64 max_frame_size = 1_GiB;
+    } column_binary{};
+
     enum class UnsupportedGeometryHandling { Throw, Null };
 
     struct
@@ -625,12 +632,6 @@ struct FormatSettings
         UnsupportedGeometryHandling unsupported_geometry_handling = UnsupportedGeometryHandling::Throw;
         bool validate_geometry = true;
     } geojson{};
-
-    // ColumnBinary format settings
-    struct
-    {
-        bool disable_preallocation = false;
-    } column_binary{};
 
 };
 
