@@ -43,6 +43,7 @@ public:
     Field getValue(const String & name) const;
     bool isFuelEnabled() const;
     WebAssembly::FuelMode getFuelMode() const;
+    bool isAggregate() const;
 
 private:
     UnorderedMapWithMemoryTracking<String, Field> settings;

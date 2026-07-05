@@ -174,8 +174,8 @@ std::shared_ptr<DB::KeyCondition> buildBboxKeyCondition(
 
     auto make_const = [&](double v, const String & name) -> const DB::ActionsDAG::Node &
     {
-        return dag.addColumn(DB::ColumnWithTypeAndName{
-            float64->createColumnConst(1, DB::Field(v)), float64, name});
+        auto column = float64->createColumnConst(1, DB::Field(v));
+        return dag.addColumn(typeid_cast<const DB::ColumnConst &>(*column).getPtr(), float64, name);
     };
     const auto & c_qxmin = make_const(filter.query_xmin, "__bbox_q_xmin");
     const auto & c_qxmax = make_const(filter.query_xmax, "__bbox_q_xmax");
@@ -198,7 +198,7 @@ std::shared_ptr<DB::KeyCondition> buildBboxKeyCondition(
     const auto & and3 = dag.addFunction(and_fn, {&and2, &cmp4}, "");
     dag.getOutputs() = {&and3};
 
-    DB::ActionsDAGWithInversionPushDown inverted(dag.getOutputs().front(), context);
+    DB::ActionsDAGWithInversionPushDown inverted(dag.getOutputs().front(), context, /*boolean_context=*/ true);
     return std::make_shared<DB::KeyCondition>(
         inverted, context, extended_sample_block.getNames(),
         std::make_shared<DB::ExpressionActions>(
@@ -239,8 +239,8 @@ std::optional<std::pair<DB::ActionsDAG, String>> buildBboxRowFilterDAG(
     auto make_const = [&](double v) -> const DB::ActionsDAG::Node &
     {
         String name = "__bbox_const_" + std::to_string(const_idx++);
-        return dag.addColumn(DB::ColumnWithTypeAndName{
-            float64->createColumnConst(1, DB::Field(v)), float64, name});
+        auto column = float64->createColumnConst(1, DB::Field(v));
+        return dag.addColumn(typeid_cast<const DB::ColumnConst &>(*column).getPtr(), float64, name);
     };
 
     const DB::ActionsDAG::Node * combined = nullptr;

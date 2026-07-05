@@ -681,7 +681,7 @@ private:
 
 
 /// Returns "clickhouse_module_init" if the module exports it, nullopt otherwise.
-std::optional<String> tryGetModuleInitFn(const std::shared_ptr<WebAssembly::WasmModule> & module)
+static std::optional<String> tryGetModuleInitFn(const std::shared_ptr<WebAssembly::WasmModule> & module)
 {
     try
     {
@@ -1148,7 +1148,7 @@ public:
         state->num_rows += row_end - row_begin;
     }
 
-    void merge(AggregateDataPtr __restrict place, ConstAggregateDataPtr rhs, Arena *) const override
+    void mergeImpl(AggregateDataPtr __restrict place, ConstAggregateDataPtr rhs, Arena *) const override
     {
         auto * state = reinterpret_cast<State *>(place);
         const auto * rhs_state = reinterpret_cast<const State *>(rhs);
@@ -1989,6 +1989,9 @@ struct WebAssemblyFunctionSettingsConstraits : public IHints<>
         /// argument. SpatialRTreeJoin expands the R-tree query bbox by this amount.
         /// -1 (default) means no expansion.
         {"spatial_expand_arg", SettingInt64{}.withDefault(-1)},
+        /// Registers the WASM function as an aggregate function: arguments are received
+        /// as Array(T) accumulating all rows in the group instead of per-row scalars.
+        {"is_aggregate", SettingBool{}.withDefault(false)},
     };
 
     VectorWithMemoryTracking<String> getAllRegisteredNames() const override
@@ -2045,6 +2048,11 @@ bool WebAssemblyFunctionSettings::isFuelEnabled() const
 WebAssembly::FuelMode WebAssemblyFunctionSettings::getFuelMode() const
 {
     return isFuelEnabled() ? WebAssembly::FuelMode::Enabled : WebAssembly::FuelMode::Disabled;
+}
+
+bool WebAssemblyFunctionSettings::isAggregate() const
+{
+    return getValue("is_aggregate").safeGet<bool>();
 }
 
 
