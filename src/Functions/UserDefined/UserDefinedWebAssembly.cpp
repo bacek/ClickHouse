@@ -1143,6 +1143,27 @@ public:
               interrupt_source.get_token(),
               tryGetModuleInitFn(wasm_function->getModule()))
     {
+        arg_encodings.reserve(original_arg_types.size());
+        fixed_value_sizes.reserve(original_arg_types.size());
+        for (const auto & type : original_arg_types)
+        {
+            auto sample = type->createColumn();
+            if (sample->isFixedAndContiguous())
+            {
+                arg_encodings.push_back(ArgEncoding::FixedWidth);
+                fixed_value_sizes.push_back(sample->sizeOfValueIfFixed());
+            }
+            else if (typeid_cast<const ColumnString *>(sample.get()) != nullptr)
+            {
+                arg_encodings.push_back(ArgEncoding::VariableWidth);
+                fixed_value_sizes.push_back(0);
+            }
+            else
+            {
+                arg_encodings.push_back(ArgEncoding::Serialized);
+                fixed_value_sizes.push_back(0);
+            }
+        }
     }
 
     String getName() const override { return function_name; }
@@ -1276,6 +1297,13 @@ public:
 
 private:
     /// One accumulated row: all arguments serialized back to back, immediately after the node.
+    enum class ArgEncoding : uint8_t
+    {
+        FixedWidth,
+        VariableWidth,
+        Serialized,
+    };
+
     struct Node
     {
         Node * next;
@@ -1310,8 +1338,32 @@ private:
         const auto settings = IColumn::SerializationSettings::createForAggregationState();
         const char * begin = nullptr;
         size_t size = 0;
-        for (size_t i = 0; i < original_arg_types.size(); ++i)
-            size += columns[i]->serializeValueIntoArena(row_num, *arena, begin, &settings).size();
+        for (size_t i = 0; i < arg_encodings.size(); ++i)
+        {
+            switch (arg_encodings[i])
+            {
+                case ArgEncoding::FixedWidth:
+                {
+                    const size_t value_size = fixed_value_sizes[i];
+                    memcpy(arena->allocContinue(value_size, begin), columns[i]->getDataAt(row_num).data(), value_size);
+                    size += value_size;
+                    break;
+                }
+                case ArgEncoding::VariableWidth:
+                {
+                    const auto value = columns[i]->getDataAt(row_num);
+                    const auto value_size = static_cast<UInt32>(value.size());
+                    char * pos = arena->allocContinue(sizeof(value_size) + value.size(), begin);
+                    memcpy(pos, &value_size, sizeof(value_size));
+                    memcpy(pos + sizeof(value_size), value.data(), value.size());
+                    size += sizeof(value_size) + value.size();
+                    break;
+                }
+                case ArgEncoding::Serialized:
+                    size += columns[i]->serializeValueIntoArena(row_num, *arena, begin, &settings).size();
+                    break;
+            }
+        }
         pushNode(state, begin, size, arena);
     }
 
@@ -1336,9 +1388,34 @@ private:
         {
             for (const Node * node = states[g]->head; node != nullptr; node = node->next)
             {
-                ReadBufferFromMemory in(node->data, node->size);
-                for (auto & column : columns)
-                    column->deserializeAndInsertFromArena(in, &settings);
+                const char * cursor = node->data;
+                const char * row_end = node->data + node->size;
+                for (size_t i = 0; i < columns.size(); ++i)
+                {
+                    switch (arg_encodings[i])
+                    {
+                        case ArgEncoding::FixedWidth:
+                            columns[i]->insertData(cursor, fixed_value_sizes[i]);
+                            cursor += fixed_value_sizes[i];
+                            break;
+                        case ArgEncoding::VariableWidth:
+                        {
+                            UInt32 value_size = 0;
+                            memcpy(&value_size, cursor, sizeof(value_size));
+                            cursor += sizeof(value_size);
+                            columns[i]->insertData(cursor, value_size);
+                            cursor += value_size;
+                            break;
+                        }
+                        case ArgEncoding::Serialized:
+                        {
+                            ReadBufferFromMemory in(cursor, row_end - cursor);
+                            columns[i]->deserializeAndInsertFromArena(in, &settings);
+                            cursor += in.count();
+                            break;
+                        }
+                    }
+                }
             }
         }
         return columns;
@@ -1384,6 +1461,8 @@ private:
     String function_name;
     std::shared_ptr<UserDefinedWebAssemblyFunction> wasm_function;
     DataTypes original_arg_types;
+    std::vector<ArgEncoding> arg_encodings;
+    std::vector<size_t> fixed_value_sizes;
     ContextPtr context;
     mutable StopSource interrupt_source;
     mutable WasmCompartmentPool compartment_pool;
