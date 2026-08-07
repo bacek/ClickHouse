@@ -153,6 +153,15 @@ public:
     /// Returns true if the function is an aggregate function (is_aggregate=1).
     bool isAggregate(const String & function_name) const;
 
+    /// Returns true if this factory registered `function_name` in AggregateFunctionFactory.
+    ///
+    /// That registration is a trampoline which resolves the WASM function lazily, so it is made
+    /// once and never withdrawn: AggregateFunctionFactory has no unregister API. Callers that
+    /// treat an AggregateFunctionFactory hit as "this is a built-in, hands off" must consult
+    /// this first, or DROP and CREATE OR REPLACE of a WASM aggregate both become impossible
+    /// after the first drop.
+    bool ownsAggregateName(const String & function_name) const;
+
     /// Returns an AggregateFunctionPtr for use in the query analyzer.
     /// arg_types must match the declared (non-Array) argument types.
     AggregateFunctionPtr getAggregate(const String & function_name, const DataTypes & arg_types, ContextPtr context) const;
@@ -186,8 +195,15 @@ private:
         DataTypes accumulator_arg_types;
     };
 
+    /// Registers `sql_name` in AggregateFunctionFactory unless that was already done.
+    /// Caller must hold registry_mutex.
+    void registerAggregateName(const String & sql_name, const DataTypes & accumulator_arg_types);
+
     mutable DB::SharedMutex registry_mutex;
     UnorderedMapWithMemoryTracking<String, std::vector<RegistryEntry>> registry;
+    /// Names handed to AggregateFunctionFactory. Outlives `registry` entries by design; see
+    /// ownsAggregateName().
+    std::unordered_set<String> aggregate_names;
 };
 
 }

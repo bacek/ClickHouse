@@ -20,6 +20,7 @@
 
 #include <AggregateFunctions/IAggregateFunction.h>
 #include <AggregateFunctions/AggregateFunctionFactory.h>
+#include <Common/Arena.h>
 #include <Common/CurrentThread.h>
 #include <Common/ThreadStatus.h>
 #include <IO/VarInt.h>
@@ -1109,10 +1110,17 @@ private:
 
 /// Aggregate function wrapper for WASM UDFs with is_aggregate=1.
 ///
-/// ClickHouse accumulates argument rows per group using per-argument MutableColumns.
-/// At insertResultInto time each accumulated column is wrapped into an Array column,
-/// forming a one-row block of Array(T) arguments, which is then passed to the underlying
-/// BUFFERED_V1 WASM function. The WASM function receives arrays and returns one result.
+/// Argument rows are accumulated per group as a singly linked list of arena nodes, each
+/// holding one row with all arguments serialized back to back. A per-group MutableColumns
+/// would be simpler, but every ColumnString there allocates a 4 KiB PODArray for its chars
+/// and another for its offsets, so a query with millions of small groups pays several KiB
+/// per group no matter how few rows it holds.
+///
+/// Results are produced a whole batch of groups at a time (see insertResultIntoBatch): the
+/// accumulated rows are flattened into one Array(T) column per argument, with one array
+/// element per group, and handed to the underlying WASM function in a single call. Calling
+/// it once per group instead makes the compartment acquire and block marshalling dominate
+/// everything else once the group count reaches the millions.
 class AggregateFunctionUserDefinedWasm final
     : public IAggregateFunctionHelper<AggregateFunctionUserDefinedWasm>
 {
@@ -1138,138 +1146,240 @@ public:
     }
 
     String getName() const override { return function_name; }
-    bool allocatesMemoryInArena() const override { return false; }
-    bool hasTrivialDestructor() const override { return false; }
+    bool allocatesMemoryInArena() const override { return true; }
+    bool hasTrivialDestructor() const override { return true; }
 
     size_t sizeOfData() const override { return sizeof(State); }
     size_t alignOfData() const override { return alignof(State); }
 
     void create(AggregateDataPtr __restrict place) const override
     {
-        auto * state = new (place) State();
-        state->columns = new MutableColumns();
-        try
-        {
-            state->columns->reserve(original_arg_types.size());
-            for (const auto & type : original_arg_types)
-                state->columns->push_back(type->createColumn());
-        }
-        catch (...)
-        {
-            /// destroy() is NOT called when create() throws, so clean up manually.
-            delete state->columns;
-            state->columns = nullptr;
-            throw;
-        }
+        new (place) State();
     }
 
     void destroy(AggregateDataPtr __restrict place) const noexcept override
     {
-        auto * state = reinterpret_cast<State *>(place);
-        delete state->columns;
+        /// Everything the state owns lives in the arena and dies with it.
+        reinterpret_cast<State *>(place)->~State();
     }
 
-    void add(AggregateDataPtr __restrict place, const IColumn ** columns, size_t row_num, Arena *) const override
+    void add(AggregateDataPtr __restrict place, const IColumn ** columns, size_t row_num, Arena * arena) const override
     {
-        auto * state = reinterpret_cast<State *>(place);
-        for (size_t i = 0; i < state->columns->size(); ++i)
-            (*state->columns)[i]->insertFrom(*columns[i], row_num);
-        ++state->num_rows;
+        appendRow(*reinterpret_cast<State *>(place), columns, row_num, arena);
     }
 
     void addBatchSinglePlace(
         size_t row_begin, size_t row_end,
         AggregateDataPtr __restrict place,
         const IColumn ** columns,
-        Arena *,
+        Arena * arena,
         ssize_t if_argument_pos) const override
     {
-        auto * state = reinterpret_cast<State *>(place);
+        auto & state = *reinterpret_cast<State *>(place);
         if (if_argument_pos >= 0)
         {
             const auto & filter = assert_cast<const ColumnUInt8 &>(*columns[if_argument_pos]);
             for (size_t row = row_begin; row < row_end; ++row)
-            {
                 if (filter.getElement(row))
-                {
-                    for (size_t i = 0; i < state->columns->size(); ++i)
-                        (*state->columns)[i]->insertFrom(*columns[i], row);
-                    ++state->num_rows;
-                }
-            }
+                    appendRow(state, columns, row, arena);
             return;
         }
-        for (size_t i = 0; i < state->columns->size(); ++i)
-            (*state->columns)[i]->insertRangeFrom(*columns[i], row_begin, row_end - row_begin);
-        state->num_rows += row_end - row_begin;
+        for (size_t row = row_begin; row < row_end; ++row)
+            appendRow(state, columns, row, arena);
     }
 
-    void mergeImpl(AggregateDataPtr __restrict place, ConstAggregateDataPtr rhs, Arena *) const override
+    void mergeImpl(AggregateDataPtr __restrict place, ConstAggregateDataPtr rhs, Arena * arena) const override
     {
-        auto * state = reinterpret_cast<State *>(place);
-        const auto * rhs_state = reinterpret_cast<const State *>(rhs);
-        for (size_t i = 0; i < state->columns->size(); ++i)
-            (*state->columns)[i]->insertRangeFrom(*(*rhs_state->columns)[i], 0, rhs_state->num_rows);
-        state->num_rows += rhs_state->num_rows;
+        auto & state = *reinterpret_cast<State *>(place);
+        const auto & rhs_state = *reinterpret_cast<const State *>(rhs);
+
+        /// The two states may live in different arenas, so the bytes have to be copied
+        /// rather than the lists spliced.
+        for (const Node * node = rhs_state.head; node != nullptr; node = node->next)
+        {
+            char * copy = arena->alloc(node->size);
+            memcpy(copy, node->data, node->size);
+            pushNode(state, copy, node->size, arena);
+        }
     }
 
     void serialize(ConstAggregateDataPtr __restrict place, WriteBuffer & buf, std::optional<size_t> /*version*/) const override
     {
         const auto * state = reinterpret_cast<const State *>(place);
+        auto columns = materializeRows(&state, 1);
         writeVarUInt(state->num_rows, buf);
-        for (size_t i = 0; i < state->columns->size(); ++i)
+        for (size_t i = 0; i < columns.size(); ++i)
         {
             auto serialization = original_arg_types[i]->getDefaultSerialization();
-            serialization->serializeBinaryBulk(*(*state->columns)[i], buf, 0, state->num_rows);
+            serialization->serializeBinaryBulk(*columns[i], buf, 0, state->num_rows);
         }
     }
 
-    void deserialize(AggregateDataPtr __restrict place, ReadBuffer & buf, std::optional<size_t> /*version*/, Arena *) const override
+    void deserialize(AggregateDataPtr __restrict place, ReadBuffer & buf, std::optional<size_t> /*version*/, Arena * arena) const override
     {
-        auto * state = reinterpret_cast<State *>(place);
-        size_t num_rows;
+        auto & state = *reinterpret_cast<State *>(place);
+        size_t num_rows = 0;
         readVarUInt(num_rows, buf);
-        for (size_t i = 0; i < state->columns->size(); ++i)
+
+        MutableColumns columns;
+        columns.reserve(original_arg_types.size());
+        for (const auto & type : original_arg_types)
+            columns.push_back(type->createColumn());
+        for (size_t i = 0; i < columns.size(); ++i)
         {
             auto serialization = original_arg_types[i]->getDefaultSerialization();
-            serialization->deserializeBinaryBulk(*(*state->columns)[i], buf, /*rows_offset=*/0, num_rows, /*avg_value_size_hint=*/0);
+            serialization->deserializeBinaryBulk(*columns[i], buf, /*rows_offset=*/0, num_rows, /*avg_value_size_hint=*/0);
         }
-        state->num_rows = num_rows;
+
+        std::vector<const IColumn *> raw;
+        raw.reserve(columns.size());
+        for (const auto & column : columns)
+            raw.push_back(column.get());
+        for (size_t row = 0; row < num_rows; ++row)
+            appendRow(state, raw.data(), row, arena);
     }
 
     void insertResultInto(AggregateDataPtr __restrict place, IColumn & to, Arena *) const override
     {
         const auto * state = reinterpret_cast<const State *>(place);
+        executeOnGroups(&state, 1, to);
+    }
 
-        /// Build a one-row block where each column is Array(original_arg_type),
-        /// containing all the accumulated rows for this group.
+    void insertResultIntoBatch(
+        size_t row_begin,
+        size_t row_end,
+        AggregateDataPtr * places,
+        size_t place_offset,
+        IColumn & to,
+        Arena *) const override
+    {
+        std::vector<const State *> states;
+        states.reserve(row_end - row_begin);
+        for (size_t i = row_begin; i < row_end; ++i)
+            states.push_back(reinterpret_cast<const State *>(places[i] + place_offset));
+
+        try
+        {
+            executeOnGroups(states.data(), states.size(), to);
+        }
+        catch (...)
+        {
+            /// Nothing was inserted, so every place in the range is still ours to destroy.
+            for (size_t i = row_begin; i < row_end; ++i)
+                destroy(places[i] + place_offset);
+            throw;
+        }
+
+        for (size_t i = row_begin; i < row_end; ++i)
+            destroyUpToState(places[i] + place_offset);
+    }
+
+private:
+    /// One accumulated row: all arguments serialized back to back, immediately after the node.
+    struct Node
+    {
+        Node * next;
+        const char * data;
+        size_t size;
+    };
+
+    struct State
+    {
+        Node * head = nullptr;
+        Node * tail = nullptr;
+        size_t num_rows = 0;
+    };
+
+    void pushNode(State & state, const char * data, size_t size, Arena * arena) const
+    {
+        auto * node = reinterpret_cast<Node *>(arena->alignedAlloc(sizeof(Node), alignof(Node)));
+        node->next = nullptr;
+        node->data = data;
+        node->size = size;
+
+        if (state.tail != nullptr)
+            state.tail->next = node;
+        else
+            state.head = node;
+        state.tail = node;
+        ++state.num_rows;
+    }
+
+    void appendRow(State & state, const IColumn ** columns, size_t row_num, Arena * arena) const
+    {
+        const auto settings = IColumn::SerializationSettings::createForAggregationState();
+        const char * begin = nullptr;
+        size_t size = 0;
+        for (size_t i = 0; i < original_arg_types.size(); ++i)
+            size += columns[i]->serializeValueIntoArena(row_num, *arena, begin, &settings).size();
+        pushNode(state, begin, size, arena);
+    }
+
+    /// Flatten the rows of `num_groups` consecutive states into one column per argument.
+    MutableColumns materializeRows(const State * const * states, size_t num_groups) const
+    {
+        auto settings = IColumn::SerializationSettings::createForAggregationState();
+
+        size_t total_rows = 0;
+        for (size_t g = 0; g < num_groups; ++g)
+            total_rows += states[g]->num_rows;
+
+        MutableColumns columns;
+        columns.reserve(original_arg_types.size());
+        for (const auto & type : original_arg_types)
+        {
+            columns.push_back(type->createColumn());
+            columns.back()->reserve(total_rows);
+        }
+
+        for (size_t g = 0; g < num_groups; ++g)
+        {
+            for (const Node * node = states[g]->head; node != nullptr; node = node->next)
+            {
+                ReadBufferFromMemory in(node->data, node->size);
+                for (auto & column : columns)
+                    column->deserializeAndInsertFromArena(in, &settings);
+            }
+        }
+        return columns;
+    }
+
+    /// One WASM call for the whole batch: each argument becomes an Array(T) column with one
+    /// array element per group.
+    void executeOnGroups(const State * const * states, size_t num_groups, IColumn & to) const
+    {
+        auto columns = materializeRows(states, num_groups);
+
+        PaddedPODArray<UInt64> offsets;
+        offsets.reserve(num_groups);
+        UInt64 total = 0;
+        for (size_t g = 0; g < num_groups; ++g)
+        {
+            total += states[g]->num_rows;
+            offsets.push_back(total);
+        }
+
         Block block;
         for (size_t i = 0; i < original_arg_types.size(); ++i)
         {
-            auto offsets = ColumnUInt64::create();
-            offsets->insert(static_cast<UInt64>(state->num_rows));
-            auto array_col = ColumnArray::create((*state->columns)[i]->getPtr(), std::move(offsets));
+            auto offsets_col = ColumnArray::ColumnOffsets::create();
+            offsets_col->getData().assign(offsets);
+            auto array_col = ColumnArray::create(std::move(columns[i]), std::move(offsets_col));
             auto array_type = std::make_shared<DataTypeArray>(original_arg_types[i]);
             block.insert(ColumnWithTypeAndName(std::move(array_col), array_type, "arg" + std::to_string(i)));
         }
 
         auto compartment_entry = compartment_pool.acquire();
         StopSource stop_source;
-        auto result_col = wasm_function->executeOnBlock(&(*compartment_entry), block, context, /*num_rows=*/1, stop_source.get_token());
+        auto result_col = wasm_function->executeOnBlock(&(*compartment_entry), block, context, num_groups, stop_source.get_token());
 
-        if (result_col->empty())
+        if (result_col->size() != num_groups)
             throw Exception(ErrorCodes::WASM_ERROR,
-                "WASM aggregate function '{}' returned empty result", function_name);
+                "WASM aggregate function '{}' returned {} rows, expected {}",
+                function_name, result_col->size(), num_groups);
 
-        to.insertFrom(*result_col, 0);
+        to.insertRangeFrom(*result_col, 0, num_groups);
     }
-
-private:
-    struct State
-    {
-        MutableColumns * columns = nullptr;
-        size_t num_rows = 0;
-    };
 
     String function_name;
     std::shared_ptr<UserDefinedWebAssemblyFunction> wasm_function;
@@ -1515,35 +1625,61 @@ void UserDefinedWebAssemblyFunctionFactory::addOrReplace(RegisteredFunction regi
         is_aggregate,
         std::move(registered_function.accumulator_arg_types)});
 
-    if (is_aggregate && !AggregateFunctionFactory::instance().hasNameOrAlias(sql_name))
-    {
-        AggregateFunctionCreator wasm_aggregate_creator =
-            {[sql_name, accumulator_arg_types](const String &, const DataTypes &, const Array &, const Settings *) -> AggregateFunctionPtr
-             {
-                 ContextPtr ctx;
-                 if (CurrentThread::isInitialized())
-                     ctx = CurrentThread::get().tryGetQueryContext();
-                 return UserDefinedWebAssemblyFunctionFactory::instance().getAggregate(sql_name, accumulator_arg_types, ctx);
-             }};
-        AggregateFunctionFactory::instance().registerFunction(
-            sql_name,
-            AggregateFunctionWithProperties{wasm_aggregate_creator, FunctionDocumentation{}, AggregateFunctionProperties{}});
-    }
+    if (is_aggregate)
+        registerAggregateName(sql_name, accumulator_arg_types);
+}
+
+void UserDefinedWebAssemblyFunctionFactory::registerAggregateName(
+    const String & sql_name, const DataTypes & accumulator_arg_types)
+{
+    if (!aggregate_names.insert(sql_name).second)
+        return;
+    if (AggregateFunctionFactory::instance().hasNameOrAlias(sql_name))
+        return;
+
+    /// The creator resolves the WASM function on every call rather than capturing it, so the
+    /// registration stays valid across DROP + CREATE OR REPLACE of the underlying function.
+    AggregateFunctionCreator wasm_aggregate_creator =
+        {[sql_name, accumulator_arg_types](const String &, const DataTypes &, const Array &, const Settings *) -> AggregateFunctionPtr
+         {
+             ContextPtr ctx;
+             if (CurrentThread::isInitialized())
+                 ctx = CurrentThread::get().tryGetQueryContext();
+             return UserDefinedWebAssemblyFunctionFactory::instance().getAggregate(sql_name, accumulator_arg_types, ctx);
+         }};
+    AggregateFunctionFactory::instance().registerFunction(
+        sql_name,
+        AggregateFunctionWithProperties{wasm_aggregate_creator, FunctionDocumentation{}, AggregateFunctionProperties{}});
+}
+
+bool UserDefinedWebAssemblyFunctionFactory::ownsAggregateName(const String & function_name) const
+{
+    std::shared_lock lock(registry_mutex);
+    return aggregate_names.contains(function_name);
 }
 
 void UserDefinedWebAssemblyFunctionFactory::replaceAll(VectorWithMemoryTracking<RegisteredFunction> registered_functions)
 {
     UnorderedMapWithMemoryTracking<String, std::vector<RegistryEntry>> new_registry;
+    std::vector<std::pair<String, DataTypes>> aggregates;
     for (auto & registered_function : registered_functions)
+    {
+        if (registered_function.is_aggregate)
+            aggregates.emplace_back(registered_function.sql_name, registered_function.accumulator_arg_types);
         new_registry[registered_function.sql_name].push_back(RegistryEntry{
             std::move(registered_function.function),
             std::move(registered_function.original_arg_types),
             std::move(registered_function.create_query),
             registered_function.is_aggregate,
             std::move(registered_function.accumulator_arg_types)});
+    }
 
     std::unique_lock lock(registry_mutex);
     registry = std::move(new_registry);
+    /// Functions restored from storage at startup are registered here too; skipping this left
+    /// them callable only as scalar functions.
+    for (const auto & [sql_name, accumulator_arg_types] : aggregates)
+        registerAggregateName(sql_name, accumulator_arg_types);
 }
 
 bool UserDefinedWebAssemblyFunctionFactory::has(const String & function_name) const

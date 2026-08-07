@@ -156,7 +156,10 @@ static void checkCanBeRegistered(const ContextPtr & context, const String & func
     if (FunctionFactory::instance().hasNameOrAlias(function_name))
         throw Exception(ErrorCodes::FUNCTION_ALREADY_EXISTS, "The function '{}' already exists", function_name);
 
-    if (AggregateFunctionFactory::instance().hasNameOrAlias(function_name))
+    /// A name this factory itself handed to AggregateFunctionFactory is not a built-in, so
+    /// re-creating the WASM function behind it must stay possible.
+    if (AggregateFunctionFactory::instance().hasNameOrAlias(function_name)
+        && !UserDefinedWebAssemblyFunctionFactory::instance().ownsAggregateName(function_name)) /// NOLINT(readability-static-accessed-through-instance)
         throw Exception(ErrorCodes::FUNCTION_ALREADY_EXISTS, "The aggregate function '{}' already exists", function_name);
 
     if (UserDefinedExecutableFunctionFactory::instance().has(function_name, context)) /// NOLINT(readability-static-accessed-through-instance)
@@ -183,9 +186,11 @@ static void checkCanBeUnregistered(const ContextPtr & context, const String & fu
         throw Exception(ErrorCodes::CANNOT_DROP_FUNCTION, "Cannot drop system function '{}'", function_name);
 
     /// AggregateFunctionFactory check: skip if the function is a WASM user-defined function
-    /// (dual-registered in AggregateFunctionFactory but lives in the WASM factory).
+    /// (dual-registered in AggregateFunctionFactory but lives in the WASM factory). Asking
+    /// whether it is still in the WASM registry would be wrong — after one drop it is not,
+    /// and the name would then look like a built-in and be undroppable forever.
     if (AggregateFunctionFactory::instance().hasNameOrAlias(function_name)
-        && !UserDefinedWebAssemblyFunctionFactory::instance().has(function_name))
+        && !UserDefinedWebAssemblyFunctionFactory::instance().ownsAggregateName(function_name)) /// NOLINT(readability-static-accessed-through-instance)
         throw Exception(ErrorCodes::CANNOT_DROP_FUNCTION, "Cannot drop system function '{}'", function_name);
 
     if (UserDefinedExecutableFunctionFactory::instance().has(function_name, context)) // NOLINT(readability-static-accessed-through-instance)
