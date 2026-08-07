@@ -497,6 +497,26 @@ inline void writeColData(
         uint8_t * data_dst = buf.data() + desc.data_offset;
 
         unalignedStore<uint64_t>(wire_offsets, 0ull);
+        if (num_rows == 0)
+            return;
+
+        // ColumnString here is not zero-terminated (see ColumnString::sizeAt) and its
+        // offsets are cumulative end positions, which is exactly the wire layout: the
+        // wire is [0, off[0], off[1], ...] over a contiguous payload. So when the
+        // column starts at chars[0] the whole thing is two bulk copies rather than a
+        // memcpy and a store per row. For short values the per-row libc memcpy
+        // dispatch dominated this loop.
+        const uint64_t total_bytes = ch_offsets[num_rows - 1];
+        if (total_bytes == desc.data_size)
+        {
+            std::memcpy(wire_offsets + sizeof(uint64_t), ch_offsets.data(),
+                        static_cast<size_t>(num_rows) * sizeof(uint64_t));
+            std::memcpy(data_dst, chars.data(), total_bytes);
+            return;
+        }
+
+        // Offsets do not start at zero (a column sharing its chars buffer with a
+        // larger one): fall back to rebasing row by row.
         uint64_t wire_pos = 0ull;
         uint64_t ch_pos = 0ull;
         for (uint32_t i = 0; i < num_rows; ++i)
