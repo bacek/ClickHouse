@@ -297,6 +297,11 @@ public:
     ColumnPtr compress(bool force_compression) const override;
 
     void reserve(size_t n) override;
+
+    /// Reserve space for at least `n` bytes of string payload (chars array).
+    /// Distinct from reserve(n) which reserves n *rows* (offsets).
+    void reserveChars(size_t n);
+
     size_t capacity() const override;
     void prepareForSquashing(const VectorWithMemoryTracking<ColumnPtr> & source_columns, size_t factor) override;
     void shrinkToFit() override;

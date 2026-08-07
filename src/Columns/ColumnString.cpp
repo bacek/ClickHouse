@@ -616,6 +616,11 @@ void ColumnString::reserve(size_t n)
     offsets.reserve_exact(n);
 }
 
+void ColumnString::reserveChars(size_t n)
+{
+    chars.reserve_exact(n);
+}
+
 size_t ColumnString::capacity() const
 {
     return offsets.capacity();
