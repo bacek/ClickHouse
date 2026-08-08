@@ -1,3 +1,4 @@
+#include <unordered_map>
 #include <unordered_set>
 
 #include <Processors/Formats/Impl/Parquet/GeoFilter.h>
@@ -37,10 +38,19 @@ std::optional<SpatialFilter> tryExtractSpatialFilterFromNode(const ActionsDAG::N
     if (!node.function_base->isSpatialPredicate() || node.children.size() < 2)
         return std::nullopt;
 
+    /// Fail-closed: a predicate with more than one non-constant geometry input (e.g. a WASM
+    /// UDF opted in via `is_spatial_predicate = 1` with signature `f(left_geom, right_geom,
+    /// const_poly)`) could be true because of a geometry column whose bbox we never looked at;
+    /// pruning on just one input's bbox would incorrectly skip matching rows.
     const ActionsDAG::Node * col_node = nullptr;
     for (const auto * child : node.children)
-        if (child->type == ActionsDAG::ActionType::INPUT && !col_node)
-            col_node = child;
+    {
+        if (child->type != ActionsDAG::ActionType::INPUT)
+            continue;
+        if (col_node)
+            return std::nullopt;
+        col_node = child;
+    }
     if (!col_node || !sample_block.has(col_node->result_name))
         return std::nullopt;
 
@@ -142,6 +152,11 @@ bool rowGroupFailsSpatialFilters(
             continue;
 
         const auto & bbox = col_meta.geospatial_statistics.bbox;
+        /// Reject non-finite or inverted bounds: malformed metadata must not prune (fail closed).
+        if (!std::isfinite(bbox.xmin) || !std::isfinite(bbox.ymin) ||
+            !std::isfinite(bbox.xmax) || !std::isfinite(bbox.ymax) ||
+            bbox.xmin > bbox.xmax || bbox.ymin > bbox.ymax)
+            continue;
         bool disjoint = bbox.xmax < filter.query_xmin
                       || bbox.xmin > filter.query_xmax
                       || bbox.ymax < filter.query_ymin
@@ -174,8 +189,7 @@ std::shared_ptr<DB::KeyCondition> buildBboxKeyCondition(
 
     auto make_const = [&](double v, const String & name) -> const DB::ActionsDAG::Node &
     {
-        auto column = float64->createColumnConst(1, DB::Field(v));
-        return dag.addColumn(typeid_cast<const DB::ColumnConst &>(*column).getPtr(), float64, name);
+        return dag.addColumn(float64->createColumnConst(1, DB::Field(v)), float64, name);
     };
     const auto & c_qxmin = make_const(filter.query_xmin, "__bbox_q_xmin");
     const auto & c_qxmax = make_const(filter.query_xmax, "__bbox_q_xmax");
@@ -239,8 +253,7 @@ std::optional<std::pair<DB::ActionsDAG, String>> buildBboxRowFilterDAG(
     auto make_const = [&](double v) -> const DB::ActionsDAG::Node &
     {
         String name = "__bbox_const_" + std::to_string(const_idx++);
-        auto column = float64->createColumnConst(1, DB::Field(v));
-        return dag.addColumn(typeid_cast<const DB::ColumnConst &>(*column).getPtr(), float64, name);
+        return dag.addColumn(float64->createColumnConst(1, DB::Field(v)), float64, name);
     };
 
     const DB::ActionsDAG::Node * combined = nullptr;
@@ -278,4 +291,4 @@ std::optional<std::pair<DB::ActionsDAG, String>> buildBboxRowFilterDAG(
     return std::make_pair(std::move(dag), kOutputColName);
 }
 
-} // namespace DB::Parquet
+}

@@ -68,8 +68,10 @@ void registerInputFormatORC(FormatFactory & factory);
 void registerOutputFormatORC(FormatFactory & factory);
 void registerInputFormatParquet(FormatFactory & factory);
 void registerOutputFormatParquet(FormatFactory & factory);
+#if USE_ARROW
 void registerInputFormatArrow(FormatFactory & factory);
 void registerOutputFormatArrow(FormatFactory & factory);
+#endif
 void registerInputFormatAvro(FormatFactory & factory);
 void registerOutputFormatAvro(FormatFactory & factory);
 void registerInputFormatRawBLOB(FormatFactory & factory);
@@ -109,6 +111,7 @@ void registerInputFormatJSONAsObject(FormatFactory & factory);
 void registerInputFormatLineAsString(FormatFactory & factory);
 void registerInputFormatMySQLDump(FormatFactory & factory);
 void registerInputFormatParquetMetadata(FormatFactory & factory);
+void registerInputFormatPuffin(FormatFactory & factory);
 void registerInputFormatDWARF(FormatFactory & factory);
 void registerInputFormatOne(FormatFactory & factory);
 
@@ -121,7 +124,9 @@ void registerNonTrivialPrefixAndSuffixCheckerJSONEachRow(FormatFactory & factory
 void registerNonTrivialPrefixAndSuffixCheckerJSONAsString(FormatFactory & factory);
 void registerNonTrivialPrefixAndSuffixCheckerJSONAsObject(FormatFactory & factory);
 
+#if USE_ARROW
 void registerArrowSchemaReader(FormatFactory & factory);
+#endif
 void registerParquetSchemaReader(FormatFactory & factory);
 void registerORCSchemaReader(FormatFactory & factory);
 void registerTSVSchemaReader(FormatFactory & factory);
@@ -152,6 +157,7 @@ void registerTemplateSchemaReader(FormatFactory & factory);
 void registerMySQLSchemaReader(FormatFactory & factory);
 void registerBSONEachRowSchemaReader(FormatFactory & factory);
 void registerParquetMetadataSchemaReader(FormatFactory & factory);
+void registerPuffinSchemaReaders(FormatFactory & factory);
 void registerDWARFSchemaReader(FormatFactory & factory);
 void registerOneSchemaReader(FormatFactory & factory);
 void registerNpySchemaReader(FormatFactory & factory);
@@ -237,8 +243,10 @@ void registerFormats()
     registerOutputFormatParquet(factory);
     registerInputFormatAvro(factory);
     registerOutputFormatAvro(factory);
+#if USE_ARROW
     registerInputFormatArrow(factory);
     registerOutputFormatArrow(factory);
+#endif
     registerInputFormatNpy(factory);
     registerOutputFormatNpy(factory);
 
@@ -272,6 +280,7 @@ void registerFormats()
     registerInputFormatMySQLDump(factory);
 
     registerInputFormatParquetMetadata(factory);
+    registerInputFormatPuffin(factory);
     registerInputFormatDWARF(factory);
     registerInputFormatOne(factory);
 
@@ -279,7 +288,9 @@ void registerFormats()
     registerNonTrivialPrefixAndSuffixCheckerJSONAsString(factory);
     registerNonTrivialPrefixAndSuffixCheckerJSONAsObject(factory);
 
+#if USE_ARROW
     registerArrowSchemaReader(factory);
+#endif
     registerParquetSchemaReader(factory);
     registerORCSchemaReader(factory);
     registerTSVSchemaReader(factory);
@@ -311,6 +322,7 @@ void registerFormats()
     registerMySQLSchemaReader(factory);
     registerBSONEachRowSchemaReader(factory);
     registerParquetMetadataSchemaReader(factory);
+    registerPuffinSchemaReaders(factory);
     registerDWARFSchemaReader(factory);
     registerOneSchemaReader(factory);
     registerNpySchemaReader(factory);

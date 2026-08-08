@@ -25,6 +25,7 @@ enum class GeoEncoding : uint8_t
 enum class GeoType : uint8_t
 {
     Point,
+    MultiPoint,
     LineString,
     Polygon,
     MultiLineString,
@@ -36,8 +37,8 @@ enum class GeoType : uint8_t
 
 struct GeoColumnMetadata
 {
-    GeoEncoding encoding;
-    GeoType type;
+    GeoEncoding encoding = GeoEncoding::WKT;
+    GeoType type = GeoType::Mixed;
 
     /// GeoParquet covering.bbox: names of the four Float64 scalar columns that store per-row
     /// bounding box coordinates. Row group min/max statistics on these columns give the spatial
@@ -61,6 +62,6 @@ DataTypePtr getGeoDataType(GeoType type);
 /// `col` must match getGeoDataType(type). Create it using getGeoDataType(type)->createColumn().
 void appendObjectToGeoColumn(const GeometricObject & object, GeoType type, IColumn & col);
 
-GeometricObject parseWKTFormat(ReadBuffer & in_buffer);
+GeometricObject parseWKTFormat(ReadBuffer & in_buffer, bool precise_float_parsing);
 
 }

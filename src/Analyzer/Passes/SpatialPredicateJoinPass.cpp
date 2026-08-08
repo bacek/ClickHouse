@@ -20,8 +20,8 @@ bool findInTableExpression(const QueryTreeNodePtr & source, const QueryTreeNodeP
     if (source->isEqual(*table_expression))
         return true;
     if (const auto * join_node = table_expression->as<JoinNode>())
-        return findInTableExpression(source, join_node->getLeftTableExpression())
-            || findInTableExpression(source, join_node->getRightTableExpression());
+        return findInTableExpression(source, join_node->getLeftTableExpressionNode())
+            || findInTableExpression(source, join_node->getRightTableExpressionNode());
     return false;
 }
 
@@ -104,7 +104,7 @@ public:
         if (!where_node)
             return;
 
-        auto & join_tree_node = query_node->getJoinTree();
+        auto & join_tree_node = query_node->getJoinTreeNode();
         if (!join_tree_node || join_tree_node->getNodeType() != QueryTreeNodeType::CROSS_JOIN)
             return;
 
@@ -141,7 +141,7 @@ public:
 
         join_node->crossToInner(spatial_conditions[0]);
 
-        query_node->getJoinTree() = std::move(join_node);
+        query_node->getJoinTreeNode() = std::move(join_node);
 
         /// Rebuild WHERE from remaining conditions.
         if (other_conditions.empty())

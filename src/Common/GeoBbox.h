@@ -33,10 +33,11 @@ struct BboxAccumulator
     double xmax = -std::numeric_limits<double>::infinity();
     double ymax = -std::numeric_limits<double>::infinity();
     bool found = false;
+    bool valid = true; // false if any non-finite coordinate was seen; pruning must fail closed
 
     void add(double x, double y)
     {
-        if (!std::isfinite(x) || !std::isfinite(y)) return;
+        if (!std::isfinite(x) || !std::isfinite(y)) { valid = false; return; }
         xmin = std::min(xmin, x);
         ymin = std::min(ymin, y);
         xmax = std::max(xmax, x);
@@ -88,11 +89,86 @@ void collectSpatialFiltersConjunctive(
         result.push_back(std::move(*filter));
 }
 
+namespace GeoBboxDetail
+{
+
+inline std::optional<double> fieldToDouble(const Field & f)
+{
+    switch (f.getType())
+    {
+        case Field::Types::Float64: return f.safeGet<Float64>();
+        case Field::Types::Int64:   return static_cast<double>(f.safeGet<Int64>());
+        case Field::Types::UInt64:  return static_cast<double>(f.safeGet<UInt64>());
+        default: return std::nullopt;
+    }
+}
+
+/// A ring is an Array whose every element is a Tuple(x, y) — the native
+/// `pointInPolygon`/`polygonsIntersect`/`polygonsWithin` literal syntax `[(x1, y1), ...]`.
+inline bool isRingArray(const Array & array)
+{
+    return !array.empty() && std::ranges::all_of(array, [](const Field & e) { return e.getType() == Field::Types::Tuple; });
+}
+
+/// A polygon (with holes) is an Array of rings: the first is the shell, the rest are holes.
+inline bool isPolygonArray(const Array & array)
+{
+    return !array.empty() && std::ranges::all_of(array, [](const Field & e)
+    {
+        return e.getType() == Field::Types::Array && isRingArray(e.safeGet<Array>());
+    });
+}
+
+/// A multipolygon is an Array of polygons.
+inline bool isMultiPolygonArray(const Array & array)
+{
+    return !array.empty() && std::ranges::all_of(array, [](const Field & e)
+    {
+        return e.getType() == Field::Types::Array && isPolygonArray(e.safeGet<Array>());
+    });
+}
+
+/// Append the points of `array` (a ring, per `isRingArray`) to `out_ring`. Returns false if any
+/// element is not a well-formed 2D point.
+inline bool appendRing(const Array & array, Polygon<CartesianPoint>::ring_type & out_ring)
+{
+    for (const auto & elem : array)
+    {
+        const auto & tuple = elem.safeGet<Tuple>();
+        if (tuple.size() < 2)
+            return false;
+        auto x = fieldToDouble(tuple[0]);
+        auto y = fieldToDouble(tuple[1]);
+        if (!x.has_value() || !y.has_value())
+            return false;
+        out_ring.emplace_back(*x, *y);
+    }
+    return true;
+}
+
+/// Build a full Polygon (shell + holes) from `array` (per `isPolygonArray`). Returns false if any
+/// ring is malformed.
+inline bool buildPolygon(const Array & array, Polygon<CartesianPoint> & out_polygon)
+{
+    if (!appendRing(array[0].safeGet<Array>(), out_polygon.outer()))
+        return false;
+    for (size_t i = 1; i < array.size(); ++i)
+    {
+        out_polygon.inners().emplace_back();
+        if (!appendRing(array[i].safeGet<Array>(), out_polygon.inners().back()))
+            return false;
+    }
+    return true;
+}
+
+}
+
 /// Extract bbox from a single Field value (not a column).
 /// Handles Tuple (native geometry points), Array (nested geometry collections),
 /// and String (WKB-encoded geometry).
 static bool extractBboxFromFieldValue(const Field & field, BboxAccumulator & acc)
 {
+    using namespace GeoBboxDetail;
     const auto type = field.getType();
 
     /// Tuple with at least two numeric elements — a single point.
@@ -103,16 +179,6 @@ static bool extractBboxFromFieldValue(const Field & field, BboxAccumulator & acc
         const auto & tuple = field.safeGet<Tuple>();
         if (tuple.size() >= 2)
         {
-            auto fieldToDouble = [](const Field & f) -> std::optional<double>
-            {
-                switch (f.getType())
-                {
-                    case Field::Types::Float64: return f.safeGet<Float64>();
-                    case Field::Types::Int64:   return static_cast<double>(f.safeGet<Int64>());
-                    case Field::Types::UInt64:  return static_cast<double>(f.safeGet<UInt64>());
-                    default: return std::nullopt;
-                }
-            };
             auto x = fieldToDouble(tuple[0]);
             auto y = fieldToDouble(tuple[1]);
             if (x.has_value() && y.has_value())
@@ -125,6 +191,73 @@ static bool extractBboxFromFieldValue(const Field & field, BboxAccumulator & acc
     if (type == Field::Types::Array)
     {
         const auto & array = field.safeGet<Array>();
+
+        /// Ring / polygon (with holes) / multipolygon literals must be validated the same way
+        /// `parseConstPolygon`/`parseConstMultiPolygon` validate them at execute time (assembled
+        /// shell + holes, `bg::correct` + `bg::is_valid`), not ring-by-ring in isolation — a hole
+        /// entirely outside its shell is invalid even though each ring is individually simple.
+        if (isRingArray(array))
+        {
+            Polygon<CartesianPoint> polygon;
+            if (!appendRing(array, polygon.outer()))
+            {
+                acc.valid = false;
+                return false;
+            }
+            boost::geometry::correct(polygon);
+            std::string failure_message;
+            if (!boost::geometry::is_valid(polygon, failure_message))
+            {
+                acc.valid = false;
+                return false;
+            }
+            acc.addAll(polygon.outer());
+            return acc.found;
+        }
+
+        if (isPolygonArray(array))
+        {
+            Polygon<CartesianPoint> polygon;
+            if (!buildPolygon(array, polygon))
+            {
+                acc.valid = false;
+                return false;
+            }
+            boost::geometry::correct(polygon);
+            std::string failure_message;
+            if (!boost::geometry::is_valid(polygon, failure_message))
+            {
+                acc.valid = false;
+                return false;
+            }
+            acc.addAll(polygon.outer());
+            return acc.found;
+        }
+
+        if (isMultiPolygonArray(array))
+        {
+            MultiPolygon<CartesianPoint> multi_polygon;
+            for (const auto & poly_elem : array)
+            {
+                multi_polygon.emplace_back();
+                if (!buildPolygon(poly_elem.safeGet<Array>(), multi_polygon.back()))
+                {
+                    acc.valid = false;
+                    return false;
+                }
+            }
+            boost::geometry::correct(multi_polygon);
+            std::string failure_message;
+            if (!boost::geometry::is_valid(multi_polygon, failure_message))
+            {
+                acc.valid = false;
+                return false;
+            }
+            for (const auto & poly : multi_polygon)
+                acc.addAll(poly.outer());
+            return acc.found;
+        }
+
         for (const auto & elem : array)
             extractBboxFromFieldValue(elem, acc);
         return acc.found;
@@ -146,6 +279,8 @@ static bool extractBboxFromFieldValue(const Field & field, BboxAccumulator & acc
                     acc.addAll(g);
                 else if constexpr (std::is_same_v<T, Polygon<CartesianPoint>>)
                     acc.addAll(g.outer());
+                else if constexpr (std::is_same_v<T, MultiPoint<CartesianPoint>>)
+                    acc.addAll(g);
                 else if constexpr (std::is_same_v<T, MultiLineString<CartesianPoint>>)
                     for (const auto & ls : g)
                         acc.addAll(ls);
@@ -188,7 +323,7 @@ inline bool tryExtractBboxFromColumn(
     {
         Field field;
         data_col->get(0, field);
-        if (!extractBboxFromFieldValue(field, acc))
+        if (!extractBboxFromFieldValue(field, acc) || !acc.valid)
             return false;
     }
     else
@@ -199,6 +334,8 @@ inline bool tryExtractBboxFromColumn(
             Field field;
             data_col->get(i, field);
             extractBboxFromFieldValue(field, acc);
+            if (!acc.valid)
+                return false;
         }
     }
 
@@ -206,7 +343,7 @@ inline bool tryExtractBboxFromColumn(
     ymin = acc.ymin;
     xmax = acc.xmax;
     ymax = acc.ymax;
-    return true;
+    return acc.found;
 }
 
 }

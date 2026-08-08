@@ -90,7 +90,7 @@ public:
         if (!query_node)
             return;
 
-        auto & join_tree = query_node->getJoinTree();
+        auto & join_tree = query_node->getJoinTreeNode();
         if (!join_tree || join_tree->getNodeType() != QueryTreeNodeType::JOIN)
             return;
 
@@ -99,7 +99,7 @@ public:
         if (outer_join.getKind() != JoinKind::Inner || !outer_join.isOnJoinExpression())
             return;
 
-        auto & outer_left = outer_join.getLeftTableExpression();
+        auto & outer_left = outer_join.getLeftTableExpressionNode();
         if (!outer_left || outer_left->getNodeType() != QueryTreeNodeType::JOIN)
             return;
 
@@ -119,20 +119,20 @@ public:
         /// Handle both orderings:
         ///   FROM probe JOIN dim ON ... JOIN dim ON ...  → dim on RIGHT of inner join
         ///   FROM dim JOIN probe ON ... JOIN dim ON ...  → dim on LEFT of inner join
-        auto & outer_dim = outer_join.getRightTableExpression();
+        auto & outer_dim = outer_join.getRightTableExpressionNode();
 
         QueryTreeNodePtr * inner_dim_ptr  = nullptr;
         QueryTreeNodePtr * probe_ptr      = nullptr;
 
-        if (samePhysicalData(inner_join.getRightTableExpression(), outer_dim))
+        if (samePhysicalData(inner_join.getRightTableExpressionNode(), outer_dim))
         {
-            inner_dim_ptr = &inner_join.getRightTableExpression();
-            probe_ptr     = &inner_join.getLeftTableExpression();
+            inner_dim_ptr = &inner_join.getRightTableExpressionNode();
+            probe_ptr     = &inner_join.getLeftTableExpressionNode();
         }
-        else if (samePhysicalData(inner_join.getLeftTableExpression(), outer_dim))
+        else if (samePhysicalData(inner_join.getLeftTableExpressionNode(), outer_dim))
         {
-            inner_dim_ptr = &inner_join.getLeftTableExpression();
-            probe_ptr     = &inner_join.getRightTableExpression();
+            inner_dim_ptr = &inner_join.getLeftTableExpressionNode();
+            probe_ptr     = &inner_join.getRightTableExpressionNode();
         }
         else
             return;
@@ -153,7 +153,7 @@ public:
 
         /// Annotate the join pair.
         inner_join.is_fused_child = true;
-        inner_join.fused_probe_on_right = (probe_ptr == &inner_join.getRightTableExpression());
+        inner_join.fused_probe_on_right = (probe_ptr == &inner_join.getRightTableExpressionNode());
         outer_join.fused_spatial_info = JoinNode::FusedSpatialInfo{
             .first_probe_col_name    = first_probe_col,
             .probe_table_node        = probe,

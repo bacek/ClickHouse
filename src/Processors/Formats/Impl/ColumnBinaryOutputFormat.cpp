@@ -9,10 +9,18 @@
 #include <Columns/ColumnNullable.h>
 
 #include <Common/typeid_cast.h>
+#include <Common/Exception.h>
 #include <Formats/ColumnarV1Wire.h>
+
+#include <limits>
 
 namespace DB
 {
+
+namespace ErrorCodes
+{
+    extern const int INCORRECT_DATA;
+}
 
 // TODO(ColumnBinary settings): add a FormatSettings knob for diagnostics/benchmarking:
 //   column_binary_disable_preallocation  — return std::nullopt here to fall through to
@@ -27,7 +35,17 @@ std::optional<uint64_t> ColumnBinaryOutputFormat::precomputeSerializedSize(const
     if (rows == 0 || block.columns() == 0)
         return std::nullopt;
 
-    uint64_t cursor = ColumnarV1::COLUMNAR_HEADER_BYTES + block.columns() * ColumnarV1::COLUMNAR_DESC_BYTES;
+    // The frame header's num_rows field is a uint32_t, and buildColDescriptor's row-count
+    // arithmetic (e.g. (num_rows + 1) for String/Array offsets) is only overflow-safe up to
+    // UINT32_MAX; reject before the narrowing cast below, rather than silently truncating
+    // (and, above 2^32, wrapping the +1 and under-sizing the frame).
+    if (rows >= std::numeric_limits<uint32_t>::max())
+        throw Exception(ErrorCodes::INCORRECT_DATA,
+            "ColumnBinary: block has {} rows, exceeding the maximum representable row count ({})",
+            rows, std::numeric_limits<uint32_t>::max());
+
+    const uint64_t hdr_desc_size = ColumnarV1::COLUMNAR_HEADER_BYTES + block.columns() * ColumnarV1::COLUMNAR_DESC_BYTES;
+    uint64_t cursor = hdr_desc_size;
 
     for (size_t i = 0; i < block.columns(); ++i)
     {
@@ -43,6 +61,17 @@ std::optional<uint64_t> ColumnBinaryOutputFormat::precomputeSerializedSize(const
         cursor = ColumnarV1::buildColDescriptor(actual, is_const, is_nullable, col_rows, cursor, desc);
     }
 
+    // Callers that preallocate straight from this return value (e.g. the buffered WASM guest
+    // buffer) would otherwise allocate an oversized buffer before consume()'s equivalent check
+    // ever runs. Throw here too so an oversized frame is rejected before any allocation happens,
+    // not only before the actual write.
+    // 0 is the pre-existing-setting compatibility fallback and means "no cap", not a literal
+    // zero-byte limit — see the matching check in consume() below.
+    if (max_frame_size_ != 0 && cursor - hdr_desc_size > max_frame_size_)
+        throw Exception(ErrorCodes::INCORRECT_DATA,
+            "ColumnBinary: frame data size {} exceeds column_binary_max_frame_size limit {}",
+            cursor - hdr_desc_size, max_frame_size_);
+
     return cursor;
 }
 
@@ -51,11 +80,19 @@ void ColumnBinaryOutputFormat::consume(Chunk chunk)
     if (!chunk)
         return;
 
+    // See the matching check in precomputeSerializedSize: reject before the narrowing cast
+    // rather than silently truncating/wrapping the row count.
+    if (chunk.getNumRows() >= std::numeric_limits<uint32_t>::max())
+        throw Exception(ErrorCodes::INCORRECT_DATA,
+            "ColumnBinary: chunk has {} rows, exceeding the maximum representable row count ({})",
+            chunk.getNumRows(), std::numeric_limits<uint32_t>::max());
+
     uint32_t num_rows = static_cast<uint32_t>(chunk.getNumRows());
     uint32_t num_cols = static_cast<uint32_t>(std::min<size_t>(chunk.getNumColumns(), header_->columns()));
 
     // Layout pass: build descriptors (compute offsets and total size).
-    uint64_t cursor = ColumnarV1::COLUMNAR_HEADER_BYTES + num_cols * ColumnarV1::COLUMNAR_DESC_BYTES;
+    const uint64_t hdr_desc_size = ColumnarV1::COLUMNAR_HEADER_BYTES + num_cols * ColumnarV1::COLUMNAR_DESC_BYTES;
+    uint64_t cursor = hdr_desc_size;
 
     std::vector<ColumnarV1::ColDescriptor> descs(num_cols);
     for (uint32_t i = 0; i < num_cols; ++i)
@@ -69,6 +106,14 @@ void ColumnBinaryOutputFormat::consume(Chunk chunk)
         uint32_t col_rows = is_const ? 1u : num_rows;
         cursor = ColumnarV1::buildColDescriptor(actual, is_const, is_nullable, col_rows, cursor, descs[i]);
     }
+
+    // Mirror ColumnBinaryInputFormat's read-side check: reject before allocating/writing
+    // rather than emitting a frame the same setting would refuse to read back. 0 means
+    // "no cap" (the pre-existing-setting compatibility fallback), not a zero-byte limit.
+    if (max_frame_size_ != 0 && cursor - hdr_desc_size > max_frame_size_)
+        throw Exception(ErrorCodes::INCORRECT_DATA,
+            "ColumnBinary: frame data size {} exceeds column_binary_max_frame_size limit {}",
+            cursor - hdr_desc_size, max_frame_size_);
 
     // Get write destination: use the pre-allocated region in out when available,
     // otherwise fall back to a temporary buffer (e.g. when the caller did not
@@ -121,11 +166,17 @@ void ColumnBinaryOutputFormat::consume(Chunk chunk)
 }
 
 ColumnBinaryOutputFormat::ColumnBinaryOutputFormat(WriteBuffer & out_, SharedHeader header,
-                                                   bool disable_preallocation)
+                                                   bool disable_preallocation,
+                                                   UInt64 max_frame_size)
     : IOutputFormat(header, out_)
     , header_(header)
     , disable_preallocation_(disable_preallocation)
+    , max_frame_size_(max_frame_size)
 {
+    // Reject unsupported signatures (nested Nullable/Variant, Map, >8-byte fixed-width
+    // types) here so callers find out at format construction, not on the first block.
+    for (const auto & col : header_->getColumnsWithTypeAndName())
+        ColumnarV1::validateColumnarV1SupportedType(col.type);
 }
 
 void registerOutputFormatColumnBinary(FormatFactory & factory)
@@ -139,7 +190,8 @@ void registerOutputFormatColumnBinary(FormatFactory & factory)
         return std::make_shared<ColumnBinaryOutputFormat>(
             buf,
             std::make_shared<const Block>(sample),
-            format_settings.column_binary.disable_preallocation);
+            format_settings.column_binary.disable_preallocation,
+            format_settings.column_binary.max_frame_size);
     });
     factory.markOutputFormatSupportsParallelFormatting("ColumnBinary");
 }

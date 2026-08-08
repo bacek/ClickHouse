@@ -21,15 +21,18 @@
 
 #include <gtest/gtest.h>
 #include <cstring>
+#include <limits>
 #include <vector>
 
 #include <Columns/ColumnArray.h>
+#include <Columns/ColumnLowCardinality.h>
 #include <Columns/ColumnNullable.h>
 #include <Columns/ColumnString.h>
 #include <Columns/ColumnTuple.h>
 #include <Columns/ColumnVariant.h>
 #include <Columns/ColumnVector.h>
 #include <DataTypes/DataTypeArray.h>
+#include <DataTypes/DataTypeLowCardinality.h>
 #include <DataTypes/DataTypeNullable.h>
 #include <DataTypes/DataTypeString.h>
 #include <DataTypes/DataTypeTuple.h>
@@ -844,4 +847,258 @@ TEST(ColumnarV1Wire, BoundsCheckComplexDataEndTruncated)
 
     auto arr_type = std::make_shared<DataTypeArray>(std::make_shared<DataTypeUInt64>());
     EXPECT_THROW(readColumnarOutput({buf.data(), buf.size()}, arr_type, num_rows), DB::Exception);
+}
+
+// ── Malformed nullable descriptor: COL_IS_NULLABLE set but null_offset == 0 ──
+//
+// null_offset == 0 must never be treated as "no null map" for a nullable
+// descriptor (byte 0 is always occupied by the frame header, so it can never
+// be a real null-map location) — otherwise the decoder would silently return
+// a plain (non-nullable) column for a declared Nullable(T) result, which can
+// reach undefined behavior downstream (e.g. ColumnNullable::insertRangeFrom's
+// release-build assert_cast) instead of a clean parse error.
+
+TEST(ColumnarV1Wire, NullableDescriptorMissingNullMapRejected)
+{
+    const uint32_t num_rows = 3;
+    const uint32_t data_off = COLUMNAR_HEADER_BYTES + COLUMNAR_DESC_BYTES;
+
+    std::vector<uint8_t> buf(data_off + num_rows * 8u, 0);
+    uint32_t one = 1;
+    std::memcpy(buf.data(),     &num_rows, 4);
+    std::memcpy(buf.data() + 4, &one,      4);
+
+    ColDescriptor desc{};
+    desc.type        = COL_FIXED64 | COL_IS_NULLABLE;
+    desc.null_offset = 0;  // malformed: nullable bit set but no null map
+    desc.data_offset = data_off;
+    desc.data_size   = num_rows * 8u;
+    std::memcpy(buf.data() + COLUMNAR_HEADER_BYTES, &desc, COLUMNAR_DESC_BYTES);
+
+    auto result_type = std::make_shared<DataTypeNullable>(std::make_shared<DataTypeUInt64>());
+    EXPECT_THROW(readColumnarOutput({buf.data(), buf.size()}, result_type, num_rows),
+                 DB::Exception);
+}
+
+// ── Malformed nullable descriptor: COL_IS_NULLABLE set but declared type isn't
+// Nullable ────────────────────────────────────────────────────────────────────
+//
+// Must reject with a normal DB::Exception, not let a reference dynamic_cast
+// throw std::bad_cast (which callers expecting this function's clean
+// parse-error contract would not handle the same way).
+
+TEST(ColumnarV1Wire, NullableBitAgainstNonNullableDeclaredTypeRejected)
+{
+    const uint32_t num_rows = 3;
+    const uint32_t null_off = COLUMNAR_HEADER_BYTES + COLUMNAR_DESC_BYTES;
+    const uint32_t data_off = null_off + num_rows;
+
+    std::vector<uint8_t> buf(data_off + num_rows * 8u, 0);
+    uint32_t one = 1;
+    std::memcpy(buf.data(),     &num_rows, 4);
+    std::memcpy(buf.data() + 4, &one,      4);
+
+    ColDescriptor desc{};
+    desc.type        = COL_FIXED64 | COL_IS_NULLABLE;
+    desc.null_offset = null_off;
+    desc.data_offset = data_off;
+    desc.data_size   = num_rows * 8u;
+    std::memcpy(buf.data() + COLUMNAR_HEADER_BYTES, &desc, COLUMNAR_DESC_BYTES);
+
+    auto result_type = std::make_shared<DataTypeUInt64>();  // not Nullable, but wire says it is
+    EXPECT_THROW(readColumnarOutput({buf.data(), buf.size()}, result_type, num_rows),
+                 DB::Exception);
+}
+
+// ── LowCardinality(String) encoder/decoder: verify COL_LOWCARD wire shape ────
+//
+// Input: 4 rows — "a", "b", "a", "c". ColumnUnique reserves position 0 for the
+// implicit default (empty string) for String dictionaries, so dict_row_count
+// ends up as 4: "" (default), "a", "b", "c".
+
+TEST(ColumnarV1Wire, LowCardinalityStringEncodeDecodeRoundTrip)
+{
+    auto lowcard_type = std::make_shared<DataTypeLowCardinality>(std::make_shared<DataTypeString>());
+    auto lc_col = lowcard_type->createColumn();
+
+    auto full = ColumnString::create();
+    full->insertData("a", 1);
+    full->insertData("b", 1);
+    full->insertData("a", 1);
+    full->insertData("c", 1);
+
+    typeid_cast<ColumnLowCardinality &>(*lc_col).insertRangeFromFullColumn(*full, 0, full->size());
+
+    uint32_t num_rows = 4;
+    auto buf = encodeCHColumn(lc_col.get(), num_rows);
+    ColDescriptor desc = readDesc(buf);
+    EXPECT_EQ(desc.type, COL_LOWCARD);
+    EXPECT_EQ(desc.null_offset, 0u);  // unused: nullability lives inside the dictionary type
+
+    const uint8_t * header = buf.data() + desc.data_offset;
+    uint32_t dict_row_count = 0;
+    std::memcpy(&dict_row_count, header, 4);
+    uint8_t index_elem_width = header[4];
+    EXPECT_EQ(dict_row_count, 4u);
+    EXPECT_EQ(index_elem_width, 1u);  // small dictionary fits in a UInt8 index
+
+    // Index array at offsets_offset: one byte per row, referencing dictionary positions.
+    const uint8_t * idx = buf.data() + desc.offsets_offset;
+    EXPECT_EQ(idx[0], idx[2]);  // rows 0 and 2 are both "a" -> same dictionary position
+    EXPECT_NE(idx[0], idx[1]);  // "a" != "b"
+    EXPECT_NE(idx[0], idx[3]);  // "a" != "c"
+
+    auto decoded = readColumnarOutput({buf.data(), buf.size()}, lowcard_type, num_rows);
+    const auto * decoded_lc = typeid_cast<const ColumnLowCardinality *>(decoded.get());
+    ASSERT_NE(decoded_lc, nullptr);
+    ASSERT_EQ(decoded_lc->size(), 4u);
+    EXPECT_EQ(decoded_lc->getDataAt(0), "a");
+    EXPECT_EQ(decoded_lc->getDataAt(1), "b");
+    EXPECT_EQ(decoded_lc->getDataAt(2), "a");
+    EXPECT_EQ(decoded_lc->getDataAt(3), "c");
+}
+
+// ── Bounds check: wrapped offset must not bypass the check via integer overflow ──
+//
+// A malformed frame can set an offset field close to UINT64_MAX. The naive check
+// `offset + length > buf.size()` overflows the addition and wraps back into range,
+// trivially passing. The safe form checks `offset > buf.size()` first, then bounds
+// the length against the *remaining* space. These three cases exercise that pattern
+// at the null map, COL_BYTES offsets array, and COL_FIXED8 data sites.
+
+TEST(ColumnarV1Wire, BoundsCheckWrappedNullOffsetRejected)
+{
+    const uint32_t num_rows = 3;
+    const uint32_t data_off = COLUMNAR_HEADER_BYTES + COLUMNAR_DESC_BYTES;
+
+    std::vector<uint8_t> buf(data_off + num_rows * 8u, 0);
+    uint32_t one = 1;
+    std::memcpy(buf.data(),     &num_rows, 4);
+    std::memcpy(buf.data() + 4, &one,      4);
+
+    ColDescriptor desc{};
+    desc.type        = COL_FIXED64 | COL_IS_NULLABLE;
+    // null_offset + num_rows would wrap a naive uint64_t addition back under buf.size().
+    desc.null_offset = std::numeric_limits<uint64_t>::max() - 1;
+    desc.data_offset = data_off;
+    desc.data_size   = num_rows * 8u;
+    std::memcpy(buf.data() + COLUMNAR_HEADER_BYTES, &desc, COLUMNAR_DESC_BYTES);
+
+    auto result_type = std::make_shared<DataTypeNullable>(std::make_shared<DataTypeUInt64>());
+    EXPECT_THROW(readColumnarOutput({buf.data(), buf.size()}, result_type, num_rows), DB::Exception);
+}
+
+TEST(ColumnarV1Wire, BoundsCheckWrappedColBytesOffsetsOffsetRejected)
+{
+    const uint32_t num_rows  = 1;
+    const uint32_t data_off  = COLUMNAR_HEADER_BYTES + COLUMNAR_DESC_BYTES;
+    const uint32_t data_size = 1u;
+
+    std::vector<uint8_t> buf(data_off + data_size, 0);
+    uint32_t one = 1;
+    std::memcpy(buf.data(),     &num_rows, 4);
+    std::memcpy(buf.data() + 4, &one,      4);
+
+    ColDescriptor desc{};
+    desc.type = COL_BYTES;
+    // offsets_offset + (num_rows + 1) * 8 would wrap a naive uint64_t addition back
+    // under buf.size().
+    desc.offsets_offset = std::numeric_limits<uint64_t>::max() - 4;
+    desc.data_offset    = data_off;
+    desc.data_size      = data_size;
+    std::memcpy(buf.data() + COLUMNAR_HEADER_BYTES, &desc, COLUMNAR_DESC_BYTES);
+
+    auto result_type = std::make_shared<DataTypeString>();
+    EXPECT_THROW(readColumnarOutput({buf.data(), buf.size()}, result_type, num_rows), DB::Exception);
+}
+
+TEST(ColumnarV1Wire, BoundsCheckWrappedLowCardIndexOffsetsOffsetRejected)
+{
+    const uint32_t num_rows = 4;
+    constexpr uint64_t header_bytes = 4u + 4u + COLUMNAR_DESC_BYTES;
+    const uint32_t data_off = COLUMNAR_HEADER_BYTES + COLUMNAR_DESC_BYTES;
+
+    std::vector<uint8_t> buf(data_off + header_bytes, 0);
+    uint32_t one = 1;
+    std::memcpy(buf.data(),     &num_rows, 4);
+    std::memcpy(buf.data() + 4, &one,      4);
+
+    // Minimal COL_LOWCARD header: dict_row_count=1, index_elem_width=1, empty dict_desc
+    // (COL_BYTES, 0 rows, 0 bytes) so the dictionary decode itself succeeds trivially.
+    uint8_t * header = buf.data() + data_off;
+    uint32_t dict_row_count = 1;
+    std::memcpy(header, &dict_row_count, 4);
+    header[4] = 1;  // index_elem_width
+    ColDescriptor dict_desc{};
+    dict_desc.type        = COL_BYTES;
+    dict_desc.offsets_offset = data_off;  // 0-row COL_BYTES: offsets array is [0], within region
+    dict_desc.data_offset = data_off;
+    dict_desc.data_size   = 0;
+    std::memcpy(header + 8u, &dict_desc, COLUMNAR_DESC_BYTES);
+
+    ColDescriptor desc{};
+    desc.type = COL_LOWCARD;
+    // offsets_offset + num_rows * index_elem_width would wrap a naive uint64_t addition
+    // back under buf.size(), letting the index array read run past the frame.
+    desc.offsets_offset = std::numeric_limits<uint64_t>::max() - 2;
+    desc.data_offset = data_off;
+    desc.data_size   = header_bytes;
+    std::memcpy(buf.data() + COLUMNAR_HEADER_BYTES, &desc, COLUMNAR_DESC_BYTES);
+
+    auto result_type = std::make_shared<DataTypeLowCardinality>(std::make_shared<DataTypeString>());
+    EXPECT_THROW(readColumnarOutput({buf.data(), buf.size()}, result_type, num_rows), DB::Exception);
+}
+
+// ── COL_FIXED64 must reject a data_size that doesn't match the row count ─────
+//
+// desc.data_size claims 1 byte, but rows_to_dec (=num_rows) is 3, so the actual
+// memcpy would need 24 bytes. Without cross-checking data_size against
+// rows_to_dec * width, the buf.size()-relative bounds check alone would let this
+// read run into whatever bytes happen to follow within the frame.
+
+TEST(ColumnarV1Wire, BoundsCheckFixed64DataSizeMismatchRejected)
+{
+    const uint32_t num_rows = 3;
+    const uint32_t data_off = COLUMNAR_HEADER_BYTES + COLUMNAR_DESC_BYTES;
+
+    std::vector<uint8_t> buf(data_off + num_rows * 8u, 0);
+    uint32_t one = 1;
+    std::memcpy(buf.data(),     &num_rows, 4);
+    std::memcpy(buf.data() + 4, &one,      4);
+
+    ColDescriptor desc{};
+    desc.type        = COL_FIXED64;
+    desc.data_offset = data_off;
+    desc.data_size   = 1;  // should be num_rows * 8 = 24
+    std::memcpy(buf.data() + COLUMNAR_HEADER_BYTES, &desc, COLUMNAR_DESC_BYTES);
+
+    auto result_type = std::make_shared<DataTypeUInt64>();
+    EXPECT_THROW(readColumnarOutput({buf.data(), buf.size()}, result_type, num_rows), DB::Exception);
+}
+
+// ── readColumnarOutput must reject descriptors pointing into header/descriptor
+// metadata, matching ColumnBinaryInputFormat's equivalent check ────────────────
+//
+// data_offset = 0 points at the frame header instead of a real data section;
+// without this check, readColumnFromDesc would silently decode header bytes as
+// the column's payload instead of throwing.
+
+TEST(ColumnarV1Wire, OutputRejectsDataOffsetInsideHeader)
+{
+    const uint32_t num_rows = 1;
+    const uint32_t hdr_desc_size = COLUMNAR_HEADER_BYTES + COLUMNAR_DESC_BYTES;
+
+    std::vector<uint8_t> buf(hdr_desc_size, 0);
+    uint32_t one = 1;
+    std::memcpy(buf.data(),     &num_rows, 4);
+    std::memcpy(buf.data() + 4, &one,      4);
+
+    ColDescriptor desc{};
+    desc.type        = COL_FIXED64;
+    desc.data_offset = 0;  // points at the frame header, not a real data section
+    desc.data_size   = 8;
+    std::memcpy(buf.data() + COLUMNAR_HEADER_BYTES, &desc, COLUMNAR_DESC_BYTES);
+
+    auto result_type = std::make_shared<DataTypeUInt64>();
+    EXPECT_THROW(readColumnarOutput({buf.data(), buf.size()}, result_type, num_rows), DB::Exception);
 }
