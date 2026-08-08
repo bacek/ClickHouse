@@ -184,7 +184,15 @@ void StorageSystemFunctions::fillData(MutableColumns & res_columns, ContextPtr c
     const auto & aggregate_functions_factory = AggregateFunctionFactory::instance();
     const auto & aggregate_function_names = aggregate_functions_factory.getAllRegisteredNames();
     for (const auto & function_name : aggregate_function_names)
+    {
+        /// A WASM aggregate function registers a trampoline under its own name in
+        /// AggregateFunctionFactory, and that registration is never withdrawn. Emitting it here
+        /// would duplicate the `WasmUserDefined` row below, and would keep listing the name as a
+        /// built-in aggregate after the function has been dropped.
+        if (UserDefinedWebAssemblyFunctionFactory::instance().ownsAggregateName(function_name))
+            continue;
         fillRow(res_columns, function_name, 1, "", FunctionOrigin::SYSTEM, aggregate_functions_factory, context);
+    }
 
     const auto & user_defined_sql_functions_factory = UserDefinedSQLFunctionFactory::instance();
     const auto & user_defined_sql_functions_names = user_defined_sql_functions_factory.getAllRegisteredNames();
@@ -258,7 +266,7 @@ void StorageSystemFunctions::fillData(MutableColumns & res_columns, ContextPtr c
         }
 
         res_columns[0]->insert(registered.sql_name);
-        res_columns[1]->insert(UInt64(0)); // is_aggregate
+        res_columns[1]->insert(UInt64(registered.is_aggregate)); // is_aggregate
         res_columns[2]->insert(false); // case_insensitive
         res_columns[3]->insertDefault(); // alias_to
         res_columns[4]->insert(create_query);
