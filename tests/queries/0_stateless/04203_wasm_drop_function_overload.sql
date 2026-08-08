@@ -2,8 +2,10 @@
 
 -- Checks DROP FUNCTION with an explicit overload signature (Type1, Type2, ...)
 -- and verifies that argless DROP FUNCTION removes all overloads at once.
--- Uses (Int32, Int32) and (Int64, Int64) overloads because they map to distinct
--- WASM value kinds (i32 vs i64) and therefore do not coerce into each other.
+-- While both overloads are registered, each call selects its exact signature.
+-- After dropping the Int32 overload, Int32 args widen into the Int64 one --
+-- single-overload calls coerce rather than reject, see 04012_wasm_type_coercion_i64.
+-- This verifies per-signature DROP works correctly.
 
 SET allow_experimental_analyzer = 1;
 
@@ -31,8 +33,9 @@ SELECT wasm_add(toInt64(10), toInt64(5));
 -- Drop the Int32 overload by explicit signature
 DROP FUNCTION wasm_add(Int32, Int32);
 
--- Int32 overload is gone; Int64 overload still works
-SELECT wasm_add(toInt32(1), toInt32(2)); -- { serverError ILLEGAL_TYPE_OF_ARGUMENT }
+-- Int32 overload is gone; Int64 overload still works.
+-- Int32 args coerce to Int64 (widening allowed): 1+2=3
+SELECT wasm_add(toInt32(1), toInt32(2));
 SELECT wasm_add(toInt64(6), toInt64(7));
 
 -- Drop the remaining Int64 overload by explicit signature
