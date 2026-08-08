@@ -12,6 +12,7 @@
 #include <Parsers/ASTCreateWasmFunctionQuery.h>
 #include <Common/quoteString.h>
 
+#include <algorithm>
 #include <optional>
 
 namespace DB
@@ -52,6 +53,13 @@ namespace
             exception.addMessage(fmt::format("while loading user defined function {}", backQuote(function_name)));
             throw;
         }
+    }
+
+    /// A SQL function takes untyped lambda parameters, so it has no argument signature and
+    /// cannot take part in an overload set: its name is occupied for every signature.
+    bool isExclusiveOverName(const IAST & ast)
+    {
+        return ast.as<ASTCreateSQLFunctionQuery>() != nullptr;
     }
 }
 
@@ -125,16 +133,27 @@ bool UserDefinedSQLObjectsStorageBase::storeObject(
     std::lock_guard lock{mutex};
     auto sig = extractSignatureFromAST(*create_object_query);
     auto outer_it = object_overloads_map.find(object_name);
-    if (outer_it != object_overloads_map.end())
+    if (outer_it != object_overloads_map.end() && !outer_it->second.empty())
     {
-        auto inner_it = outer_it->second.find(sig);
-        if (inner_it != outer_it->second.end())
+        const bool exclusive_collision = isExclusiveOverName(*create_object_query)
+            || std::any_of(outer_it->second.begin(), outer_it->second.end(),
+                           [](const auto & stored) { return isExclusiveOverName(*stored.second); });
+
+        if (exclusive_collision || outer_it->second.contains(sig))
         {
             if (throw_if_exists)
                 throw Exception(ErrorCodes::FUNCTION_ALREADY_EXISTS,
                     "User-defined object '{}' already exists", object_name);
             if (!replace_if_exists)
                 return false;
+
+            /// The new definition cannot coexist with any of the stored ones, so replacing it
+            /// means dropping the whole overload set rather than one matching signature.
+            if (exclusive_collision)
+            {
+                removeObjectImpl(current_context, object_type, object_name, /*argument_type_names=*/{}, /*throw_if_not_exists=*/false);
+                object_overloads_map.erase(outer_it);
+            }
         }
     }
 

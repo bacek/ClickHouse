@@ -20,9 +20,6 @@
 
 #include <Parsers/ASTCreateSQLFunctionQuery.h>
 #include <Parsers/ASTCreateWasmFunctionQuery.h>
-#include <Parsers/ASTFunction.h>
-#include <Parsers/ASTIdentifier.h>
-#include <Parsers/ASTNameTypePair.h>
 #include <Parsers/IAST.h>
 #include <Parsers/parseQuery.h>
 #include <Parsers/ParserCreateFunctionQuery.h>
@@ -105,11 +102,10 @@ static String extractFunctionName(const ASTPtr & ast)
 {
     if (auto * wasm_query = ast->as<ASTCreateWasmFunctionQuery>())
         return wasm_query->getFunctionName();
+    /// `function_core` is the lambda body, whose ASTFunction name is the literal "lambda" --
+    /// the SQL name lives in `function_name`, so ask the query for it.
     if (auto * sql_query = ast->as<ASTCreateSQLFunctionQuery>())
-    {
-        if (auto * func = sql_query->function_core->as<ASTFunction>())
-            return func->name;
-    }
+        return sql_query->getFunctionName();
     return {};
 }
 
@@ -122,21 +118,8 @@ static Strings extractArgumentTypeNames(const ASTPtr & ast)
         for (const auto & arg_type : def.argument_types)
             types.push_back(arg_type->getName());
     }
-    else if (auto * sql_query = ast->as<ASTCreateSQLFunctionQuery>())
-    {
-        if (auto * func = sql_query->function_core->as<ASTFunction>())
-        {
-            const auto & args = func->arguments->children;
-            for (size_t i = 0; i + 1 < args.size(); ++i)
-            {
-                const auto * pair = args[i]->as<ASTNameTypePair>();
-                if (pair)
-                    types.push_back(pair->type->as<ASTIdentifier &>().name());
-                else
-                    types.push_back(args[i]->as<ASTIdentifier &>().name());
-            }
-        }
-    }
+    /// SQL UDF parameters are untyped lambda arguments, so such a function has no argument
+    /// type signature at all and always occupies the single empty-signature overload slot.
     return types;
 }
 
