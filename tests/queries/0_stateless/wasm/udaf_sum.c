@@ -9,18 +9,19 @@
  *   count_f64_msgpack - counts elements in Array(Float64) → Float64
  *
  * When registered with SETTINGS is_aggregate = 1, ClickHouse accumulates rows
- * per GROUP BY key, then calls this function once at finalize with a one-row
- * block where the single column is Array(Float64).
+ * per GROUP BY key, then calls this function once at finalize with a block whose
+ * single Array(Float64) column holds one array per group. The call must return
+ * exactly `n_rows` values, one per group.
  *
- * RowBinary encoding of Array(Float64):
+ * RowBinary encoding of one Array(Float64) row:
  *   - ULeb128 array length N
  *   - N * 8 bytes little-endian IEEE-754 doubles
- * Output: 8 bytes little-endian double.
+ * Output: n_rows * 8 bytes little-endian double.
  *
- * MsgPack encoding of Array(Float64):
+ * MsgPack encoding of one Array(Float64) row:
  *   - fixarray (0x9N, N≤15) / array16 (0xdc NN NN) / array32 (0xdd NN NN NN NN)
  *   - N * (0xcb + 8 bytes big-endian IEEE-754 double)
- * Output: 0xcb + 8 bytes big-endian double.
+ * Output: n_rows * (0xcb + 8 bytes big-endian double).
  */
 
 #include <stdint.h>
@@ -76,46 +77,59 @@ static uint64_t read_uleb128(const uint8_t ** p)
     return result;
 }
 
-/* Sum all Float64 values from an Array(Float64) column (RowBinary, 1 row).
- * Returns a RowBinary-encoded Float64 result (8 bytes). */
+/* Sum the Float64 values of each array in an Array(Float64) column (RowBinary).
+ * Returns one RowBinary-encoded Float64 per input row (8 bytes each). */
 Span * sum_f64(Span * span, uint32_t n_rows)
 {
-    (void)n_rows;
     const uint8_t * p = span->data;
 
-    uint64_t arr_size = read_uleb128(&p);
-
-    double sum = 0.0;
-    for (uint64_t i = 0; i < arr_size; ++i)
-    {
-        double val;
-        __builtin_memcpy(&val, p, 8);
-        p += 8;
-        sum += val;
-    }
-
-    Span * res = clickhouse_create_buffer(8);
+    Span * res = clickhouse_create_buffer(n_rows * 8);
     if (!res)
         return NULL;
-    __builtin_memcpy(res->data, &sum, 8);
-    res->size = 8;
+    uint8_t * out = res->data;
+
+    for (uint32_t row = 0; row < n_rows; ++row)
+    {
+        uint64_t arr_size = read_uleb128(&p);
+
+        double sum = 0.0;
+        for (uint64_t i = 0; i < arr_size; ++i)
+        {
+            double val;
+            __builtin_memcpy(&val, p, 8);
+            p += 8;
+            sum += val;
+        }
+
+        __builtin_memcpy(out, &sum, 8);
+        out += 8;
+    }
+
+    res->size = n_rows * 8;
     return res;
 }
 
-/* Count elements in an Array(Float64) column (RowBinary) — returns length as Float64. */
+/* Count elements of each array in an Array(Float64) column (RowBinary) — lengths as Float64. */
 Span * count_f64(Span * span, uint32_t n_rows)
 {
-    (void)n_rows;
     const uint8_t * p = span->data;
 
-    uint64_t arr_size = read_uleb128(&p);
-    double count = (double)arr_size;
-
-    Span * res = clickhouse_create_buffer(8);
+    Span * res = clickhouse_create_buffer(n_rows * 8);
     if (!res)
         return NULL;
-    __builtin_memcpy(res->data, &count, 8);
-    res->size = 8;
+    uint8_t * out = res->data;
+
+    for (uint32_t row = 0; row < n_rows; ++row)
+    {
+        uint64_t arr_size = read_uleb128(&p);
+        p += arr_size * 8;
+
+        double count = (double)arr_size;
+        __builtin_memcpy(out, &count, 8);
+        out += 8;
+    }
+
+    res->size = n_rows * 8;
     return res;
 }
 
@@ -173,41 +187,51 @@ static void write_msgpack_f64(uint8_t ** p, double v)
     *(*p)++ = (uint8_t) bits;
 }
 
-/* Sum all Float64 values from an Array(Float64) column (MsgPack, 1 row).
- * Returns a MsgPack-encoded Float64 result (0xcb + 8 bytes). */
+/* Sum the Float64 values of each array in an Array(Float64) column (MsgPack).
+ * Returns one MsgPack-encoded Float64 per input row (0xcb + 8 bytes each). */
 Span * sum_f64_msgpack(Span * span, uint32_t n_rows)
 {
-    (void)n_rows;
     const uint8_t * p = span->data;
 
-    uint32_t arr_size = read_msgpack_array_len(&p);
-
-    double sum = 0.0;
-    for (uint32_t i = 0; i < arr_size; ++i)
-        sum += read_msgpack_f64(&p);
-
-    Span * res = clickhouse_create_buffer(9);
+    Span * res = clickhouse_create_buffer(n_rows * 9);
     if (!res)
         return NULL;
     uint8_t * out = res->data;
-    write_msgpack_f64(&out, sum);
-    res->size = 9;
+
+    for (uint32_t row = 0; row < n_rows; ++row)
+    {
+        uint32_t arr_size = read_msgpack_array_len(&p);
+
+        double sum = 0.0;
+        for (uint32_t i = 0; i < arr_size; ++i)
+            sum += read_msgpack_f64(&p);
+
+        write_msgpack_f64(&out, sum);
+    }
+
+    res->size = n_rows * 9;
     return res;
 }
 
-/* Count elements in an Array(Float64) column (MsgPack) — returns length as Float64. */
+/* Count elements of each array in an Array(Float64) column (MsgPack) — lengths as Float64. */
 Span * count_f64_msgpack(Span * span, uint32_t n_rows)
 {
-    (void)n_rows;
     const uint8_t * p = span->data;
 
-    uint32_t arr_size = read_msgpack_array_len(&p);
-
-    Span * res = clickhouse_create_buffer(9);
+    Span * res = clickhouse_create_buffer(n_rows * 9);
     if (!res)
         return NULL;
     uint8_t * out = res->data;
-    write_msgpack_f64(&out, (double)arr_size);
-    res->size = 9;
+
+    for (uint32_t row = 0; row < n_rows; ++row)
+    {
+        uint32_t arr_size = read_msgpack_array_len(&p);
+        for (uint32_t i = 0; i < arr_size; ++i)
+            read_msgpack_f64(&p);
+
+        write_msgpack_f64(&out, (double)arr_size);
+    }
+
+    res->size = n_rows * 9;
     return res;
 }

@@ -74,6 +74,12 @@ SELECT count() FROM system.functions WHERE name IN ('wasm_udaf_sum', 'wasm_udaf_
 EOF
 
 # ---- MsgPack serialization format ----
+${CLICKHOUSE_CLIENT} << 'EOF'
+DROP FUNCTION IF EXISTS wasm_udaf_sum_msgpack;
+DROP FUNCTION IF EXISTS wasm_udaf_count_msgpack;
+DELETE FROM system.webassembly_modules WHERE name = 'udaf_msgpack_test';
+EOF
+
 cat "${CUR_DIR}/wasm/udaf_sum.wasm" | ${CLICKHOUSE_CLIENT} \
     --query "INSERT INTO system.webassembly_modules (name, code) SELECT 'udaf_msgpack_test', code FROM input('code String') FORMAT RawBlob"
 
