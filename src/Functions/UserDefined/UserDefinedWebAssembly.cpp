@@ -602,14 +602,12 @@ public:
             timer_ser.reset();
 
             // ── Invoke WASM ──────────────────────────────────────────────────
-            WasmPtr result_ptr = 0;
-            {
-                ProfileEventTimeIncrement<Microseconds> timer_exec(ProfileEvents::WasmGuestExecuteMicroseconds);
-                result_ptr = compartment->invoke<WasmPtr>(
-                    col_function_name,
-                    {wasm_input.getHandle(), static_cast<WasmSizeT>(input_rows_count)},
-                    stop_token);
-            }
+            // The guest call is timed by the runtime itself (WasmGuestExecuteMicroseconds
+            // is incremented inside WasmCompartment::invoke), so it is not wrapped here.
+            WasmPtr result_ptr = compartment->invoke<WasmPtr>(
+                col_function_name,
+                {wasm_input.getHandle(), static_cast<WasmSizeT>(input_rows_count)},
+                stop_token);
 
             if (result_ptr == 0)
                 throw Exception(ErrorCodes::WASM_ERROR,
@@ -2749,7 +2747,11 @@ public:
         }
 
         {
-            ProfileEventTimeIncrement<Microseconds> timer_ser(ProfileEvents::WasmSerializationMicroseconds);
+            // Stopped explicitly before the guest call below, so that marshalling is not
+            // credited with the execution time. The buffers have to stay alive across both,
+            // which is why the timer is optional instead of scoped to a block.
+            std::optional<ProfileEventTimeIncrement<Microseconds>> timer_ser;
+            timer_ser.emplace(ProfileEvents::WasmSerializationMicroseconds);
 
             // Allocate two separate WASM buffers.
             WasmMemoryGuard wasm_chain = allocateInWasmMemory(wmm.get(), static_cast<uint32_t>(chain_bytes.size()));
@@ -2768,6 +2770,8 @@ public:
 
             for (uint32_t ci = 0; ci < num_cols; ++ci)
                 writeColData(inner_cols[ci], is_nullable_flags[ci], row_counts[ci], descs[ci], row_mem);
+
+            timer_ser.reset();
 
             // ── Invoke clickhouse_chain_execute(chain_buf, row_buf, n) ───────
             auto result_ptr = compartment_ptr->invoke<WasmPtr>(
