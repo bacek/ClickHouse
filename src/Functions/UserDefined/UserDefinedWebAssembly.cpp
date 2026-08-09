@@ -73,6 +73,7 @@ namespace ProfileEvents
 extern const Event WasmTotalExecuteMicroseconds;
 extern const Event WasmSerializationMicroseconds;
 extern const Event WasmDeserializationMicroseconds;
+extern const Event WasmGuestExecuteMicroseconds;
 }
 
 
@@ -563,7 +564,11 @@ public:
 
         // ── Allocate buffer in WASM memory ───────────────────────────────────
         {
-            ProfileEventTimeIncrement<Microseconds> timer_ser(ProfileEvents::WasmSerializationMicroseconds);
+            // Stopped explicitly before the guest call below, so that serialization and
+            // execution are attributed separately. The buffer has to stay alive across
+            // both, which is why the timer is optional instead of scoped to a block.
+            std::optional<ProfileEventTimeIncrement<Microseconds>> timer_ser;
+            timer_ser.emplace(ProfileEvents::WasmSerializationMicroseconds);
 
             auto wmm = std::make_unique<WasmMemoryManagerV01>(compartment, stop_token);
             WasmMemoryGuard wasm_input = allocateInWasmMemory(wmm.get(), total_buf_size);
@@ -594,11 +599,17 @@ public:
                 writeColData(inner_cols[ci], is_nullable_flags[ci], row_counts[ci],
                              descs[ci], wasm_mem);
 
+            timer_ser.reset();
+
             // ── Invoke WASM ──────────────────────────────────────────────────
-            auto result_ptr = compartment->invoke<WasmPtr>(
-                col_function_name,
-                {wasm_input.getHandle(), static_cast<WasmSizeT>(input_rows_count)},
-                stop_token);
+            WasmPtr result_ptr = 0;
+            {
+                ProfileEventTimeIncrement<Microseconds> timer_exec(ProfileEvents::WasmGuestExecuteMicroseconds);
+                result_ptr = compartment->invoke<WasmPtr>(
+                    col_function_name,
+                    {wasm_input.getHandle(), static_cast<WasmSizeT>(input_rows_count)},
+                    stop_token);
+            }
 
             if (result_ptr == 0)
                 throw Exception(ErrorCodes::WASM_ERROR,

@@ -1475,10 +1475,10 @@ The server successfully detected this situation and will download merged part fr
     \
     M(ParquetFetchWaitTimeMicroseconds, "Time of waiting for parquet file reads from decoding threads (not prefetching threads)", ValueType::Microseconds) \
     \
-    M(WasmSerializationMicroseconds, "Time spent executing WebAssembly code", ValueType::Microseconds) \
-    M(WasmDeserializationMicroseconds, "Time spent executing WebAssembly code", ValueType::Microseconds) \
-    M(WasmGuestExecuteMicroseconds, "Time spent executing WebAssembly code", ValueType::Microseconds) \
-    M(WasmTotalExecuteMicroseconds, "Time spent executing WebAssembly code", ValueType::Microseconds) \
+    M(WasmSerializationMicroseconds, "Time spent marshalling arguments into WebAssembly guest memory", ValueType::Microseconds) \
+    M(WasmDeserializationMicroseconds, "Time spent reading the result back out of WebAssembly guest memory", ValueType::Microseconds) \
+    M(WasmGuestExecuteMicroseconds, "Time spent inside the WebAssembly guest call itself", ValueType::Microseconds) \
+    M(WasmTotalExecuteMicroseconds, "Total time spent in a WebAssembly UDF, marshalling included", ValueType::Microseconds) \
     M(WasmModuleInstatiate, "Number of WebAssembly compartments created", ValueType::Number) \
     M(WasmMemoryAllocated, "Total memory allocated for WebAssembly compartments", ValueType::Bytes) \
     \
