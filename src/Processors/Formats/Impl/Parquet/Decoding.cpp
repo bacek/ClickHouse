@@ -342,16 +342,29 @@ struct PlainStringDecoder : public PageDecoder
         if (converter->isTrivial())
         {
             /// Fast path for directly appending to ColumnString.
-            ///
-            /// ColumnString::reserve() sizes the offsets array only, so without a
-            /// separate payload reservation `chars` grows by repeated doubling and
-            /// every growth touches pages that have never been faulted in. The
-            /// lengths are cheap to walk, so walk them once and reserve exactly.
             auto & col_str = assert_cast<ColumnString &>(col);
+            size_t to_reserve = num_values;
+            if (filter)
+            {
+                to_reserve = 0;
+                for (size_t i = 0; i < num_values; ++i)
+                    to_reserve += filter[filter_offset + i];
+            }
+            col_str.reserve(col_str.size() + to_reserve);
 
-            const char * const values_begin = data;
-            size_t rows_to_add = 0;
-            size_t bytes_to_add = 0;
+            /// reserve() sizes the offsets array only. Without a separate payload reservation
+            /// `chars` grows by repeated doubling, and each growth faults in fresh pages.
+            /// Walking the length prefixes to get the exact size costs a second pass over the
+            /// page, which is more expensive than the reallocations it saves, so bound the
+            /// payload from the page instead: of the bytes left in it, 4 per value are length
+            /// prefixes. When this call consumes the whole page the bound is exact; otherwise
+            /// it overshoots by the tail, so scale it by the fraction of values kept.
+            const size_t remaining = size_t(end - data);
+            const size_t prefix_bytes = num_values * 4;
+            size_t payload_bound = remaining > prefix_bytes ? remaining - prefix_bytes : 0;
+            if (filter && to_reserve < num_values)
+                payload_bound = payload_bound / num_values * to_reserve;
+            col_str.getChars().reserve_exact(col_str.getChars().size() + payload_bound);
             for (size_t i = 0; i < num_values; ++i)
             {
                 UInt32 x = 0;
@@ -359,27 +372,8 @@ struct PlainStringDecoder : public PageDecoder
                 size_t len = 4 + size_t(x);
                 requireRemainingBytes(len);
                 if (!filter || filter[filter_offset + i])
-                {
-                    rows_to_add += 1;
-                    bytes_to_add += size_t(x);
-                }
-                data += len;
-            }
-            data = values_begin;
-
-            /// Both reservations are absolute, not incremental, and the column may
-            /// already hold values from earlier pages.
-            col_str.reserve(col_str.size() + rows_to_add);
-            col_str.reserveChars(col_str.getChars().size() + bytes_to_add);
-
-            /// The pass above already bounds-checked every value in this range.
-            for (size_t i = 0; i < num_values; ++i)
-            {
-                UInt32 x = 0;
-                memcpy(&x, data, 4);
-                if (!filter || filter[filter_offset + i])
                     col_str.insertData(data + 4, size_t(x));
-                data += 4 + size_t(x);
+                data += len;
             }
         }
         else
