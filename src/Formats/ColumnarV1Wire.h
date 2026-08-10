@@ -1064,17 +1064,22 @@ inline MutableColumnPtr readColumnFromDesc(
                 throw Exception(ErrorCodes::INCORRECT_DATA,
                     "COLUMNAR_V1: COL_BYTES invalid string offsets at row {}: [{}, {}), data_size={}",
                     i, wire_start, wire_end, desc.data_size);
-            uint64_t str_len    = wire_end - wire_start;
-            chars.resize(ch_pos + str_len);
-            std::memcpy(chars.data() + ch_pos, data + wire_start, str_len);
-            ch_pos += str_len;
-            offsets[i] = ch_pos;
             expected_start = wire_end;
         }
         if (expected_start != desc.data_size)
             throw Exception(ErrorCodes::INCORRECT_DATA,
                 "COLUMNAR_V1: COL_BYTES offsets do not cover the full data block: consumed {}, data_size={}",
                 expected_start, desc.data_size);
+
+        // The loop above proved the offsets are contiguous, start at 0 and end exactly at
+        // data_size, which is the same layout ColumnString uses (cumulative end positions,
+        // no zero terminator - see writeColData). So the payload transfers as two bulk
+        // copies instead of a resize and a memcpy per row.
+        ch_pos = desc.data_size;
+        chars.resize(ch_pos);
+        std::memcpy(chars.data(), data, ch_pos);
+        std::memcpy(offsets.data(), wire_offsets + sizeof(uint64_t),
+                    static_cast<size_t>(rows_to_dec) * sizeof(uint64_t));
         col = maybe_nullable(std::move(col_str));
     }
     else if (raw_type == COL_FIXED8)
