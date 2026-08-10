@@ -1181,10 +1181,15 @@ static QueryPlanNode buildPhysicalJoinImpl(
                 {
                     const auto * node = join_expression[0].getNode();
                     /// Spatial predicates (st_within, st_contains, st_intersects, …) route to SpatialRTreeJoin.
+                    /// canUseSpatialPredicate must be consulted here and not just in
+                    /// chooseJoinAlgorithm(): committing to the empty-key clause below discards
+                    /// the cross-join fallback, so a predicate that SpatialRTreeJoin later
+                    /// declines would be left with no join algorithm at all.
                     is_spatial_predicate_join = node
                         && node->type == ActionsDAG::ActionType::FUNCTION
                         && node->function_base
-                        && node->function_base->isSpatialPredicate();
+                        && node->function_base->isSpatialPredicate()
+                        && SpatialRTreeJoin::canUseSpatialPredicate(node);
                 }
 
                 if (!can_convert_to_cross && !is_spatial_predicate_join)
@@ -1298,6 +1303,11 @@ static QueryPlanNode buildPhysicalJoinImpl(
                 const auto * node = ref.getNode();
                 if (!node || node->type != ActionsDAG::ActionType::FUNCTION
                     || !node->function_base || !node->function_base->isSpatialPredicate())
+                    return false;
+                /// This branch also commits to an empty-key clause, so it must agree with
+                /// SpatialRTreeJoin about what that join can execute. A predicate it declines
+                /// stays in residual_filter and the join stays CROSS.
+                if (!SpatialRTreeJoin::canUseSpatialPredicate(node))
                     return false;
                 /// Must reference columns from both the left (bit 0) and right (bit 1) tables.
                 auto src = ref.getSourceRelations();

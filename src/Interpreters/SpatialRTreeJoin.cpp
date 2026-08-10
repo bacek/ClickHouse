@@ -10,6 +10,9 @@
 #include <Common/Exception.h>
 #include <Common/logger_useful.h>
 #include <Common/Stopwatch.h>
+#include <DataTypes/DataTypeLowCardinality.h>
+#include <DataTypes/DataTypeNullable.h>
+#include <DataTypes/DataTypeString.h>
 #include <IO/ReadBufferFromMemory.h>
 #include <IO/ReadHelpers.h>
 
@@ -163,6 +166,98 @@ SpatialRTreeJoin::BGBox SpatialRTreeJoin::wkbBBox(std::string_view wkb)
 
 // ── Column identification ─────────────────────────────────────────────────────
 
+namespace
+{
+
+/// Wrappers we may look through when resolving a predicate argument to the
+/// column the bbox scanner will read.  Each either preserves the geometry
+/// (the WKB parsers) or only changes nullability, so a bbox taken from the
+/// wrapped column's raw bytes still bounds the value the predicate sees.
+bool isGeometryPreservingWrapper(const String & name)
+{
+    static const std::unordered_set<String> wrappers = {
+        "assumeNotNull",
+        "readWKB",
+        "readWKBPoint",
+        "readWKBLineString",
+        "readWKBPolygon",
+        "readWKBMultiPoint",
+        "readWKBMultiLineString",
+        "readWKBMultiPolygon",
+    };
+    return wrappers.contains(name);
+}
+
+/// Resolve a predicate argument down to the INPUT column holding its WKB bytes.
+/// Follows ALIAS links and single-argument geometry-preserving wrappers; stops at
+/// anything else, because the bbox scanner reads the resolved column directly and
+/// a computed value would not correspond to the argument.
+const ActionsDAG::Node * findGeomInput(const ActionsDAG::Node * node)
+{
+    while (node)
+    {
+        if (node->type == ActionsDAG::ActionType::INPUT)
+            return node;
+
+        if (node->type == ActionsDAG::ActionType::ALIAS)
+        {
+            if (node->children.empty())
+                return nullptr;
+            node = node->children[0];
+            continue;
+        }
+
+        if (node->type == ActionsDAG::ActionType::FUNCTION
+            && node->children.size() == 1
+            && isGeometryPreservingWrapper(node->function_base ? node->function_base->getName() : String{}))
+        {
+            node = node->children[0];
+            continue;
+        }
+
+        return nullptr;
+    }
+    return nullptr;
+}
+
+/// wkbBBox reads bytes via IColumn::getDataAt, which only String-family columns
+/// implement.  A natively-typed geo column (Point, Array(Tuple(Float64,Float64)), …)
+/// would throw NOT_IMPLEMENTED deep inside the build phase.
+bool isWKBBytesColumn(const DataTypePtr & type)
+{
+    return isString(removeNullable(removeLowCardinality(type)));
+}
+
+}
+
+bool SpatialRTreeJoin::canUseSpatialPredicate(const ActionsDAG::Node * fn)
+{
+    if (!fn || fn->type != ActionsDAG::ActionType::FUNCTION || !fn->function_base || fn->children.size() < 2)
+        return false;
+
+    for (size_t i = 0; i < 2; ++i)
+    {
+        const auto * input = findGeomInput(fn->children[i]);
+        if (!input || !isWKBBytesColumn(input->result_type))
+            return false;
+    }
+
+    /// The bbox pre-filter widens by this distance, so it must be known at plan
+    /// time; a non-constant would let the filter drop true matches.
+    int expand_arg_index = fn->function_base->getSpatialExpandArg();
+    if (expand_arg_index >= 0)
+    {
+        auto idx = static_cast<size_t>(expand_arg_index);
+        if (idx >= fn->children.size())
+            return false;
+        const auto * dist_node = fn->children[idx];
+        if (dist_node->type != ActionsDAG::ActionType::COLUMN || !dist_node->column)
+            return false;
+    }
+
+    return true;
+}
+
 bool SpatialRTreeJoin::identifyGeomColumns(
     const ExpressionActionsPtr & expr,
     const Block & right_hdr,
@@ -178,31 +273,11 @@ bool SpatialRTreeJoin::identifyGeomColumns(
         return false;
 
     const ActionsDAG::Node * fn = outputs[0];
-    if (fn->type != ActionsDAG::ActionType::FUNCTION || fn->children.size() < 2)
+    if (!canUseSpatialPredicate(fn))
         return false;
 
-    /// Walk a node chain down to the first INPUT node.
-    /// Only follows ALIAS nodes; stops at FUNCTION nodes to avoid treating
-    /// expressions like st_expand_col(b, c) as a plain column reference.
-    /// (If the predicate arg is wrapped in a computation, fall back to hash join.)
-    auto find_input = [](const ActionsDAG::Node * node) -> const ActionsDAG::Node *
-    {
-        while (node)
-        {
-            if (node->type == ActionsDAG::ActionType::INPUT)
-                return node;
-            if (node->type != ActionsDAG::ActionType::ALIAS || node->children.empty())
-                return nullptr;
-            node = node->children[0];
-        }
-        return nullptr;
-    };
-
-    const auto * in0 = find_input(fn->children[0]);
-    const auto * in1 = find_input(fn->children[1]);
-
-    if (!in0 || !in1)
-        return false;
+    const auto * in0 = findGeomInput(fn->children[0]);
+    const auto * in1 = findGeomInput(fn->children[1]);
 
     if (right_hdr.has(in0->result_name))
     {
@@ -217,21 +292,15 @@ bool SpatialRTreeJoin::identifyGeomColumns(
     else
         return false;
 
-    /// Extract the constant distance value from the designated argument index.
-    /// If it is not a compile-time constant we fall back to hash join (returning false)
-    /// to avoid false negatives in the bbox pre-filter.
+    /// Read the constant distance from the designated argument.
+    /// canUseSpatialPredicate has already established that it is a constant column;
+    /// only the numeric conversion can still fail.
     out_bbox_expand = 0.0;
     if (expand_arg_index >= 0)
     {
-        auto idx = static_cast<size_t>(expand_arg_index);
-        if (idx >= fn->children.size())
-            return false;
-        const auto * dist_node = fn->children[idx];
-        if (dist_node->type != ActionsDAG::ActionType::COLUMN || !dist_node->column)
-            return false;
         try
         {
-            out_bbox_expand = dist_node->column->getFloat64(0);
+            out_bbox_expand = fn->children[static_cast<size_t>(expand_arg_index)]->column->getFloat64(0);
         }
         catch (...)
         {

@@ -38,8 +38,10 @@ namespace DB
 ///
 /// Limitations:
 ///   - INNER JOIN only (getNonJoinedBlocks returns nullptr)
-///   - Both predicate arguments must be direct column references (no function wrapping).
-///     Expressions like st_expand_col(b, c) as an argument fall back to hash join.
+///   - Both predicate arguments must resolve to a WKB String column, either directly
+///     or through geometry-preserving wrappers (assumeNotNull, readWKB*). Arguments
+///     computed by anything else — st_expand_col(b, c), or a natively-typed geo
+///     column the bbox scanner cannot read as bytes — fall back to cross join.
 ///   - WKB geometry types 1-7 (Point/LineString/Polygon/Multi*/GeometryCollection)
 class SpatialRTreeJoin : public IJoin
 {
@@ -78,6 +80,16 @@ public:
         const Block & left_sample_block,
         const Block & result_sample_block,
         UInt64 max_block_size) const override;
+
+    /// True when this join can actually execute the predicate rooted at `fn`:
+    /// both geometry arguments resolve to a WKB String column, and the
+    /// bbox-expand argument (if the predicate declares one) is a constant.
+    ///
+    /// Planning has two decision points and they must agree. JoinStepLogical
+    /// discards the cross-join fallback when it commits to an empty-key clause,
+    /// so a predicate accepted there and rejected in chooseJoinAlgorithm() is
+    /// left with no join algorithm at all. Both call this.
+    static bool canUseSpatialPredicate(const ActionsDAG::Node * fn);
 
     /// Try to identify left/right geometry column names from the spatial predicate
     /// ActionsDAG. Returns false if detection fails (e.g. either argument is wrapped

@@ -1,0 +1,21 @@
+-- WKB args behind readWKB*/assumeNotNull: SpatialRTreeJoin --
+│  Type: inner | Strictness: all | Algorithm: SpatialRTreeJoin
+-- and it returns the right pairs --
+1	10
+2	20
+-- identical to the same predicate as a post-join filter --
+1	10
+2	20
+-- native geo columns: no R-tree, no error --
+│  Type: cross | Strictness: all | Algorithm: ConstantJoin
+-- and the fallback still answers correctly --
+1	10
+2	20
+-- computed argument: no R-tree, no error --
+│  Type: cross | Strictness: all | Algorithm: ConstantJoin
+-- shifting by -88 moves point 3 (100 100) into the second polygon --
+3	20
+-- LEFT JOIN over WKB args keeps unmatched left rows --
+10	1
+20	2
+30	0
