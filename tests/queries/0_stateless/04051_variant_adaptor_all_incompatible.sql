@@ -1,0 +1,29 @@
+-- Regression test: FunctionVariantAdaptor must throw ILLEGAL_TYPE_OF_ARGUMENT
+-- consistently when ALL Variant alternatives are incompatible with a function,
+-- instead of silently returning Nullable(Nothing) which caused WHERE clauses
+-- to return 0 rows with no diagnostic.
+--
+-- The fix: when result_types is empty after trying all alternatives,
+-- throw instead of falling back to Nullable(Nothing).
+
+SET enable_analyzer = 1;
+
+-- Variant(UInt32, Date): neither alternative is compatible with base64Encode(String).
+
+-- WHERE context: must throw, not silently return 0 rows.
+SELECT count() FROM (
+    SELECT CAST(number::UInt32 AS Variant(UInt32, Date)) AS v FROM numbers(5)
+)
+WHERE base64Encode(v) != ''; -- {serverError ILLEGAL_TYPE_OF_ARGUMENT}
+
+-- SELECT context: must throw the same error (was already consistent).
+SELECT base64Encode(v) FROM (
+    SELECT CAST(number::UInt32 AS Variant(UInt32, Date)) AS v FROM numbers(3)
+); -- {serverError ILLEGAL_TYPE_OF_ARGUMENT}
+
+-- Sanity check: a Variant where one alternative IS compatible works correctly.
+-- base64Encode accepts String, so Variant(UInt32, String) rows with String value
+-- produce a result; UInt32 rows produce NULL.
+SELECT base64Encode(v) IS NOT NULL FROM (
+    SELECT CAST('hello'::String AS Variant(UInt32, String)) AS v
+);

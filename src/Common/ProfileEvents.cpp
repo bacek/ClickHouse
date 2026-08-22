@@ -1549,10 +1549,10 @@ The server successfully detected this situation and will download merged part fr
     \
     M(ParquetFetchWaitTimeMicroseconds, "Time of waiting for parquet file reads from decoding threads (not prefetching threads)", ValueType::Microseconds) \
     \
-    M(WasmSerializationMicroseconds, "Time spent executing WebAssembly code", ValueType::Microseconds) \
-    M(WasmDeserializationMicroseconds, "Time spent executing WebAssembly code", ValueType::Microseconds) \
-    M(WasmGuestExecuteMicroseconds, "Time spent executing WebAssembly code", ValueType::Microseconds) \
-    M(WasmTotalExecuteMicroseconds, "Time spent executing WebAssembly code", ValueType::Microseconds) \
+    M(WasmSerializationMicroseconds, "Time spent marshalling arguments into WebAssembly guest memory", ValueType::Microseconds) \
+    M(WasmDeserializationMicroseconds, "Time spent reading the result back out of WebAssembly guest memory", ValueType::Microseconds) \
+    M(WasmGuestExecuteMicroseconds, "Time spent inside the WebAssembly guest call itself", ValueType::Microseconds) \
+    M(WasmTotalExecuteMicroseconds, "Total time spent in a WebAssembly UDF, marshalling included", ValueType::Microseconds) \
     M(WasmModuleInstatiate, "Number of WebAssembly compartments created", ValueType::Number) \
     M(WasmMemoryAllocated, "Total memory allocated for WebAssembly compartments", ValueType::Bytes) \
     \
@@ -1566,9 +1566,11 @@ The server successfully detected this situation and will download merged part fr
     M(ExecutableUserDefinedFunctionPoolWaitMicroseconds, "Time spent waiting on tryBorrowObject when the executable_pool user-defined function pool is exhausted, in microseconds.", ValueType::Microseconds) \
     \
     M(ParquetReadRowGroups, "The total number of row groups read from parquet data", ValueType::Number) \
-    M(ParquetPrunedRowGroups, "The total number of row groups pruned from parquet data", ValueType::Number) \
-    M(ParquetReadPages, "The total number of Parquet data pages read", ValueType::Number) \
-    M(ParquetPrunedPages, "The total number of pages pruned from parquet data via column index", ValueType::Number) \
+    M(ParquetPrunedRowGroups, "The total number of row groups pruned via min/max statistics from parquet data", ValueType::Number) \
+    M(ParquetPrunedRowGroupsByBloomFilter, "The total number of row groups pruned via bloom filter from parquet data", ValueType::Number) \
+    M(ParquetReadPages, "The total number of pages read from parquet data (after column index pruning)", ValueType::Number) \
+    M(ParquetPrunedPages, "The total number of pages pruned via column index from parquet data", ValueType::Number) \
+    M(ParquetPrunedRowsByColumnIndex, "The total number of rows pruned via column index from parquet data", ValueType::Number) \
     M(ParquetDecodingTasks, "Tasks issued by parquet reader", ValueType::Number) \
     M(ParquetDecodingTaskBatches, "Task groups sent to a thread pool by parquet reader", ValueType::Number) \
     M(ParquetPrefetcherReadRandomRead, "The total number of reads with ReadMode::RandomRead by DB::Parquet::Prefetcher", ValueType::Number) \

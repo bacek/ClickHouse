@@ -44,6 +44,8 @@
 #include <Interpreters/JoinSwitcher.h>
 #include <Interpreters/MergeJoin.h>
 #include <Interpreters/PasteJoin.h>
+#include <Interpreters/SpatialRTreeJoin.h>
+#include <Interpreters/SpatialRTreeDoubleJoin.h>
 #include <Interpreters/SpillingHashJoin.h>
 
 #include <Planner/PlannerActionsVisitor.h>
@@ -75,6 +77,7 @@ namespace Setting
     extern const SettingsBool allow_dynamic_type_in_join_keys;
     extern const SettingsUInt64 max_bytes_before_external_join;
     extern const SettingsDouble max_bytes_ratio_before_external_join;
+    extern const SettingsBool query_plan_spatial_rtree_swap_table;
 }
 
 namespace ServerSetting
@@ -1361,6 +1364,7 @@ JoinAlgorithmParams::JoinAlgorithmParams(const Context & context)
 
     initial_query_id = context.getInitialQueryId();
     lock_acquire_timeout = std::chrono::milliseconds(settings[Setting::lock_acquire_timeout].totalMilliseconds());
+    spatial_rtree_swap_table = settings[Setting::query_plan_spatial_rtree_swap_table];
 }
 
 JoinAlgorithmParams::JoinAlgorithmParams(
@@ -1397,6 +1401,36 @@ std::shared_ptr<IJoin> chooseJoinAlgorithm(
     SharedHeader right_table_expression_header,
     const JoinAlgorithmParams & params)
 {
+    /// Spatial predicate join: INNER JOIN with no equijoin keys and a single
+    /// ON clause whose entire condition is a WASM spatial predicate
+    /// (is_spatial_predicate=1 in CREATE FUNCTION settings).
+    /// Use an R-tree index on the right geometry column to skip bbox-disjoint pairs.
+    /// Must be checked BEFORE the mixed-conditions hash-only guard below.
+    if (table_join->getMixedJoinExpression()
+        && (table_join->kind() == JoinKind::Inner || table_join->kind() == JoinKind::Left
+            || table_join->kind() == JoinKind::Right)
+        && table_join->getClauses().size() == 1
+        && table_join->getClauses().front().key_names_left.empty())
+    {
+        const auto & mixed = table_join->getMixedJoinExpression();
+        const auto & dag_outputs = mixed->getActionsDAG().getOutputs();
+        if (dag_outputs.size() == 1
+            && dag_outputs[0]->type == ActionsDAG::ActionType::FUNCTION
+            && dag_outputs[0]->function_base
+            && dag_outputs[0]->function_base->isSpatialPredicate())
+        {
+            if (table_join->isFusedSpatialJoin())
+                return std::make_shared<SpatialRTreeDoubleJoin>(table_join, right_table_expression_header);
+
+            String left_col;
+            String right_col;
+            double bbox_expand = 0.0;
+            int expand_arg_index = dag_outputs[0]->function_base->getSpatialExpandArg();
+            if (SpatialRTreeJoin::identifyGeomColumns(mixed, *right_table_expression_header, left_col, right_col, expand_arg_index, bbox_expand))
+                return std::make_shared<SpatialRTreeJoin>(table_join, right_table_expression_header, bbox_expand);
+        }
+    }
+
     if (table_join->getMixedJoinExpression()
         && !table_join->isEnabledAlgorithm(JoinAlgorithm::HASH)
         && !table_join->isEnabledAlgorithm(JoinAlgorithm::PARALLEL_HASH)

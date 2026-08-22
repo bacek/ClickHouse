@@ -12,6 +12,7 @@
 #include <span>
 #include <string>
 #include <variant>
+#include <pthread.h>
 #include <fmt/core.h>
 #include <fmt/ranges.h>
 #include <base/MemorySanitizer.h>
@@ -58,10 +59,42 @@ void setStoreFuel(wasmtime::Store::Context ctx, const WasmModule::Config & cfg, 
 wasmtime::Module compileModuleWithEngine(wasmtime::Engine & engine, std::string_view module_bytes, std::string_view phase)
 {
     std::span<uint8_t> bytes(reinterpret_cast<uint8_t *>(const_cast<char *>(module_bytes.data())), module_bytes.size());
-    auto result = wasmtime::Module::compile(engine, bytes);
-    if (!result)
-        throw Exception(ErrorCodes::WASM_ERROR, "Failed to compile wasm code ({}): {}", phase, result.err().message());
-    return std::move(result.ok());
+
+    // Cranelift's egraph optimizer generates a huge constructor_simplify function
+    // (64KB+ of code) that recurses up to REWRITE_LIMIT=5 times during compilation.
+    // Each level pushes a large stack frame; the default 512KB thread stack overflows
+    // on aarch64-apple-darwin. Compile on a dedicated thread with an 8 MiB stack.
+    struct CompileTask
+    {
+        wasmtime::Engine & engine;
+        std::span<uint8_t> bytes;
+        std::optional<wasmtime::Module> result;
+        std::string error;
+    };
+    CompileTask task{engine, bytes, std::nullopt, {}};
+
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setstacksize(&attr, 8 * 1024 * 1024);
+
+    pthread_t thread;
+    pthread_create(&thread, &attr, [](void * arg) -> void *
+    {
+        auto & t = *static_cast<CompileTask *>(arg);
+        auto res = wasmtime::Module::compile(t.engine, t.bytes);
+        if (res)
+            t.result = res.ok();
+        else
+            t.error = res.err().message();
+        return nullptr;
+    }, &task);
+
+    pthread_attr_destroy(&attr);
+    pthread_join(thread, nullptr);
+
+    if (!task.result)
+        throw Exception(ErrorCodes::WASM_ERROR, "Failed to compile wasm code ({}): {}", phase, task.error);
+    return std::move(*task.result);
 }
 
 }
@@ -184,6 +217,8 @@ struct WasmTimeRuntime::Impl
         /// The Cranelift optimizer is prohibitively slow in debug builds and can
         /// hit debug-only traps while simplifying even small modules.
         config.cranelift_opt_level(wasmtime::OptLevel::None);
+#else
+        config.cranelift_opt_level(wasmtime::OptLevel::Speed);
 #endif
         return config;
     }
@@ -500,6 +535,19 @@ public:
         });
 
         wasmtime::Linker linker(engine);
+
+#ifdef WASMTIME_FEATURE_WASI
+        /// Provide WASI preview1 stubs for modules linked with wasi-libc.
+        wasmtime::WasiConfig wasi_config;
+        auto set_wasi_result = store.context().set_wasi(std::move(wasi_config));
+        if (!set_wasi_result)
+            throw Exception(ErrorCodes::WASM_ERROR, "Failed to set WASI config: {}", set_wasi_result.err().message());
+        auto define_wasi_result = linker.define_wasi();
+        if (!define_wasi_result)
+            throw Exception(ErrorCodes::WASM_ERROR, "Failed to define WASI: {}", define_wasi_result.err().message());
+
+#endif
+
         for (const auto & host_function : host_functions)
         {
             const auto & func_decl = host_function.getFunctionDeclaration();

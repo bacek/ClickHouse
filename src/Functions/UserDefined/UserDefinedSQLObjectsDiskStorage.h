@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <Core/Types.h>
 #include <Functions/UserDefined/UserDefinedSQLObjectsStorageBase.h>
 #include <Common/Logger_fwd.h>
 #include <Interpreters/Context_fwd.h>
@@ -36,6 +37,7 @@ private:
         const ContextPtr & current_context,
         UserDefinedSQLObjectType object_type,
         const String & object_name,
+        const Strings & argument_type_names,
         bool throw_if_not_exists) override;
 
     void createDirectory();

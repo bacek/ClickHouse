@@ -180,6 +180,10 @@ private:
     Clauses clauses;
     /// Originally used for inequal join. If there is no any inequal join condition, it will be nullptr.
     std::shared_ptr<ExpressionActions> mixed_join_expression = nullptr;
+    /// Non-spatial conditions from the JOIN ON clause (e.g. `b1.id < b2.id` alongside
+    /// a spatial predicate).  Evaluated inside SpatialRTreeJoin BEFORE the spatial
+    /// predicate so that cheap conditions prune candidates early.  nullptr when absent.
+    std::shared_ptr<ExpressionActions> pre_spatial_filter_expression = nullptr;
 
     ASTTableJoin table_join;
     std::optional<JoinOperator> join_operator;
@@ -268,6 +272,17 @@ private:
     getKeysForNullSafeComparion(const ColumnsWithTypeAndName & left_sample_columns, const ColumnsWithTypeAndName & right_sample_columns);
 
 public:
+    /// Set when this is a fused double-probe spatial join (SpatialRTreeDoubleJoin).
+    /// Identifier of the first-probe left geometry column (e.g. "__table2.t_pickuploc").
+    /// Empty means "not fused".
+    String fused_first_probe_left_col;
+
+    /// Output columns from the FIRST probe result.
+    /// right_col: column name in right_blocks (e.g. "__table3.z_zonekey")
+    /// first_probe_col: desired output name (e.g. "__table1.z_zonekey")
+    struct FusedProbeOutputCol { String right_col; String first_probe_col; DataTypePtr type; };
+    std::vector<FusedProbeOutputCol> fused_first_probe_output_cols;
+
     TableJoin() = default;
 
     TableJoin(const Settings & settings, JoinAnalyzeMode analyze_mode_, VolumePtr tmp_volume_, TemporaryDataOnDiskScopePtr tmp_data_);
@@ -371,6 +386,11 @@ public:
     const std::shared_ptr<ExpressionActions> & getMixedJoinExpression() const { return mixed_join_expression; }
     std::shared_ptr<ExpressionActions> & getMixedJoinExpression() { return mixed_join_expression; }
 
+    const std::shared_ptr<ExpressionActions> & getPreSpatialFilterExpression() const { return pre_spatial_filter_expression; }
+    std::shared_ptr<ExpressionActions> & getPreSpatialFilterExpression() { return pre_spatial_filter_expression; }
+
+    bool isFusedSpatialJoin() const { return !fused_first_probe_left_col.empty(); }
+
     Names getAllNames(JoinTableSide side) const;
 
     void resetCollected();
@@ -464,6 +484,7 @@ public:
     const NamesAndTypesList & getOutputColumns(JoinTableSide side) const;
     const NamesAndTypesList & columnsFromJoinedTable() const { return columns_from_joined_table; }
     const NamesAndTypesList & columnsAddedByJoin() const { return columns_added_by_join; }
+    const NamesAndTypesList & resultColumnsFromLeftTable() const { return result_columns_from_left_table; }
 
     /// StorageJoin overrides key names (cause of different names qualification)
     void setRightKeys(const Names & keys) { getOnlyClause().key_names_right = keys; }

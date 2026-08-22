@@ -780,6 +780,26 @@ inline void writeColData(
         uint8_t * data_dst = buf.data() + desc.data_offset;
 
         unalignedStore<uint64_t>(wire_offsets, 0ull);
+        if (num_rows == 0)
+            return;
+
+        // ColumnString here is not zero-terminated (see ColumnString::sizeAt) and its
+        // offsets are cumulative end positions, which is exactly the wire layout: the
+        // wire is [0, off[0], off[1], ...] over a contiguous payload. So when the
+        // column starts at chars[0] the whole thing is two bulk copies rather than a
+        // memcpy and a store per row. For short values the per-row libc memcpy
+        // dispatch dominated this loop.
+        const uint64_t total_bytes = ch_offsets[num_rows - 1];
+        if (total_bytes == desc.data_size)
+        {
+            std::memcpy(wire_offsets + sizeof(uint64_t), ch_offsets.data(),
+                        static_cast<size_t>(num_rows) * sizeof(uint64_t));
+            std::memcpy(data_dst, chars.data(), total_bytes);
+            return;
+        }
+
+        // Offsets do not start at zero (a column sharing its chars buffer with a
+        // larger one): fall back to rebasing row by row.
         uint64_t wire_pos = 0ull;
         uint64_t ch_pos = 0ull;
         for (uint32_t i = 0; i < num_rows; ++i)
@@ -1074,17 +1094,22 @@ inline MutableColumnPtr readColumnFromDesc(
                 throw Exception(ErrorCodes::INCORRECT_DATA,
                     "COLUMNAR_V1: COL_BYTES invalid string offsets at row {}: [{}, {}), data_size={}",
                     i, wire_start, wire_end, desc.data_size);
-            uint64_t str_len    = wire_end - wire_start;
-            chars.resize(ch_pos + str_len);
-            std::memcpy(chars.data() + ch_pos, data + wire_start, str_len);
-            ch_pos += str_len;
-            offsets[i] = ch_pos;
             expected_start = wire_end;
         }
         if (expected_start != desc.data_size)
             throw Exception(ErrorCodes::INCORRECT_DATA,
                 "COLUMNAR_V1: COL_BYTES offsets do not cover the full data block: consumed {}, data_size={}",
                 expected_start, desc.data_size);
+
+        // The loop above proved the offsets are contiguous, start at 0 and end exactly at
+        // data_size, which is the same layout ColumnString uses (cumulative end positions,
+        // no zero terminator - see writeColData). So the payload transfers as two bulk
+        // copies instead of a resize and a memcpy per row.
+        ch_pos = desc.data_size;
+        chars.resize(ch_pos);
+        std::memcpy(chars.data(), data, ch_pos);
+        std::memcpy(offsets.data(), wire_offsets + sizeof(uint64_t),
+                    static_cast<size_t>(rows_to_dec) * sizeof(uint64_t));
         col = maybe_nullable(std::move(col_str));
     }
     else if (raw_type == COL_FIXED8)

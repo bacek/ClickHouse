@@ -554,6 +554,11 @@ struct Reader
     /// before applying row-group and page pruning: NULL bbox means unknown extent, must not prune.
     std::vector<std::array<size_t, 4>> spatial_key_condition_bbox_col_indices;
 
+    /// Per-row ActionsDAG prefilter built from GeoParquet covering.bbox spatial filters.
+    /// Injected as the first prewhere step so that WASM spatial functions only evaluate
+    /// rows whose bbox intersects the query bbox.
+    std::optional<std::pair<ActionsDAG, String>> bbox_row_prefilter;
+
     /// Per-column KeyConditions extracted from spatial_key_conditions for page-level
     /// spatial bbox pruning. Stored here (not as a local variable) to keep the shared_ptrs
     /// alive, since raw pointers from them are referenced by

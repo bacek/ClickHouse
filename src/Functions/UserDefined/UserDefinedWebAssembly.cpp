@@ -22,6 +22,13 @@
 #include <DataTypes/DataTypeString.h>
 #include <Columns/ColumnTuple.h>
 
+#include <AggregateFunctions/IAggregateFunction.h>
+#include <AggregateFunctions/AggregateFunctionFactory.h>
+#include <Common/Arena.h>
+#include <Common/CurrentThread.h>
+#include <Common/ThreadStatus.h>
+#include <IO/VarInt.h>
+
 #include <Functions/IFunction.h>
 #include <Functions/IFunctionAdaptors.h>
 
@@ -63,6 +70,7 @@ namespace ProfileEvents
 extern const Event WasmTotalExecuteMicroseconds;
 extern const Event WasmSerializationMicroseconds;
 extern const Event WasmDeserializationMicroseconds;
+extern const Event WasmGuestExecuteMicroseconds;
 }
 
 
@@ -656,7 +664,9 @@ public:
             }
 
             // ── Invoke WASM ──────────────────────────────────────────────────
-            auto result_ptr = compartment->invoke<WasmPtr>(
+            // The guest call is timed by the runtime itself (WasmGuestExecuteMicroseconds
+            // is incremented inside WasmCompartment::invoke), so it is not wrapped here.
+            WasmPtr result_ptr = compartment->invoke<WasmPtr>(
                 col_function_name,
                 {wasm_input.getHandle(), static_cast<WasmSizeT>(input_rows_count)},
                 stop_token);
@@ -780,11 +790,13 @@ public:
         unsigned limit,
         std::shared_ptr<WebAssembly::WasmModule> wasm_module_,
         WebAssembly::WasmModule::Config module_cfg_,
-        StopToken stop_token_)
+        StopToken stop_token_,
+        std::optional<String> init_function_name_ = std::nullopt)
         : Base(limit, getLogger("WasmCompartmentPool"))
         , wasm_module(std::move(wasm_module_))
         , module_cfg(std::move(module_cfg_))
         , stop_token(std::move(stop_token_))
+        , init_function_name(std::move(init_function_name_))
     {
         LOG_DEBUG(log, "WasmCompartmentPool created with limit: {}", limit);
     }
@@ -795,7 +807,10 @@ protected:
     ObjectPtr allocObject() override
     {
         LOG_DEBUG(log, "Allocating new WasmCompartment");
-        return wasm_module->instantiate(module_cfg, stop_token);
+        auto compartment = wasm_module->instantiate(module_cfg, stop_token);
+        if (init_function_name)
+            compartment->invoke<void>(*init_function_name, {}, stop_token);
+        return compartment;
     }
 
 private:
@@ -804,8 +819,23 @@ private:
 
     std::mutex acquire_mutex;
     StopToken stop_token;
+    std::optional<String> init_function_name;
 };
 
+
+/// Returns "clickhouse_module_init" if the module exports it, nullopt otherwise.
+static std::optional<String> tryGetModuleInitFn(const std::shared_ptr<WebAssembly::WasmModule> & module)
+{
+    try
+    {
+        module->getExport("clickhouse_module_init");
+        return "clickhouse_module_init";
+    }
+    catch (...)
+    {
+        return std::nullopt;
+    }
+}
 
 static WebAssembly::WasmModule::Config getWasmModuleConfig(ContextPtr context, WebAssembly::FuelMode fuel_mode)
 {
@@ -945,12 +975,20 @@ public:
     String getName() const override { return function_name; }
     bool isVariadic() const override { return false; }
     bool isDeterministic() const override { return user_defined_function->getIsDeterministic(); }
+    const DataTypes & getArgumentTypes() const { return user_defined_function->getArguments(); }
     bool isSpatialPredicate() const override
     {
         auto val = user_defined_function->getSettings().getValue("is_spatial_predicate");
         if (val.getType() == Field::Types::Bool)
             return val.safeGet<bool>();
         return val.safeGet<UInt64>() != 0;
+    }
+    int getSpatialExpandArg() const override
+    {
+        auto val = user_defined_function->getSettings().getValue("spatial_expand_arg");
+        if (val.isNull()) return -1;
+        auto idx = val.safeGet<Int64>();
+        return idx < 0 ? -1 : static_cast<int>(idx);
     }
     bool isSuitableForShortCircuitArgumentsExecution(const DataTypesWithConstInfo & /* arguments */) const override { return false; }
     size_t getNumberOfArguments() const override { return user_defined_function->getArguments().size(); }
@@ -982,23 +1020,28 @@ public:
             /// neither for an exact type match nor for a numeric coercion.
             bool allow_nullable_relaxation
                 = dynamic_cast<const UserDefinedWebAssemblyFunctionColumnarV1 *>(user_defined_function.get()) != nullptr;
-            if (allow_nullable_relaxation)
-            {
-                const DataTypePtr & stripped = removeNullable(arguments[i]);
-                if (stripped->equals(*expected_arguments[i]))
-                    continue;
+            /// Without the relaxation `stripped` is just arguments[i], so every check below
+            /// reduces to its non-relaxed form and BUFFERED_V1 keeps rejecting Nullable args.
+            const DataTypePtr stripped = allow_nullable_relaxation ? removeNullable(arguments[i]) : arguments[i];
+            if (allow_nullable_relaxation && stripped->equals(*expected_arguments[i]))
+                continue;
 
-                /// Allow implicit coercions: same kind, i32→i64, any int→any float, f32→f64.
-                auto actual_kind = wasmKindForDataType(stripped.get());
-                auto expected_kind = wasmKindForDataType(expected_arguments[i].get());
-                if (actual_kind && expected_kind && canCoerce(*actual_kind, *expected_kind))
-                    continue;
-            }
-            else
+            /// Allow implicit coercions: same kind, i32→i64, any int→any float, f32→f64.
+            auto actual_kind = wasmKindForDataType(stripped.get());
+            auto expected_kind = wasmKindForDataType(expected_arguments[i].get());
+            if (actual_kind && expected_kind && canCoerce(*actual_kind, *expected_kind))
+                continue;
+
+            /// Allow a geo type (or its constant-folded bare structural form) to satisfy a
+            /// Geometry (Variant) parameter — mirrors the check in typesMatchOverload.
+            if (const auto * variant_type = typeid_cast<const DataTypeVariant *>(expected_arguments[i].get()))
             {
-                auto actual_kind = wasmKindForDataType(arguments[i].get());
-                auto expected_kind = wasmKindForDataType(expected_arguments[i].get());
-                if (actual_kind && expected_kind && canCoerce(*actual_kind, *expected_kind))
+                if (variant_type->tryGetVariantDiscriminator(stripped->getName()).has_value())
+                    continue;
+                bool structural_match = false;
+                for (const auto & v : variant_type->getVariants())
+                    if (stripped->equals(*v)) { structural_match = true; break; }
+                if (structural_match)
                     continue;
             }
 
@@ -1035,6 +1078,40 @@ public:
     {
         auto compartment_entry = compartment_pool.acquire();
         auto * compartment_ptr = &(*compartment_entry);
+
+        // Coerce actual columns to Variant when the function declares a Variant parameter but
+        // received a member type (e.g. Point passed to Geometry).  Lets callers skip the
+        // explicit CAST(x, 'Geometry').
+        // When the input type lacks a custom name (e.g. bare Array(Tuple) not cast to Ring),
+        // we fall back to structural matching against variant members. Note: structurally
+        // ambiguous types (Array(Array(Tuple)) matches both Polygon and MultiLineString) require
+        // the caller to use an explicit geo type cast; without one the first alphabetical match wins.
+        const auto & declared = user_defined_function->getArguments();
+        ColumnsWithTypeAndName coerced = arguments;
+        for (size_t i = 0; i < coerced.size() && i < declared.size(); ++i)
+        {
+            const auto * variant_type = typeid_cast<const DataTypeVariant *>(declared[i].get());
+            if (!variant_type || coerced[i].type->equals(*declared[i]))
+                continue;
+
+            if (!coerced[i].type->hasCustomName())
+            {
+                for (const auto & v : variant_type->getVariants())
+                {
+                    if (coerced[i].type->equals(*v))
+                    {
+                        coerced[i].column = castColumn(coerced[i], v);
+                        coerced[i].type = v;
+                        break;
+                    }
+                }
+            }
+
+            coerced[i].column = castColumn(coerced[i], declared[i]);
+            coerced[i].type = declared[i];
+        }
+
+        // COLUMNAR_V1: bypass RowBinary batching, pass columns directly (ColumnConst stays const).
         try
         {
             // COLUMNAR_V1: bypass RowBinary batching, pass columns directly (ColumnConst stays
@@ -1796,6 +1873,481 @@ private:
     mutable WasmCompartmentPool compartment_pool;
 };
 
+/// Aggregate function wrapper for WASM UDFs with is_aggregate=1.
+///
+/// Argument rows are accumulated per group as a singly linked list of arena nodes, each
+/// holding one row with all arguments serialized back to back. A per-group MutableColumns
+/// would be simpler, but every ColumnString there allocates a 4 KiB PODArray for its chars
+/// and another for its offsets, so a query with millions of small groups pays several KiB
+/// per group no matter how few rows it holds.
+///
+/// Results are produced a whole batch of groups at a time (see insertResultIntoBatch): the
+/// accumulated rows are flattened into one Array(T) column per argument, with one array
+/// element per group, and handed to the underlying WASM function in a single call. Calling
+/// it once per group instead makes the compartment acquire and block marshalling dominate
+/// everything else once the group count reaches the millions.
+class AggregateFunctionUserDefinedWasm final
+    : public IAggregateFunctionHelper<AggregateFunctionUserDefinedWasm>
+{
+public:
+    AggregateFunctionUserDefinedWasm(
+        String function_name_,
+        std::shared_ptr<UserDefinedWebAssemblyFunction> wasm_function_,
+        DataTypes original_arg_types_,
+        ContextPtr context_)
+        : IAggregateFunctionHelper<AggregateFunctionUserDefinedWasm>(original_arg_types_, {}, wasm_function_->getResultType())
+        , function_name(std::move(function_name_))
+        , wasm_function(std::move(wasm_function_))
+        , original_arg_types(std::move(original_arg_types_))
+        , context(std::move(context_))
+        , interrupt_source()
+        , compartment_pool(
+              static_cast<UInt32>(context->getSettingsRef()[Setting::webassembly_udf_max_instances]),
+              wasm_function->getModule(),
+              getWasmModuleConfig(context, wasm_function->getSettings().getFuelMode()),
+              interrupt_source.get_token(),
+              tryGetModuleInitFn(wasm_function->getModule()))
+    {
+        arg_encodings.reserve(original_arg_types.size());
+        fixed_value_sizes.reserve(original_arg_types.size());
+        for (const auto & type : original_arg_types)
+        {
+            auto sample = type->createColumn();
+            if (sample->isFixedAndContiguous())
+            {
+                arg_encodings.push_back(ArgEncoding::FixedWidth);
+                fixed_value_sizes.push_back(sample->sizeOfValueIfFixed());
+            }
+            else if (typeid_cast<const ColumnString *>(sample.get()) != nullptr)
+            {
+                arg_encodings.push_back(ArgEncoding::VariableWidth);
+                fixed_value_sizes.push_back(0);
+            }
+            else
+            {
+                arg_encodings.push_back(ArgEncoding::Serialized);
+                fixed_value_sizes.push_back(0);
+            }
+        }
+    }
+
+    String getName() const override { return function_name; }
+    bool allocatesMemoryInArena() const override { return true; }
+    bool hasTrivialDestructor() const override { return true; }
+
+    size_t sizeOfData() const override { return sizeof(State); }
+    size_t alignOfData() const override { return alignof(State); }
+
+    void create(AggregateDataPtr __restrict place) const override
+    {
+        new (place) State();
+    }
+
+    void destroy(AggregateDataPtr __restrict place) const noexcept override
+    {
+        /// Everything the state owns lives in the arena and dies with it.
+        reinterpret_cast<State *>(place)->~State();
+    }
+
+    void add(AggregateDataPtr __restrict place, const IColumn ** columns, size_t row_num, Arena * arena) const override
+    {
+        appendRow(*reinterpret_cast<State *>(place), columns, row_num, arena);
+    }
+
+    void addBatchSinglePlace(
+        size_t row_begin, size_t row_end,
+        AggregateDataPtr __restrict place,
+        const IColumn ** columns,
+        Arena * arena,
+        ssize_t if_argument_pos) const override
+    {
+        auto & state = *reinterpret_cast<State *>(place);
+        if (if_argument_pos >= 0)
+        {
+            const auto & filter = assert_cast<const ColumnUInt8 &>(*columns[if_argument_pos]);
+            for (size_t row = row_begin; row < row_end; ++row)
+                if (filter.getElement(row))
+                    appendRow(state, columns, row, arena);
+            return;
+        }
+        for (size_t row = row_begin; row < row_end; ++row)
+            appendRow(state, columns, row, arena);
+    }
+
+    void mergeImpl(AggregateDataPtr __restrict place, ConstAggregateDataPtr rhs, Arena * arena) const override
+    {
+        auto & state = *reinterpret_cast<State *>(place);
+        const auto & rhs_state = *reinterpret_cast<const State *>(rhs);
+
+        /// The two states may live in different arenas, so the bytes have to be copied
+        /// rather than the lists spliced.
+        for (const Node * node = rhs_state.head; node != nullptr; node = node->next)
+        {
+            char * copy = arena->alloc(node->size);
+            memcpy(copy, node->data, node->size);
+            pushNode(state, copy, node->size, arena);
+        }
+    }
+
+    void serialize(ConstAggregateDataPtr __restrict place, WriteBuffer & buf, std::optional<size_t> /*version*/) const override
+    {
+        const auto * state = reinterpret_cast<const State *>(place);
+        auto columns = materializeRows(&state, 1);
+        writeVarUInt(state->num_rows, buf);
+        for (size_t i = 0; i < columns.size(); ++i)
+        {
+            auto serialization = original_arg_types[i]->getDefaultSerialization();
+            serialization->serializeBinaryBulk(*columns[i], buf, 0, state->num_rows);
+        }
+    }
+
+    void deserialize(AggregateDataPtr __restrict place, ReadBuffer & buf, std::optional<size_t> /*version*/, Arena * arena) const override
+    {
+        auto & state = *reinterpret_cast<State *>(place);
+        size_t num_rows = 0;
+        readVarUInt(num_rows, buf);
+
+        MutableColumns columns;
+        columns.reserve(original_arg_types.size());
+        for (const auto & type : original_arg_types)
+            columns.push_back(type->createColumn());
+        for (size_t i = 0; i < columns.size(); ++i)
+        {
+            auto serialization = original_arg_types[i]->getDefaultSerialization();
+            serialization->deserializeBinaryBulk(*columns[i], buf, /*rows_offset=*/0, num_rows, /*avg_value_size_hint=*/0);
+        }
+
+        std::vector<const IColumn *> raw;
+        raw.reserve(columns.size());
+        for (const auto & column : columns)
+            raw.push_back(column.get());
+        for (size_t row = 0; row < num_rows; ++row)
+            appendRow(state, raw.data(), row, arena);
+    }
+
+    void insertResultInto(AggregateDataPtr __restrict place, IColumn & to, Arena *) const override
+    {
+        const auto * state = reinterpret_cast<const State *>(place);
+        executeOnGroups(&state, 1, to);
+    }
+
+    void insertResultIntoBatch(
+        size_t row_begin,
+        size_t row_end,
+        AggregateDataPtr * places,
+        size_t place_offset,
+        IColumn & to,
+        Arena *) const override
+    {
+        std::vector<const State *> states;
+        states.reserve(row_end - row_begin);
+        for (size_t i = row_begin; i < row_end; ++i)
+            states.push_back(reinterpret_cast<const State *>(places[i] + place_offset));
+
+        try
+        {
+            executeOnGroups(states.data(), states.size(), to);
+        }
+        catch (...)
+        {
+            /// Nothing was inserted, so every place in the range is still ours to destroy.
+            for (size_t i = row_begin; i < row_end; ++i)
+                destroy(places[i] + place_offset);
+            throw;
+        }
+
+        for (size_t i = row_begin; i < row_end; ++i)
+            destroyUpToState(places[i] + place_offset);
+    }
+
+private:
+    /// One accumulated row: all arguments serialized back to back, immediately after the node.
+    enum class ArgEncoding : uint8_t
+    {
+        FixedWidth,
+        VariableWidth,
+        Serialized,
+    };
+
+    struct Node
+    {
+        Node * next;
+        const char * data;
+        size_t size;
+    };
+
+    struct State
+    {
+        Node * head = nullptr;
+        Node * tail = nullptr;
+        size_t num_rows = 0;
+    };
+
+    void pushNode(State & state, const char * data, size_t size, Arena * arena) const
+    {
+        auto * node = reinterpret_cast<Node *>(arena->alignedAlloc(sizeof(Node), alignof(Node)));
+        node->next = nullptr;
+        node->data = data;
+        node->size = size;
+
+        if (state.tail != nullptr)
+            state.tail->next = node;
+        else
+            state.head = node;
+        state.tail = node;
+        ++state.num_rows;
+    }
+
+    void appendRow(State & state, const IColumn ** columns, size_t row_num, Arena * arena) const
+    {
+        const auto settings = IColumn::SerializationSettings::createForAggregationState();
+        const char * begin = nullptr;
+        size_t size = 0;
+        for (size_t i = 0; i < arg_encodings.size(); ++i)
+        {
+            switch (arg_encodings[i])
+            {
+                case ArgEncoding::FixedWidth:
+                {
+                    const size_t value_size = fixed_value_sizes[i];
+                    memcpy(arena->allocContinue(value_size, begin), columns[i]->getDataAt(row_num).data(), value_size);
+                    size += value_size;
+                    break;
+                }
+                case ArgEncoding::VariableWidth:
+                {
+                    const auto value = columns[i]->getDataAt(row_num);
+                    const auto value_size = static_cast<UInt32>(value.size());
+                    char * pos = arena->allocContinue(sizeof(value_size) + value.size(), begin);
+                    memcpy(pos, &value_size, sizeof(value_size));
+                    memcpy(pos + sizeof(value_size), value.data(), value.size());
+                    size += sizeof(value_size) + value.size();
+                    break;
+                }
+                case ArgEncoding::Serialized:
+                    size += columns[i]->serializeValueIntoArena(row_num, *arena, begin, &settings).size();
+                    break;
+            }
+        }
+        pushNode(state, begin, size, arena);
+    }
+
+    /// Flatten the rows of `num_groups` consecutive states into one column per argument.
+    MutableColumns materializeRows(const State * const * states, size_t num_groups) const
+    {
+        auto settings = IColumn::SerializationSettings::createForAggregationState();
+
+        size_t total_rows = 0;
+        for (size_t g = 0; g < num_groups; ++g)
+            total_rows += states[g]->num_rows;
+
+        MutableColumns columns;
+        columns.reserve(original_arg_types.size());
+        for (const auto & type : original_arg_types)
+        {
+            columns.push_back(type->createColumn());
+            columns.back()->reserve(total_rows);
+        }
+
+        for (size_t g = 0; g < num_groups; ++g)
+        {
+            for (const Node * node = states[g]->head; node != nullptr; node = node->next)
+            {
+                const char * cursor = node->data;
+                const char * row_end = node->data + node->size;
+                for (size_t i = 0; i < columns.size(); ++i)
+                {
+                    switch (arg_encodings[i])
+                    {
+                        case ArgEncoding::FixedWidth:
+                            columns[i]->insertData(cursor, fixed_value_sizes[i]);
+                            cursor += fixed_value_sizes[i];
+                            break;
+                        case ArgEncoding::VariableWidth:
+                        {
+                            UInt32 value_size = 0;
+                            memcpy(&value_size, cursor, sizeof(value_size));
+                            cursor += sizeof(value_size);
+                            columns[i]->insertData(cursor, value_size);
+                            cursor += value_size;
+                            break;
+                        }
+                        case ArgEncoding::Serialized:
+                        {
+                            ReadBufferFromMemory in(cursor, row_end - cursor);
+                            columns[i]->deserializeAndInsertFromArena(in, &settings);
+                            cursor += in.count();
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        return columns;
+    }
+
+    /// One WASM call for the whole batch: each argument becomes an Array(T) column with one
+    /// array element per group.
+    void executeOnGroups(const State * const * states, size_t num_groups, IColumn & to) const
+    {
+        auto columns = materializeRows(states, num_groups);
+
+        PaddedPODArray<UInt64> offsets;
+        offsets.reserve(num_groups);
+        UInt64 total = 0;
+        for (size_t g = 0; g < num_groups; ++g)
+        {
+            total += states[g]->num_rows;
+            offsets.push_back(total);
+        }
+
+        Block block;
+        for (size_t i = 0; i < original_arg_types.size(); ++i)
+        {
+            auto offsets_col = ColumnArray::ColumnOffsets::create();
+            offsets_col->getData().assign(offsets);
+            auto array_col = ColumnArray::create(std::move(columns[i]), std::move(offsets_col));
+            auto array_type = std::make_shared<DataTypeArray>(original_arg_types[i]);
+            block.insert(ColumnWithTypeAndName(std::move(array_col), array_type, "arg" + std::to_string(i)));
+        }
+
+        auto compartment_entry = compartment_pool.acquire();
+        StopSource stop_source;
+        auto result_col = wasm_function->executeOnBlock(&(*compartment_entry), block, context, num_groups, stop_source.get_token());
+
+        if (result_col->size() != num_groups)
+            throw Exception(ErrorCodes::WASM_ERROR,
+                "WASM aggregate function '{}' returned {} rows, expected {}",
+                function_name, result_col->size(), num_groups);
+
+        to.insertRangeFrom(*result_col, 0, num_groups);
+    }
+
+    String function_name;
+    std::shared_ptr<UserDefinedWebAssemblyFunction> wasm_function;
+    DataTypes original_arg_types;
+    std::vector<ArgEncoding> arg_encodings;
+    std::vector<size_t> fixed_value_sizes;
+    ContextPtr context;
+    mutable StopSource interrupt_source;
+    mutable WasmCompartmentPool compartment_pool;
+};
+
+/// Returns true if `actual` argument types are compatible with `expected` for WASM dispatch.
+/// Mirrors the per-argument matching logic in FunctionUserDefinedWasm::getReturnTypeImpl.
+static bool typesMatchOverload(const DataTypes & actual, const DataTypes & expected)
+{
+    if (actual.size() != expected.size())
+        return false;
+    for (size_t i = 0; i < actual.size(); ++i)
+    {
+        if (actual[i]->equals(*expected[i]))
+            continue;
+        const DataTypePtr & stripped = removeNullable(actual[i]);
+        if (stripped->equals(*expected[i]))
+            continue;
+        auto actual_kind   = wasmKindForDataType(stripped.get());
+        auto expected_kind = wasmKindForDataType(expected[i].get());
+        if (actual_kind && expected_kind && *actual_kind == *expected_kind)
+            continue;
+        // Allow CH geo types (Point, LineString, …) to satisfy a Geometry (Variant) parameter.
+        // Constant-folded geo literals arrive as bare structural types (e.g. Tuple(Float64,Float64))
+        // without the custom name, so we also accept structural matches against variant members.
+        if (const auto * variant_type = typeid_cast<const DataTypeVariant *>(expected[i].get()))
+        {
+            if (variant_type->tryGetVariantDiscriminator(stripped->getName()).has_value())
+                continue;
+            bool structural_match = false;
+            for (const auto & v : variant_type->getVariants())
+                if (stripped->equals(*v)) { structural_match = true; break; }
+            if (structural_match)
+                continue;
+        }
+        return false;
+    }
+    return true;
+}
+
+/// Overload resolver for WASM functions registered under the same SQL name with different
+/// argument type signatures.  At planning time it picks the first overload whose declared
+/// argument types match the call-site types; the selected FunctionBase carries exactly that
+/// one overload into executeImpl, so no re-selection is needed at execution time.
+class WasmOverloadResolver : public IFunctionOverloadResolver
+{
+public:
+    WasmOverloadResolver(
+        String name_,
+        std::vector<std::shared_ptr<FunctionUserDefinedWasm>> overloads_,
+        ContextPtr context_)
+        : name(std::move(name_))
+        , overloads(std::move(overloads_))
+        , context(std::move(context_))
+    {}
+
+    String getName() const override { return name; }
+    bool isVariadic() const override { return false; }
+    size_t getNumberOfArguments() const override
+    {
+        return overloads.empty() ? 0 : overloads.front()->getNumberOfArguments();
+    }
+
+    bool isDeterministic() const override
+    {
+        return overloads.empty() || overloads.front()->isDeterministic();
+    }
+    bool useDefaultImplementationForNulls() const override
+    {
+        return overloads.empty() || overloads.front()->useDefaultImplementationForNulls();
+    }
+    bool isSpatialPredicate() const override
+    {
+        return !overloads.empty() && overloads.front()->isSpatialPredicate();
+    }
+
+    // Disable CH's automatic Variant-expansion so that a Geometry argument reaches the
+    // overload that explicitly declares Geometry rather than being fanned out over each
+    // Variant alternative (Point, LineString, …) before we get a chance to match.
+    bool useDefaultImplementationForVariant() const override { return false; }
+
+    DataTypePtr getReturnTypeImpl(const DataTypes & arguments) const override
+    {
+        for (const auto & fn : overloads)
+        {
+            if (typesMatchOverload(arguments, fn->getArgumentTypes()))
+                return fn->getReturnTypeImpl(arguments);
+        }
+        auto get_names = std::views::transform([](const auto & t) { return t->getName(); });
+        throw Exception(
+            ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT,
+            "No matching overload of '{}' for argument types ({})",
+            name,
+            fmt::join(arguments | get_names, ", "));
+    }
+
+    FunctionBasePtr buildImpl(const ColumnsWithTypeAndName & arguments, const DataTypePtr & result_type) const override
+    {
+        DataTypes types;
+        types.reserve(arguments.size());
+        for (const auto & a : arguments)
+            types.push_back(a.type);
+
+        for (const auto & fn : overloads)
+        {
+            if (typesMatchOverload(types, fn->getArgumentTypes()))
+                return std::make_unique<FunctionToFunctionBaseAdaptor>(fn, types, result_type);
+        }
+        throw Exception(
+            ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT,
+            "No matching overload of '{}' during build",
+            name);
+    }
+
+private:
+    String name;
+    std::vector<std::shared_ptr<FunctionUserDefinedWasm>> overloads;
+    ContextPtr context;
+};
+
 UserDefinedWebAssemblyFunctionFactory::RegisteredFunction
 UserDefinedWebAssemblyFunctionFactory::prepareFunction(ASTPtr create_function_query, WasmModuleManager & module_manager) const
 {
@@ -1827,6 +2379,40 @@ UserDefinedWebAssemblyFunctionFactory::prepareFunction(ASTPtr create_function_qu
 
     const auto & internal_function_name
         = function_def.source_function_name.empty() ? function_def.function_name : function_def.source_function_name;
+
+    const bool is_aggregate = function_def.settings.isAggregate();
+
+    if (is_aggregate && function_def.abi_version == WasmAbiVersion::RowDirect)
+        throw Exception(
+            ErrorCodes::BAD_ARGUMENTS,
+            "SETTINGS is_aggregate = 1 is not supported with ABI ROW_DIRECT: array arguments "
+            "cannot be passed as scalar WASM values. Use ABI BUFFERED_V1 instead.");
+
+    /// For aggregate functions, the WASM export receives Array(T) arguments — one array per declared
+    /// argument type containing all accumulated rows for the group.
+    /// If the declared type is already Array(T), use T as the accumulator element type and keep
+    /// the WASM signature as Array(T) (no double-wrapping).
+    /// If the declared type is scalar T, wrap to Array(T) for the WASM signature.
+    DataTypes wasm_arg_types = function_def.argument_types;
+    DataTypes accumulator_arg_types;
+    if (is_aggregate)
+    {
+        accumulator_arg_types.reserve(wasm_arg_types.size());
+        for (auto & type : wasm_arg_types)
+        {
+            if (const auto * array_type = typeid_cast<const DataTypeArray *>(type.get()))
+            {
+                accumulator_arg_types.push_back(array_type->getNestedType());
+                /// type is already Array(T) — leave wasm_arg_types entry unchanged
+            }
+            else
+            {
+                accumulator_arg_types.push_back(type);
+                type = std::make_shared<DataTypeArray>(type);
+            }
+        }
+    }
+
     std::shared_ptr<UserDefinedWebAssemblyFunction> wasm_func = UserDefinedWebAssemblyFunction::create(
         wasm_module,
         internal_function_name,
@@ -1837,7 +2423,13 @@ UserDefinedWebAssemblyFunctionFactory::prepareFunction(ASTPtr create_function_qu
         function_def.settings,
         function_def.is_deterministic);
 
-    return RegisteredFunction{function_def.function_name, std::move(wasm_func), std::move(create_function_query)};
+    return RegisteredFunction{
+        function_def.function_name,
+        std::move(wasm_func),
+        function_def.argument_types,
+        std::move(create_function_query),
+        is_aggregate,
+        accumulator_arg_types};
 }
 
 std::shared_ptr<UserDefinedWebAssemblyFunction>
@@ -1852,45 +2444,135 @@ UserDefinedWebAssemblyFunctionFactory::addOrReplace(ASTPtr create_function_query
 void UserDefinedWebAssemblyFunctionFactory::addOrReplace(RegisteredFunction registered_function)
 {
     std::unique_lock lock(registry_mutex);
-    registry[registered_function.sql_name] = RegistryEntry{std::move(registered_function.function), std::move(registered_function.create_query)};
+    auto & entries = registry[registered_function.sql_name];
+    // Replace an existing overload with the same argument types; otherwise add a new one.
+    for (auto & entry : entries)
+    {
+        if (typesMatchOverload(registered_function.original_arg_types, entry.original_arg_types))
+        {
+            entry = RegistryEntry{
+                std::move(registered_function.function),
+                std::move(registered_function.original_arg_types),
+                std::move(registered_function.create_query),
+                registered_function.is_aggregate,
+                std::move(registered_function.accumulator_arg_types)};
+            return;
+        }
+    }
+    const bool is_aggregate = registered_function.is_aggregate;
+    const String sql_name = registered_function.sql_name;
+    DataTypes accumulator_arg_types = registered_function.accumulator_arg_types;
+    entries.push_back(RegistryEntry{
+        std::move(registered_function.function),
+        std::move(registered_function.original_arg_types),
+        std::move(registered_function.create_query),
+        is_aggregate,
+        std::move(registered_function.accumulator_arg_types)});
+
+    if (is_aggregate)
+        registerAggregateName(sql_name, accumulator_arg_types);
+}
+
+void UserDefinedWebAssemblyFunctionFactory::registerAggregateName(
+    const String & sql_name, const DataTypes & accumulator_arg_types)
+{
+    if (!aggregate_names.insert(sql_name).second)
+        return;
+    if (AggregateFunctionFactory::instance().hasNameOrAlias(sql_name))
+        return;
+
+    /// The creator resolves the WASM function on every call rather than capturing it, so the
+    /// registration stays valid across DROP + CREATE OR REPLACE of the underlying function.
+    AggregateFunctionCreator wasm_aggregate_creator =
+        {[sql_name, accumulator_arg_types](const String &, const DataTypes &, const Array &, const Settings *) -> AggregateFunctionPtr
+         {
+             ContextPtr ctx;
+             if (CurrentThread::isInitialized())
+                 ctx = CurrentThread::get().tryGetQueryContext();
+             return UserDefinedWebAssemblyFunctionFactory::instance().getAggregate(sql_name, accumulator_arg_types, ctx);
+         }};
+    AggregateFunctionFactory::instance().registerFunction(
+        sql_name,
+        AggregateFunctionWithProperties{wasm_aggregate_creator, FunctionDocumentation{}, AggregateFunctionProperties{}});
+}
+
+bool UserDefinedWebAssemblyFunctionFactory::ownsAggregateName(const String & function_name) const
+{
+    std::shared_lock lock(registry_mutex);
+    return aggregate_names.contains(function_name);
 }
 
 void UserDefinedWebAssemblyFunctionFactory::replaceAll(VectorWithMemoryTracking<RegisteredFunction> registered_functions)
 {
-    UnorderedMapWithMemoryTracking<String, RegistryEntry> new_registry;
-    new_registry.reserve(registered_functions.size());
+    UnorderedMapWithMemoryTracking<String, std::vector<RegistryEntry>> new_registry;
+    std::vector<std::pair<String, DataTypes>> aggregates;
     for (auto & registered_function : registered_functions)
-        new_registry[registered_function.sql_name] = RegistryEntry{std::move(registered_function.function), std::move(registered_function.create_query)};
+    {
+        if (registered_function.is_aggregate)
+            aggregates.emplace_back(registered_function.sql_name, registered_function.accumulator_arg_types);
+        new_registry[registered_function.sql_name].push_back(RegistryEntry{
+            std::move(registered_function.function),
+            std::move(registered_function.original_arg_types),
+            std::move(registered_function.create_query),
+            registered_function.is_aggregate,
+            std::move(registered_function.accumulator_arg_types)});
+    }
 
     std::unique_lock lock(registry_mutex);
     registry = std::move(new_registry);
+    /// Functions restored from storage at startup are registered here too; skipping this left
+    /// them callable only as scalar functions.
+    for (const auto & [sql_name, accumulator_arg_types] : aggregates)
+        registerAggregateName(sql_name, accumulator_arg_types);
 }
 
 bool UserDefinedWebAssemblyFunctionFactory::has(const String & function_name) const
 {
     std::shared_lock lock(registry_mutex);
-    return registry.contains(function_name);
+    auto it = registry.find(function_name);
+    return it != registry.end() && !it->second.empty();
+}
+
+bool UserDefinedWebAssemblyFunctionFactory::hasOverload(const String & function_name, const DataTypes & arg_types) const
+{
+    std::shared_lock lock(registry_mutex);
+    auto it = registry.find(function_name);
+    if (it == registry.end() || it->second.empty())
+        return false;
+    for (const auto & entry : it->second)
+        if (typesMatchOverload(arg_types, entry.original_arg_types))
+            return true;
+    return false;
+}
+
+std::shared_ptr<UserDefinedWebAssemblyFunction> UserDefinedWebAssemblyFunctionFactory::getFunction(const String & function_name) const
+{
+    std::shared_lock lock(registry_mutex);
+    auto it = registry.find(function_name);
+    if (it == registry.end() || it->second.empty())
+        return nullptr;
+    return it->second.front().function;
 }
 
 FunctionOverloadResolverPtr UserDefinedWebAssemblyFunctionFactory::get(const String & function_name, ContextPtr context)
 {
-    std::shared_ptr<UserDefinedWebAssemblyFunction> wasm_func = nullptr;
+    std::vector<std::shared_ptr<FunctionUserDefinedWasm>> overload_fns;
     {
         std::shared_lock lock(registry_mutex);
         auto it = registry.find(function_name);
-        if (it == registry.end())
-        {
+        if (it == registry.end() || it->second.empty())
             throw Exception(
                 ErrorCodes::RESOURCE_NOT_FOUND,
                 "WebAssembly function '{}' not found in [{}]",
                 function_name,
                 fmt::join(registry | std::views::transform([](const auto & pair) { return pair.first; }), ", "));
-        }
-        wasm_func = it->second.function;
+        for (const auto & entry : it->second)
+            overload_fns.push_back(std::make_shared<FunctionUserDefinedWasm>(function_name, entry.function, context));
     }
 
-    auto executable_function = std::make_shared<FunctionUserDefinedWasm>(function_name, std::move(wasm_func), std::move(context));
-    return std::make_unique<FunctionToOverloadResolverAdaptor>(std::move(executable_function));
+    if (overload_fns.size() == 1)
+        return std::make_unique<FunctionToOverloadResolverAdaptor>(std::move(overload_fns.front()));
+    return std::make_unique<WasmOverloadResolver>(function_name, std::move(overload_fns), std::move(context));
 }
 
 FunctionOverloadResolverPtr UserDefinedWebAssemblyFunctionFactory::tryGet(const String & function_name, ContextPtr context)
@@ -1901,33 +2583,359 @@ FunctionOverloadResolverPtr UserDefinedWebAssemblyFunctionFactory::tryGet(const 
         auto it = registry.find(function_name);
         if (it == registry.end())
             return nullptr;
-        wasm_func = it->second.function;
+        wasm_func = it->second.front().function;
     }
 
     auto executable_function = std::make_shared<FunctionUserDefinedWasm>(function_name, std::move(wasm_func), std::move(context));
     return std::make_unique<FunctionToOverloadResolverAdaptor>(std::move(executable_function));
 }
 
+bool UserDefinedWebAssemblyFunctionFactory::isAggregate(const String & function_name) const
+{
+    std::shared_lock lock(registry_mutex);
+    auto it = registry.find(function_name);
+    return it != registry.end() && !it->second.empty() && it->second.front().is_aggregate;
+}
+
+AggregateFunctionPtr UserDefinedWebAssemblyFunctionFactory::getAggregate(
+    const String & function_name, const DataTypes & arg_types, ContextPtr context) const
+{
+    std::shared_ptr<UserDefinedWebAssemblyFunction> wasm_func;
+    DataTypes original_arg_types;
+    {
+        std::shared_lock lock(registry_mutex);
+        auto it = registry.find(function_name);
+        if (it == registry.end() || it->second.empty())
+            throw Exception(
+                ErrorCodes::RESOURCE_NOT_FOUND,
+                "WebAssembly aggregate function '{}' not found",
+                function_name);
+
+        const RegistryEntry * match = nullptr;
+        for (const auto & entry : it->second)
+        {
+            if (!entry.is_aggregate)
+                continue;
+            if (arg_types.empty() || typesMatchOverload(arg_types, entry.accumulator_arg_types))
+            {
+                match = &entry;
+                break;
+            }
+        }
+        if (!match)
+            match = &it->second.front(); // fallback: first aggregate entry
+        if (!match->is_aggregate)
+            throw Exception(
+                ErrorCodes::BAD_ARGUMENTS,
+                "WebAssembly function '{}' is not an aggregate function",
+                function_name);
+        wasm_func = match->function;
+        original_arg_types = match->accumulator_arg_types;
+    }
+    return std::make_shared<AggregateFunctionUserDefinedWasm>(
+        function_name, std::move(wasm_func), std::move(original_arg_types), std::move(context));
+}
+
+
 bool UserDefinedWebAssemblyFunctionFactory::dropIfExists(const String & function_name)
 {
+    // Backward compatibility: call the new method with empty argument types
+    return dropIfExists(function_name, {});
+}
+
+bool UserDefinedWebAssemblyFunctionFactory::dropIfExists(const String & function_name, const Strings & argument_type_names)
+{
     std::unique_lock lock(registry_mutex);
-    return registry.erase(function_name) > 0;
+    auto it = registry.find(function_name);
+    if (it == registry.end())
+        return false;
+
+    auto & entries = it->second;
+
+    if (argument_type_names.empty())
+    {
+        /// Drop all overloads
+        registry.erase(it);
+        return true;
+    }
+
+    /// Drop only the overload matching the signature
+    auto new_end = std::remove_if(entries.begin(), entries.end(),
+        [&argument_type_names](const RegistryEntry & entry)
+    {
+        if (entry.original_arg_types.size() != argument_type_names.size())
+            return false;
+        for (size_t i = 0; i < argument_type_names.size(); ++i)
+            if (entry.original_arg_types[i]->getName() != argument_type_names[i])
+                return false;
+        return true;
+    });
+
+    bool removed = (new_end != entries.end());
+    if (removed)
+    {
+        entries.erase(new_end, entries.end());
+        if (entries.empty())
+            registry.erase(it);
+    }
+    return removed;
 }
 
 VectorWithMemoryTracking<UserDefinedWebAssemblyFunctionFactory::RegisteredFunction> UserDefinedWebAssemblyFunctionFactory::getAllFunctions() const
 {
     std::shared_lock lock(registry_mutex);
     VectorWithMemoryTracking<RegisteredFunction> result;
-    result.reserve(registry.size());
-    for (const auto & [sql_name, entry] : registry)
-        result.push_back(RegisteredFunction{sql_name, entry.function, entry.create_query});
+    for (const auto & [sql_name, entries] : registry)
+        for (const auto & entry : entries)
+            result.push_back(RegisteredFunction{
+                .sql_name = sql_name,
+                .function = entry.function,
+                .original_arg_types = entry.original_arg_types,
+                .create_query = entry.create_query,
+                .is_aggregate = entry.is_aggregate,
+                .accumulator_arg_types = entry.accumulator_arg_types});
     return result;
 }
+
+
 
 UserDefinedWebAssemblyFunctionFactory & UserDefinedWebAssemblyFunctionFactory::instance()
 {
     static UserDefinedWebAssemblyFunctionFactory factory;
     return factory;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// WASM chain executor
+//
+// Executes a validated SOURCE → XFORM* → SINK chain in a single WASM call via
+// clickhouse_chain_execute.
+//
+// Chain buffer layout (passed to WASM):
+//   [n_funcs: u32][cstr name_0]...[cstr name_n-1][pad to 8B][COLUMNAR_V1 data]
+// ─────────────────────────────────────────────────────────────────────────────
+
+class FunctionUserDefinedWasmChain : public IFunction
+{
+public:
+    FunctionUserDefinedWasmChain(
+        String name_,
+        Strings fn_names_,
+        std::shared_ptr<WebAssembly::WasmModule> wasm_module_,
+        DataTypes source_arg_types_,
+        DataTypePtr result_type_,
+        std::vector<std::vector<Field>> fn_scalar_values_,
+        std::vector<DataTypes>          fn_scalar_types_,
+        ContextPtr context_,
+        WebAssembly::FuelMode fuel_mode_)
+        : name(std::move(name_))
+        , fn_names(std::move(fn_names_))
+        , wasm_module(std::move(wasm_module_))
+        , source_arg_types(std::move(source_arg_types_))
+        , result_type(std::move(result_type_))
+        , fn_scalar_values(std::move(fn_scalar_values_))
+        , fn_scalar_types(std::move(fn_scalar_types_))
+        , context(std::move(context_))
+        , fuel_mode(fuel_mode_)
+        , compartment_pool(
+              static_cast<UInt32>(context->getSettingsRef()[Setting::webassembly_udf_max_instances]),
+              wasm_module,
+              getWasmModuleConfig(context, fuel_mode),
+              interrupt_source.get_token(),
+              tryGetModuleInitFn(wasm_module))
+    {
+    }
+
+    String getName() const override { return name; }
+    bool isVariadic() const override { return false; }
+    bool isDeterministic() const override { return false; }
+    bool isSuitableForShortCircuitArgumentsExecution(const DataTypesWithConstInfo &) const override { return false; }
+    size_t getNumberOfArguments() const override { return source_arg_types.size(); }
+
+    DataTypePtr getReturnTypeImpl(const DataTypes &) const override { return result_type; }
+
+    bool useDefaultImplementationForNulls() const override
+    {
+        return result_type->canBeInsideNullable();
+    }
+
+    ColumnPtr executeImpl(
+        const ColumnsWithTypeAndName & arguments,
+        const DataTypePtr & /*result_type*/,
+        size_t input_rows_count) const override
+    {
+        ProfileEventTimeIncrement<Microseconds> timer(ProfileEvents::WasmTotalExecuteMicroseconds);
+
+        if (input_rows_count == 0)
+            return result_type->createColumn();
+
+        auto compartment_entry = compartment_pool.acquire();
+        auto * compartment_ptr = &(*compartment_entry);
+        auto stop_token = interrupt_source.get_token();
+
+        auto wmm = std::make_unique<WasmMemoryManagerV01>(compartment_ptr, stop_token);
+
+        // ── Build chain descriptor buffer: [n_funcs: u32][cstr names...] ────
+        const uint32_t n_funcs = static_cast<uint32_t>(fn_names.size());
+        std::vector<uint8_t> chain_bytes;
+        chain_bytes.resize(4);
+        std::memcpy(chain_bytes.data(), &n_funcs, 4);
+        for (const auto & fn : fn_names)
+        {
+            chain_bytes.insert(chain_bytes.end(),
+                reinterpret_cast<const uint8_t *>(fn.c_str()),
+                reinterpret_cast<const uint8_t *>(fn.c_str()) + fn.size() + 1);
+        }
+
+        // ── Build COLUMNAR_V1 row buffer ─────────────────────────────────────
+        // Scalar constants are appended after the source geometry columns as
+        // COL_IS_CONST columns (1 stored row each).  The WASM side reads them
+        // by column index after consuming the source geometry columns.
+        const uint32_t num_src_cols = static_cast<uint32_t>(arguments.size());
+
+        // Materialise scalar constants into 1-row mutable columns.
+        uint32_t total_scalar_cols = 0;
+        for (const auto & sv : fn_scalar_values)
+            total_scalar_cols += static_cast<uint32_t>(sv.size());
+
+        std::vector<MutableColumnPtr> scalar_col_storage;
+        scalar_col_storage.reserve(total_scalar_cols);
+        for (size_t fi = 0; fi < fn_scalar_values.size(); ++fi)
+            for (size_t si = 0; si < fn_scalar_values[fi].size(); ++si)
+            {
+                auto mut = fn_scalar_types[fi][si]->createColumn();
+                mut->insert(fn_scalar_values[fi][si]);
+                scalar_col_storage.push_back(std::move(mut));
+            }
+
+        const uint32_t num_cols = num_src_cols + total_scalar_cols;
+        uint64_t col_cursor = COLUMNAR_HEADER_BYTES + num_cols * COLUMNAR_DESC_BYTES;
+
+        std::vector<ColDescriptor> descs(num_cols);
+        std::vector<const IColumn *> inner_cols(num_cols);
+        std::vector<bool> is_nullable_flags(num_cols, false);
+        std::vector<uint32_t> row_counts(num_cols);
+
+        for (uint32_t ci = 0; ci < num_src_cols; ++ci)
+        {
+            const IColumn * col = arguments[ci].column.get();
+            bool is_const = false;
+            if (const auto * cc = typeid_cast<const ColumnConst *>(col))
+            {
+                col = &cc->getDataColumn();
+                is_const = true;
+            }
+            bool is_nullable = typeid_cast<const ColumnNullable *>(col) != nullptr;
+            uint32_t nrows = is_const ? 1u : static_cast<uint32_t>(input_rows_count);
+            is_nullable_flags[ci] = is_nullable;
+            inner_cols[ci]        = col;
+            row_counts[ci]        = nrows;
+            col_cursor = buildColDescriptor(col, is_const, is_nullable, nrows, col_cursor, descs[ci]);
+        }
+
+        for (uint32_t si = 0; si < total_scalar_cols; ++si)
+        {
+            uint32_t ci = num_src_cols + si;
+            const IColumn * col = scalar_col_storage[si].get();
+            inner_cols[ci]  = col;
+            row_counts[ci]  = 1u;
+            col_cursor = buildColDescriptor(col, /*is_const=*/true, /*is_nullable=*/false, 1u, col_cursor, descs[ci]);
+        }
+
+        {
+            // Stopped explicitly before the guest call below, so that marshalling is not
+            // credited with the execution time. The buffers have to stay alive across both,
+            // which is why the timer is optional instead of scoped to a block.
+            std::optional<ProfileEventTimeIncrement<Microseconds>> timer_ser;
+            timer_ser.emplace(ProfileEvents::WasmSerializationMicroseconds);
+
+            // Allocate two separate WASM buffers.
+            WasmMemoryGuard wasm_chain = allocateInWasmMemory(wmm.get(), static_cast<uint32_t>(chain_bytes.size()));
+            std::memcpy(wasm_chain.getMemoryView().data(), chain_bytes.data(), chain_bytes.size());
+
+            WasmMemoryGuard wasm_row = allocateInWasmMemory(wmm.get(), col_cursor);
+            auto row_mem = wasm_row.getMemoryView();
+
+            uint32_t n_rows32 = static_cast<uint32_t>(input_rows_count);
+            std::memcpy(row_mem.data(),     &n_rows32, 4);
+            std::memcpy(row_mem.data() + 4, &num_cols, 4);
+
+            for (uint32_t ci = 0; ci < num_cols; ++ci)
+                std::memcpy(row_mem.data() + COLUMNAR_HEADER_BYTES + ci * COLUMNAR_DESC_BYTES,
+                            &descs[ci], COLUMNAR_DESC_BYTES);
+
+            for (uint32_t ci = 0; ci < num_cols; ++ci)
+                writeColData(inner_cols[ci], is_nullable_flags[ci], row_counts[ci], descs[ci], row_mem);
+
+            timer_ser.reset();
+
+            // ── Invoke clickhouse_chain_execute(chain_buf, row_buf, n) ───────
+            auto result_ptr = compartment_ptr->invoke<WasmPtr>(
+                "clickhouse_chain_execute",
+                {wasm_chain.getHandle(), wasm_row.getHandle(), static_cast<WasmSizeT>(input_rows_count)},
+                stop_token);
+
+            if (result_ptr == 0)
+                throw Exception(ErrorCodes::WASM_ERROR, "clickhouse_chain_execute returned nullptr");
+
+            WasmMemoryGuard result_guard(wmm.get(), result_ptr);
+
+            {
+                ProfileEventTimeIncrement<Microseconds> timer_de(ProfileEvents::WasmDeserializationMicroseconds);
+                auto out_view = result_guard.getMemoryView();
+                return readColumnarOutput(
+                    {out_view.data(), out_view.size()},
+                    result_type,
+                    input_rows_count);
+            }
+        }
+    }
+
+    void cancelExecution() const override { interrupt_source.request_stop(); }
+
+private:
+    String                                    name;
+    Strings                                   fn_names;
+    std::shared_ptr<WebAssembly::WasmModule>  wasm_module;
+    DataTypes                                 source_arg_types;
+    DataTypePtr                               result_type;
+    std::vector<std::vector<Field>>           fn_scalar_values;
+    std::vector<DataTypes>                    fn_scalar_types;
+    ContextPtr                                context;
+    WebAssembly::FuelMode                     fuel_mode;
+    mutable StopSource                        interrupt_source;
+    mutable WasmCompartmentPool               compartment_pool;
+};
+
+FunctionOverloadResolverPtr createWasmChainResolver(
+    Strings fn_names,
+    std::shared_ptr<WebAssembly::WasmModule> wasm_module,
+    DataTypes source_arg_types,
+    DataTypePtr result_type,
+    std::vector<std::vector<Field>> fn_scalar_values,
+    std::vector<DataTypes>          fn_scalar_types,
+    ContextPtr context,
+    WebAssembly::FuelMode fuel_mode)
+{
+    // Synthetic name for logging/explain; not registered in any factory.
+    String chain_name = "__wasm_chain";
+    for (const auto & n : fn_names)
+    {
+        chain_name += '_';
+        chain_name += n;
+    }
+
+    auto fn = std::make_shared<FunctionUserDefinedWasmChain>(
+        std::move(chain_name),
+        std::move(fn_names),
+        std::move(wasm_module),
+        std::move(source_arg_types),
+        std::move(result_type),
+        std::move(fn_scalar_values),
+        std::move(fn_scalar_types),
+        std::move(context),
+        fuel_mode);
+    return std::make_unique<FunctionToOverloadResolverAdaptor>(std::move(fn));
 }
 
 struct WebAssemblyFunctionSettingsConstraits : public IHints<>
@@ -1999,12 +3007,33 @@ struct WebAssemblyFunctionSettingsConstraits : public IHints<>
         }
     };
 
+    struct SettingInt64
+    {
+        SettingDefinition withDefault(Int64 default_value) const
+        {
+            return SettingDefinition(
+                [](std::string_view name, const Field & value)
+                {
+                    if (value.getType() != Field::Types::Int64 && value.getType() != Field::Types::UInt64)
+                        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Expected an integer for setting '{}'", name);
+                },
+                Field(default_value));
+        }
+    };
+
     const UnorderedMapWithMemoryTracking<String, SettingDefinition> settings_def = {
         /// Serialization format for input/output data for ABI what uses serialization
         {"serialization_format", SettingStringFromSet{{"MsgPack", "JSONEachRow", "CSV", "TSV", "TSVRaw", "RowBinary", "Buffers", "ColumnBinary"}}.withDefault("MsgPack")},
         {"webassembly_udf_enable_fuel", SettingBool{}.withDefault(true)},
         /// Whether bbox-disjoint pruning is safe for this function (see IFunctionBase::isSpatialPredicate).
         {"is_spatial_predicate", SettingBool{}.withDefault(false)},
+        /// For distance predicates (e.g. st_dwithin): 0-based index of the constant distance
+        /// argument. SpatialRTreeJoin expands the R-tree query bbox by this amount.
+        /// -1 (default) means no expansion.
+        {"spatial_expand_arg", SettingInt64{}.withDefault(-1)},
+        /// Registers the WASM function as an aggregate function: arguments are received
+        /// as Array(T) accumulating all rows in the group instead of per-row scalars.
+        {"is_aggregate", SettingBool{}.withDefault(false)},
     };
 
     VectorWithMemoryTracking<String> getAllRegisteredNames() const override
@@ -2062,5 +3091,11 @@ WebAssembly::FuelMode WebAssemblyFunctionSettings::getFuelMode() const
 {
     return isFuelEnabled() ? WebAssembly::FuelMode::Enabled : WebAssembly::FuelMode::Disabled;
 }
+
+bool WebAssemblyFunctionSettings::isAggregate() const
+{
+    return getValue("is_aggregate").safeGet<bool>();
+}
+
 
 }

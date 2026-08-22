@@ -345,12 +345,28 @@ struct PlainStringDecoder : public PageDecoder
         {
             /// Fast path for directly appending to ColumnString.
             auto & col_str = assert_cast<ColumnString &>(col);
-            size_t to_reserve = filter ? 0 : num_values;
-            for (size_t i = 0; filter && i < num_values; ++i)
-                to_reserve += filter[filter_offset + i];
-            if (!filter)
-                to_reserve = num_values;
+            size_t to_reserve = num_values;
+            if (filter)
+            {
+                to_reserve = 0;
+                for (size_t i = 0; i < num_values; ++i)
+                    to_reserve += filter[filter_offset + i];
+            }
             col_str.reserve(col_str.size() + to_reserve);
+
+            /// reserve() sizes the offsets array only. Without a separate payload reservation
+            /// `chars` grows by repeated doubling, and each growth faults in fresh pages.
+            /// Walking the length prefixes to get the exact size costs a second pass over the
+            /// page, which is more expensive than the reallocations it saves, so bound the
+            /// payload from the page instead: of the bytes left in it, 4 per value are length
+            /// prefixes. When this call consumes the whole page the bound is exact; otherwise
+            /// it overshoots by the tail, so scale it by the fraction of values kept.
+            const size_t remaining = size_t(end - data);
+            const size_t prefix_bytes = num_values * 4;
+            size_t payload_bound = remaining > prefix_bytes ? remaining - prefix_bytes : 0;
+            if (filter && to_reserve < num_values)
+                payload_bound = payload_bound / num_values * to_reserve;
+            col_str.getChars().reserve_exact(col_str.getChars().size() + payload_bound);
             for (size_t i = 0; i < num_values; ++i)
             {
                 UInt32 x = 0;

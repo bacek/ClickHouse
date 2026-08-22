@@ -191,6 +191,8 @@ QueryTreeNodePtr JoinNode::cloneImpl() const
         getJoinExpression(),
         locality, strictness, kind, is_using_join_expression);
     clone->is_natural = is_natural;
+    clone->is_fused_child = is_fused_child;
+    clone->fused_spatial_info = fused_spatial_info;
     return clone;
 }
 

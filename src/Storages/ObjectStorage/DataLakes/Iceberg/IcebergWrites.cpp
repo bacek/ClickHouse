@@ -503,14 +503,10 @@ void generateManifestFile(
 
             auto lower_statistics = data_file_statistics->getLowerBounds();
             if (canWriteStatistics(lower_statistics, field_id_to_column_index, sample_block))
-            {
                 set_fields(lower_statistics, Iceberg::f_lower_bounds, dump_fields);
-            }
             auto upper_statistics = data_file_statistics->getUpperBounds();
             if (canWriteStatistics(upper_statistics, field_id_to_column_index, sample_block))
-            {
                 set_fields(upper_statistics, Iceberg::f_upper_bounds, dump_fields);
-            }
         }
         data_file.field(Iceberg::f_record_count) = avro::GenericDatum(static_cast<Int64>(data_file_row_counts[file_idx]));
         data_file.field(Iceberg::f_file_size_in_bytes) = avro::GenericDatum(static_cast<Int64>(data_file_byte_counts[file_idx]));

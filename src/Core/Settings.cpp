@@ -2675,6 +2675,23 @@ Determine which side of the join should be the build table (also called inner, t
 - 'false': Never swap tables (the right table is the build table).
 - 'true': Always swap tables (the left table is the build table).
 )", 0) \
+DECLARE(Bool, query_plan_spatial_rtree_swap_table, false, R"(
+    When enabled, automatically swap the build and probe sides of a spatial R-tree join
+    (SpatialRTreeJoin) if row count estimates indicate that the left (probe) side is much
+    larger than the right (build) side (more than 5×). Swapping reduces R-tree probe calls
+    at the cost of building the R-tree on the originally-larger side.
+    Disabled by default because R-tree build cost (O(N log N)) typically outweighs probe
+    savings when the larger side moves to the build position.
+)", 0) \
+DECLARE(Bool, query_plan_fuse_spatial_joins, false, R"(
+    When enabled, fuses two spatial predicate joins against the same right-side table into a
+    single SpatialRTreeDoubleJoin pass. The fused join builds the R-tree once and probes it
+    twice per left row (once per spatial predicate), eliminating the intermediate result that
+    would otherwise be materialized between the two joins.
+    Beneficial only when the shared right-side table is small (≤1000 rows), because each
+    unique right-side geometry still requires a PreparedGeometry build per WASM call.
+    Disabled by default.
+)", 0) \
 DECLARE(UInt64, query_plan_optimize_join_order_limit, 10, R"(
 Optimize the order of joins within the same subquery. Currently only supported for very limited cases.
 Value is the maximum number of tables to optimize.

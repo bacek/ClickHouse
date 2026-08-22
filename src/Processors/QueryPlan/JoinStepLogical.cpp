@@ -2,8 +2,15 @@
 #include <DataTypes/IDataType.h>
 #include <Processors/QueryPlan/JoinStepLogical.h>
 #include <Processors/QueryPlan/QueryPlanFormat.h>
+#include <Processors/QueryPlan/QueryPlanStepRegistry.h>
 
 #include <base/scope_guard.h>
+
+namespace DB
+{
+class QueryPlanStepRegistry;
+void registerJoinStep(QueryPlanStepRegistry & registry);
+}
 
 #include <Common/JSONBuilder.h>
 #include <Common/safe_cast.h>
@@ -60,6 +67,7 @@
 
 #include <Storages/MergeTree/MergeTreeData.h>
 #include <Storages/StorageJoin.h>
+#include <Interpreters/SpatialRTreeJoin.h>
 
 #include <Processors/QueryPlan/Optimizations/joinOrder.h>
 #include <algorithm>
@@ -1448,19 +1456,49 @@ static QueryPlanNode buildPhysicalJoinImpl(
                     && TableJoin::isEnabledAlgorithm(join_settings.join_algorithms, JoinAlgorithm::HASH)
                     && join_operator.strictness == JoinStrictness::All;
 
-                is_disjunctive_condition = tryAddDisjunctiveConditions(
-                    join_expression, table_join_clauses, used_expressions, join_settings, planning_context,
-                    join_operator.shared_runtime_filter_descriptors, !can_convert_to_cross);
-
-                if (!is_disjunctive_condition)
+                /// Check if this is a spatial predicate join (SpatialRTreeJoin handles INNER, LEFT, and RIGHT).
+                /// RIGHT arises when the generic join optimizer flips a LEFT JOIN to put the smaller side on the build (right) side.
+                bool is_spatial_predicate_join = false;
+                if ((isInner(join_operator.kind) || isLeft(join_operator.kind) || isRight(join_operator.kind)) && join_expression.size() == 1)
                 {
-                    if (!can_convert_to_cross)
-                        throw Exception(ErrorCodes::INVALID_JOIN_ON_EXPRESSION, "Cannot determine join keys in JOIN ON expression {}",
-                            formatJoinCondition(join_expression));
+                    const auto * node = join_expression[0].getNode();
+                    /// Spatial predicates (st_within, st_contains, st_intersects, ...) route to SpatialRTreeJoin.
+                    /// canUseSpatialPredicate must be consulted here and not just in
+                    /// chooseJoinAlgorithm(): committing to the empty-key clause below discards
+                    /// the cross-join fallback, so a predicate that SpatialRTreeJoin later
+                    /// declines would be left with no join algorithm at all.
+                    is_spatial_predicate_join = node
+                        && node->type == ActionsDAG::ActionType::FUNCTION
+                        && node->function_base
+                        && node->function_base->isSpatialPredicate()
+                        && SpatialRTreeJoin::canUseSpatialPredicate(node);
+                }
 
-                    join_operator.kind = JoinKind::Cross;
-                    join_operator.residual_filter.append_range(join_expression);
+                if (is_spatial_predicate_join)
+                {
+                    table_join_clauses.emplace_back(); /// empty-key clause for SpatialRTreeJoin
+                    JoinActionRef spatial_pred = join_expression[0];
                     join_expression.clear();
+                    auto spatial_dag = JoinExpressionActions::getSubDAG(std::views::single(spatial_pred));
+                    table_join->getMixedJoinExpression() = std::make_shared<ExpressionActions>(
+                        std::move(spatial_dag), optimization_settings.actions_settings);
+                }
+                else
+                {
+                    is_disjunctive_condition = tryAddDisjunctiveConditions(
+                        join_expression, table_join_clauses, used_expressions, join_settings, planning_context,
+                        join_operator.shared_runtime_filter_descriptors, !can_convert_to_cross);
+
+                    if (!is_disjunctive_condition)
+                    {
+                        if (!can_convert_to_cross)
+                            throw Exception(ErrorCodes::INVALID_JOIN_ON_EXPRESSION, "Cannot determine join keys in JOIN ON expression {}",
+                                formatJoinCondition(join_expression));
+
+                        join_operator.kind = JoinKind::Cross;
+                        join_operator.residual_filter.append_range(join_expression);
+                        join_expression.clear();
+                    }
                 }
             }
         }
@@ -1540,10 +1578,100 @@ static QueryPlanNode buildPhysicalJoinImpl(
     /// NULL-extended, not dropped), so they are evaluated during the join as a mixed join
     /// expression, while the residual filter still drops rows from the result.
     JoinActionRef on_clause_condition = concatConditions(join_expression);
+
+    /// Auto-rewrite: a CROSS JOIN (or comma join) whose residual filter contains
+    /// a spatial predicate referencing columns from BOTH tables can be promoted to
+    /// an INNER JOIN handled by SpatialRTreeJoin.
+    ///
+    /// Single-table residual conditions (e.g. st_intersects(CONST, z.col)) are
+    /// already pushed to the appropriate scan by earlier query-tree optimisations,
+    /// so they do not appear here.  Any remaining mixed conditions become post-join
+    /// filters via the normal residual path.
+    if (isCrossOrComma(join_operator.kind)
+        && join_operator.strictness == JoinStrictness::All
+        && !join_operator.residual_filter.empty())
+    {
+        auto spatial_it = std::find_if(
+            join_operator.residual_filter.begin(),
+            join_operator.residual_filter.end(),
+            [](const JoinActionRef & ref) -> bool
+            {
+                const auto * node = ref.getNode();
+                if (!node || node->type != ActionsDAG::ActionType::FUNCTION
+                    || !node->function_base || !node->function_base->isSpatialPredicate())
+                    return false;
+                /// This branch also commits to an empty-key clause, so it must agree with
+                /// SpatialRTreeJoin about what that join can execute. A predicate it declines
+                /// stays in residual_filter and the join stays CROSS.
+                if (!SpatialRTreeJoin::canUseSpatialPredicate(node))
+                    return false;
+                /// Must reference columns from both the left (bit 0) and right (bit 1) tables.
+                auto src = ref.getSourceRelations();
+                return src.test(0) && src.test(1);
+            });
+
+        if (spatial_it != join_operator.residual_filter.end())
+        {
+            JoinActionRef spatial_pred = *spatial_it;
+            join_operator.residual_filter.erase(spatial_it);
+            join_operator.kind = JoinKind::Inner;
+            table_join_clauses.emplace_back(); /// empty-key clause for SpatialRTreeJoin
+
+            auto spatial_dag = JoinExpressionActions::getSubDAG(std::views::single(spatial_pred));
+            ExpressionActionsPtr & mixed_join_expression = table_join->getMixedJoinExpression();
+            mixed_join_expression = std::make_shared<ExpressionActions>(
+                std::move(spatial_dag), optimization_settings.actions_settings);
+
+            /// Any remaining cross-table conditions (e.g. `b1.id < b2.id` paired with
+            /// a spatial predicate) become a pre-spatial filter evaluated inside
+            /// SpatialRTreeJoin BEFORE the spatial predicate.  This avoids calling the
+            /// expensive spatial function for pairs that a cheap condition rejects.
+            ///
+            /// Only cross-table conditions (referencing both tables) are lifted here;
+            /// single-table conditions remain in residual_filter for the normal path.
+            std::vector<JoinActionRef> pre_filter_conds;
+            std::vector<JoinActionRef> remaining_residual;
+            for (auto & ref : join_operator.residual_filter)
+            {
+                auto src = ref.getSourceRelations();
+                if (src.test(0) && src.test(1))
+                    pre_filter_conds.push_back(ref);
+                else
+                    remaining_residual.push_back(ref);
+            }
+            join_operator.residual_filter = std::move(remaining_residual);
+
+            if (!pre_filter_conds.empty())
+            {
+                JoinActionRef pre_cond = concatConditions(pre_filter_conds);
+                auto pre_dag = JoinExpressionActions::getSubDAG(std::views::single(pre_cond));
+                table_join->getPreSpatialFilterExpression() = std::make_shared<ExpressionActions>(
+                    std::move(pre_dag), optimization_settings.actions_settings);
+            }
+        }
+    }
+
     JoinActionRef residual_filter_condition = concatConditions(join_operator.residual_filter);
 
+    /// Returns true for a spatial predicate that references both join tables.
+    /// Requires cross-table span so that single-table spatial conditions (e.g.
+    /// st_intersects(CONST, right_col)) are not mistakenly treated as join predicates.
+    auto is_cross_table_spatial_predicate = [](const JoinActionRef & ref) -> bool
+    {
+        const auto * node = ref.getNode();
+        if (!node || node->type != ActionsDAG::ActionType::FUNCTION
+            || !node->function_base || !node->function_base->isSpatialPredicate())
+            return false;
+        auto src = ref.getSourceRelations();
+        return src.test(0) && src.test(1);
+    };
+
+    /// A spatial ON condition must be evaluated during the join so SpatialRTreeJoin can use it,
+    /// not folded into a post-join filter.
     const bool build_mixed_join_expression
-        = on_clause_condition && (is_disjunctive_condition || !canPushDownFromOn(join_operator));
+        = on_clause_condition
+        && (is_disjunctive_condition || !canPushDownFromOn(join_operator)
+            || is_cross_table_spatial_predicate(on_clause_condition));
 
     /// A prepared storage delivers its columns already converted to `Nullable`, so the conversion is
     /// dropped from the right-side expression below and the aliased `Nullable` node is what the join
@@ -1768,6 +1896,68 @@ static QueryPlanNode buildPhysicalJoinImpl(
         right_sample_block,
         join_algorithm_params);
 
+    /// Spatial R-tree side swap: for SpatialRTreeJoin the LEFT side probes the R-tree
+    /// (one R-tree query per left row) and the RIGHT side is the R-tree build side.
+    /// Optimal layout: small side on LEFT (probe), large side on RIGHT (build).
+    /// If the left side is much larger than the right (≥5×), swap so the smaller side
+    /// becomes the probe and the larger side becomes the R-tree.  This converts:
+    ///   INNER → INNER (symmetric, no semantic change)
+    ///   LEFT  → RIGHT (all original-left rows still appear via getNonJoinedBlocks)
+    ///
+    /// We swap:  children[0]↔children[1], left_dag↔right_dag,
+    ///           left_sample_block↔right_sample_block, table_join->swapSides().
+    /// Then we recreate SpatialRTreeJoin with the new right_sample_block (= original left).
+    if (join_algorithm_params.spatial_rtree_swap_table
+        && typeid_cast<const SpatialRTreeJoin *>(join_algorithm_ptr.get())
+        && join_algorithm_params.lhs_size_estimation
+        && join_algorithm_params.rhs_size_estimation)
+    {
+        static constexpr double kSwapRatio = 5.0;
+        /// Swap when left (probe) is much larger than right (build): reduces probe calls.
+        const double ratio = static_cast<double>(*join_algorithm_params.lhs_size_estimation)
+                           / static_cast<double>(*join_algorithm_params.rhs_size_estimation);
+        if (ratio >= kSwapRatio)
+        {
+            std::swap(children[0], children[1]);
+            std::swap(left_dag, right_dag);
+            std::swap(left_sample_block, right_sample_block);
+            table_join->swapSides(); // Left→Right (or Inner stays Inner)
+
+            /// Recompute the R-tree join with the new right_sample_block (= original left = small side).
+            const auto & mixed = table_join->getMixedJoinExpression();
+            if (mixed)
+            {
+                const auto & dag_outputs = mixed->getActionsDAG().getOutputs();
+                if (dag_outputs.size() == 1
+                    && dag_outputs[0]->function_base)
+                {
+                    String lc;
+                    String rc;
+                    double bbox_expand = 0.0;
+                    const int expand_idx = dag_outputs[0]->function_base->getSpatialExpandArg();
+                    if (SpatialRTreeJoin::identifyGeomColumns(mixed, *right_sample_block, lc, rc, expand_idx, bbox_expand))
+                    {
+                        LOG_DEBUG(
+                            getLogger("SpatialRTreeJoin"),
+                            "Swapping R-tree sides (lhs/rhs ratio={:.0f}): build on new-right ({} rows), probe with new-left ({} rows)",
+                            ratio,
+                            *join_algorithm_params.rhs_size_estimation,
+                            *join_algorithm_params.lhs_size_estimation);
+                        join_algorithm_ptr = std::make_shared<SpatialRTreeJoin>(table_join, right_sample_block, bbox_expand);
+                    }
+                    else
+                    {
+                        // identifyGeomColumns failed with swapped header — revert
+                        std::swap(children[0], children[1]);
+                        std::swap(left_dag, right_dag);
+                        std::swap(left_sample_block, right_sample_block);
+                        table_join->swapSides(); // revert
+                    }
+                }
+            }
+        }
+    }
+
     QueryPlanNode node;
     node.children = std::move(children);
     String residual_filter_condition_name = residual_filter_condition ? residual_filter_condition.getColumnName() : "";
@@ -1833,6 +2023,9 @@ void JoinStepLogical::buildPhysicalJoin(
 
         if (join_step->right_relation.estimated_rows)
             join_step->join_algorithm_params->rhs_size_estimation = join_step->right_relation.estimated_rows;
+        if (join_step->left_relation.estimated_rows)
+            join_step->join_algorithm_params->lhs_size_estimation = join_step->left_relation.estimated_rows;
+        join_step->join_algorithm_params->spatial_rtree_swap_table = optimization_settings.spatial_rtree_swap_table;
 
         if (hash_table_key_hash)
         {
@@ -2278,6 +2471,14 @@ void JoinStepLogical::addConditions(ActionsDAG actions_dag)
     expression_actions.getActionsDAG()->mergeNodes(std::move(actions_dag), &conditions);
     for (const auto * node : conditions)
         join_operator.expression.emplace_back(node, expression_actions);
+}
+
+void JoinStepLogical::addSpatialCondition(ActionsDAG actions_dag)
+{
+    ActionsDAG::NodeRawConstPtrs conditions;
+    expression_actions.getActionsDAG()->mergeNodes(std::move(actions_dag), &conditions);
+    for (const auto * node : conditions)
+        join_operator.residual_filter.emplace_back(node, expression_actions);
 }
 
 std::optional<UInt64> JoinStepLogical::getInputRowsEstimation(JoinTableSide side) const

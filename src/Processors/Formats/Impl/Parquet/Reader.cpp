@@ -52,6 +52,8 @@ namespace ProfileEvents
     extern const Event ParquetColumnsFilterExpression;
     extern const Event ParquetReadPages;
     extern const Event ParquetPrunedPages;
+    extern const Event ParquetReadPages;
+    extern const Event ParquetPrunedRowsByColumnIndex;
 }
 
 namespace DB::Parquet
@@ -634,6 +636,11 @@ void Reader::prefilterAndInitRowGroups(const std::optional<std::unordered_set<UI
     {
         if (auto ctx = format_filter_info->context.lock())
         {
+            /// Inputs for the per-row bbox prefilter DAG, which eliminates rows that cannot
+            /// possibly intersect the query bbox before the (potentially expensive) spatial
+            /// predicate runs.
+            std::vector<std::tuple<SpatialFilter, String, String, String, String>> bbox_filter_inputs;
+
             for (const auto & sf : all_spatial_filters)
             {
                 auto geo_it = resolve_geo_meta(sf.geometry_column_name);
@@ -683,7 +690,11 @@ void Reader::prefilterAndInitRowGroups(const std::optional<std::unordered_set<UI
                             if (injected_bbox_columns.contains(col))
                                 pc.first_step_to_calculate = SIZE_MAX;
                         }
+
+                bbox_filter_inputs.emplace_back(sf, bbox_cols[0], bbox_cols[1], bbox_cols[2], bbox_cols[3]);
             }
+
+            bbox_row_prefilter = buildBboxRowFilterDAG(bbox_filter_inputs, ctx);
         }
         else
         {
@@ -825,6 +836,35 @@ void Reader::prefilterAndInitRowGroups(const std::optional<std::unordered_set<UI
             if (!output_info.is_primitive || !primitive_columns[output_info.primitive_start].decoder.allow_stats)
                 continue;
             primitive_columns[output_info.primitive_start].column_index_conditions.push_back({key_condition.get(), SIZE_MAX});
+        }
+    }
+
+    /// Page-level pruning for spatial bbox columns: extract per-column conditions from each
+    /// spatial KeyCondition (covering.bbox) and wire them to the bbox primitive columns.
+    /// Bbox columns are hidden auxiliaries — they have no output_columns entry, so we match
+    /// primitive_columns directly by idx_in_output_block.
+    if (options.format.parquet.page_filter_push_down && !spatial_key_conditions.empty())
+    {
+        for (size_t sci = 0; sci < spatial_key_conditions.size(); ++sci)
+        {
+            const size_t prev_size = spatial_column_conditions.size();
+            spatial_key_conditions[sci]->extractSingleColumnConditions(spatial_column_conditions, nullptr);
+            for (size_t i = prev_size; i < spatial_column_conditions.size(); ++i)
+            {
+                const auto & [idx_in_output_block, key_condition] = spatial_column_conditions[i];
+                for (auto & pc : primitive_columns)
+                {
+                    if (pc.idx_in_output_block != idx_in_output_block)
+                        continue;
+                    if (!pc.decoder.allow_stats)
+                        break;
+                    /// Remember which spatial predicate this single-column condition came from:
+                    /// it may only prune a page when all four of that predicate's bbox columns
+                    /// are known to be null-free (see `applyColumnIndex`).
+                    pc.column_index_conditions.push_back({key_condition.get(), sci});
+                    break;
+                }
+            }
         }
     }
 
@@ -1303,6 +1343,11 @@ void Reader::preparePrewhere()
         }
     };
 
+    /// Inject bbox prefilter as the very first step so that downstream predicates
+    /// (including potentially expensive WASM spatial functions) only evaluate rows
+    /// whose bounding box intersects the query bbox.
+    if (bbox_row_prefilter)
+        add_step(bbox_row_prefilter->first, bbox_row_prefilter->second, true);
     if (row_level_filter)
         add_step(row_level_filter->actions, row_level_filter->column_name, true);
     if (prewhere_info)
@@ -2135,6 +2180,10 @@ void Reader::intersectColumnIndexResultsAndInitSubgroups(RowGroup & row_group)
             }
         }
     }
+    size_t pruned_rows = size_t(row_group.meta->num_rows) - num_rows;
+    if (pruned_rows > 0)
+        ProfileEvents::increment(ProfileEvents::ParquetPrunedRowsByColumnIndex, pruned_rows);
+
     if (num_rows == 0)
         return;
 
@@ -2287,6 +2336,12 @@ void Reader::determinePagesToPrefetch(ColumnChunk & column, const RowSubgroup & 
             }
         }
         chassert(!page_byte_ranges.empty());
+
+        size_t total_pages = locations.size();
+        size_t selected_pages = column.data_pages.size();
+        if (selected_pages < total_pages)
+            ProfileEvents::increment(ProfileEvents::ParquetPrunedPages, total_pages - selected_pages);
+        ProfileEvents::increment(ProfileEvents::ParquetReadPages, selected_pages);
 
         auto handles = prefetcher.splitRange(std::move(column.data_pages_prefetch), page_byte_ranges, /*likely_to_be_used*/ false);
 

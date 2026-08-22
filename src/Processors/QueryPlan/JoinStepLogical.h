@@ -118,6 +118,11 @@ public:
 
     void addConditions(ActionsDAG actions_dag);
 
+    /// Like addConditions, but adds to residual_filter instead of expression.
+    /// Used by tryMergeFilterIntoJoinCondition to route spatial predicates from
+    /// a WHERE clause above a CROSS/COMMA join into the join's spatial pipeline.
+    void addSpatialCondition(ActionsDAG actions_dag);
+
     /// Extract the part of the JOIN ON expression that can be evaluated on `side` alone, to be applied
     /// as a filter on that input.
     std::optional<ActionsDAG::ActionsForFilterPushDown> getFilterActions(

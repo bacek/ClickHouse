@@ -156,14 +156,25 @@ static void checkCanBeRegistered(const ContextPtr & context, const String & func
     if (FunctionFactory::instance().hasNameOrAlias(function_name))
         throw Exception(ErrorCodes::FUNCTION_ALREADY_EXISTS, "The function '{}' already exists", function_name);
 
-    if (AggregateFunctionFactory::instance().hasNameOrAlias(function_name))
+    /// A name this factory itself handed to AggregateFunctionFactory is not a built-in, so
+    /// re-creating the WASM function behind it must stay possible.
+    if (AggregateFunctionFactory::instance().hasNameOrAlias(function_name)
+        && !UserDefinedWebAssemblyFunctionFactory::instance().ownsAggregateName(function_name)) /// NOLINT(readability-static-accessed-through-instance)
         throw Exception(ErrorCodes::FUNCTION_ALREADY_EXISTS, "The aggregate function '{}' already exists", function_name);
 
     if (UserDefinedExecutableFunctionFactory::instance().has(function_name, context)) /// NOLINT(readability-static-accessed-through-instance)
         throw Exception(ErrorCodes::FUNCTION_ALREADY_EXISTS, "User defined executable function '{}' already exists", function_name);
 
-    if (throw_if_exists && UserDefinedWebAssemblyFunctionFactory::instance().has(function_name)) /// NOLINT(readability-static-accessed-through-instance)
-        throw Exception(ErrorCodes::FUNCTION_ALREADY_EXISTS, "User defined wasm function '{}' already exists", function_name);
+    if (throw_if_exists)
+    {
+        if (const auto * wasm_query = create_function_query.as<ASTCreateWasmFunctionQuery>())
+        {
+            if (UserDefinedWebAssemblyFunctionFactory::instance().hasOverload(function_name, wasm_query->validateAndGetDefinition().argument_types)) /// NOLINT(readability-static-accessed-through-instance)
+                throw Exception(ErrorCodes::FUNCTION_ALREADY_EXISTS, "User defined wasm function '{}' already exists", function_name);
+        }
+        else if (UserDefinedWebAssemblyFunctionFactory::instance().has(function_name)) /// NOLINT(readability-static-accessed-through-instance)
+            throw Exception(ErrorCodes::FUNCTION_ALREADY_EXISTS, "User defined wasm function '{}' already exists", function_name);
+    }
 
     if (const auto * create_sql_function_query = typeid_cast<const ASTCreateSQLFunctionQuery *>(&create_function_query))
         validateSQLFunction(create_sql_function_query->function_core, function_name);
@@ -175,9 +186,11 @@ static void checkCanBeUnregistered(const ContextPtr & context, const String & fu
         throw Exception(ErrorCodes::CANNOT_DROP_FUNCTION, "Cannot drop system function '{}'", function_name);
 
     /// AggregateFunctionFactory check: skip if the function is a WASM user-defined function
-    /// (dual-registered in AggregateFunctionFactory but lives in the WASM factory).
+    /// (dual-registered in AggregateFunctionFactory but lives in the WASM factory). Asking
+    /// whether it is still in the WASM registry would be wrong — after one drop it is not,
+    /// and the name would then look like a built-in and be undroppable forever.
     if (AggregateFunctionFactory::instance().hasNameOrAlias(function_name)
-        && !UserDefinedWebAssemblyFunctionFactory::instance().has(function_name))
+        && !UserDefinedWebAssemblyFunctionFactory::instance().ownsAggregateName(function_name)) /// NOLINT(readability-static-accessed-through-instance)
         throw Exception(ErrorCodes::CANNOT_DROP_FUNCTION, "Cannot drop system function '{}'", function_name);
 
     if (UserDefinedExecutableFunctionFactory::instance().has(function_name, context)) // NOLINT(readability-static-accessed-through-instance)
@@ -222,7 +235,11 @@ bool UserDefinedSQLFunctionFactory::registerFunction(const ContextMutablePtr & c
     return true;
 }
 
-bool UserDefinedSQLFunctionFactory::unregisterFunction(const ContextMutablePtr & current_context, const String & function_name, bool throw_if_not_exists)
+bool UserDefinedSQLFunctionFactory::unregisterFunction(
+    const ContextMutablePtr & current_context,
+    const String & function_name,
+    const Strings & argument_type_names,
+    bool throw_if_not_exists)
 {
     checkCanBeUnregistered(current_context, function_name);
 
@@ -233,6 +250,7 @@ bool UserDefinedSQLFunctionFactory::unregisterFunction(const ContextMutablePtr &
             current_context,
             UserDefinedSQLObjectType::Function,
             function_name,
+            argument_type_names,
             throw_if_not_exists);
         if (!removed)
             return false;
@@ -245,7 +263,7 @@ bool UserDefinedSQLFunctionFactory::unregisterFunction(const ContextMutablePtr &
 
     /// If deleted function is a WASM function, remove it from WASM function factory as well
     /// After that wasm modules can be safely dropped as well, since no functions refer to them
-    UserDefinedWebAssemblyFunctionFactory::instance().dropIfExists(function_name);
+    UserDefinedWebAssemblyFunctionFactory::instance().dropIfExists(function_name, argument_type_names);
 
     return true;
 }

@@ -18,9 +18,12 @@
 
 #include <Interpreters/Context.h>
 
+#include <Parsers/ASTCreateSQLFunctionQuery.h>
+#include <Parsers/ASTCreateWasmFunctionQuery.h>
 #include <Parsers/IAST.h>
 #include <Parsers/parseQuery.h>
 #include <Parsers/ParserCreateFunctionQuery.h>
+#include <Parsers/TokenIterator.h>
 
 #include <Poco/DirectoryIterator.h>
 
@@ -66,6 +69,71 @@ UserDefinedSQLObjectsDiskStorage::UserDefinedSQLObjectsDiskStorage(const Context
 }
 
 
+static std::vector<ASTPtr> parseAllCreateFunctionStatements(const String & content, const ContextPtr & global_context, bool warn_on_truncation = true)
+{
+    std::vector<ASTPtr> result;
+
+    if (content.empty())
+        return result;
+
+    ParserCreateFunctionQuery parser;
+    Tokens tokens{content.data(), content.data() + content.size()};
+    IParser::Pos pos(
+        TokenIterator(tokens),
+        static_cast<uint32_t>(global_context->getSettingsRef()[Setting::max_parser_depth]),
+        static_cast<uint32_t>(global_context->getSettingsRef()[Setting::max_parser_backtracks]));
+    Expected expected;
+    ASTPtr ast;
+
+    while (parser.parse(pos, ast, expected))
+    {
+        result.push_back(ast);
+        expected = Expected();
+        ast = nullptr;
+    }
+
+    if (warn_on_truncation && pos.get().type != TokenType::EndOfStream)
+        tryLogCurrentException("UserDefinedSQLObjectsDiskStorage", "Trailing content after parsing user-defined function statements");
+
+    return result;
+}
+
+static String extractFunctionName(const ASTPtr & ast)
+{
+    if (auto * wasm_query = ast->as<ASTCreateWasmFunctionQuery>())
+        return wasm_query->getFunctionName();
+    /// `function_core` is the lambda body, whose ASTFunction name is the literal "lambda" --
+    /// the SQL name lives in `function_name`, so ask the query for it.
+    if (auto * sql_query = ast->as<ASTCreateSQLFunctionQuery>())
+        return sql_query->getFunctionName();
+    return {};
+}
+
+static Strings extractArgumentTypeNames(const ASTPtr & ast)
+{
+    Strings types;
+    if (auto * wasm_query = ast->as<ASTCreateWasmFunctionQuery>())
+    {
+        const auto & def = wasm_query->validateAndGetDefinition();
+        for (const auto & arg_type : def.argument_types)
+            types.push_back(arg_type->getName());
+    }
+    /// SQL UDF parameters are untyped lambda arguments, so such a function has no argument
+    /// type signature at all and always occupies the single empty-signature overload slot.
+    return types;
+}
+
+static bool argumentsMatch(const Strings & query_types, const Strings & drop_types)
+{
+    if (query_types.size() != drop_types.size())
+        return false;
+    for (size_t i = 0; i < query_types.size(); ++i)
+        if (query_types[i] != drop_types[i])
+            return false;
+    return true;
+}
+
+
 ASTPtr UserDefinedSQLObjectsDiskStorage::tryLoadObject(UserDefinedSQLObjectType object_type, const String & object_name)
 {
     return tryLoadObject(object_type, object_name, getFilePath(object_type, object_name), /* check_file_exists= */ true);
@@ -81,34 +149,22 @@ ASTPtr UserDefinedSQLObjectsDiskStorage::tryLoadObject(UserDefinedSQLObjectType 
         if (check_file_exists && !fs::exists(path))
             return nullptr;
 
-        /// There is .sql file with user defined object creation statement.
+        /// There is .sql file with user defined object creation statement(s).
         ReadBufferFromFile in(path);
 
-        String object_create_query;
-        readStringUntilEOF(object_create_query, in);
+        String file_content;
+        readStringUntilEOF(file_content, in);
 
-        switch (object_type)
-        {
-            case UserDefinedSQLObjectType::Function:
-            {
-                auto context = getContext();
-                ParserCreateFunctionQuery parser;
-                ASTPtr ast = parseQuery(
-                    parser,
-                    object_create_query.data(),
-                    object_create_query.data() + object_create_query.size(),
-                    "",
-                    0,
-                    context->getSettingsRef()[Setting::max_parser_depth],
-                    context->getSettingsRef()[Setting::max_parser_backtracks]);
-                return ast;
-            }
-        }
+        if (object_type != UserDefinedSQLObjectType::Function)
+            return nullptr;
+
+        auto asts = parseAllCreateFunctionStatements(file_content, getContext());
+        return asts.empty() ? nullptr : asts.back();
     }
     catch (...)
     {
         tryLogCurrentException(log, fmt::format("while loading user defined SQL object {} from path {}", backQuote(object_name), path));
-        return nullptr; /// Failed to load this sql object, will ignore it
+        return nullptr;
     }
 }
 
@@ -150,14 +206,23 @@ void UserDefinedSQLObjectsDiskStorage::loadObjectsImpl()
 
         size_t prefix_length = strlen("function_");
         size_t suffix_length = strlen(".sql");
-        String function_name = unescapeForFileName(file_name.substr(prefix_length, file_name.length() - prefix_length - suffix_length));
+        String file_function_name = unescapeForFileName(file_name.substr(prefix_length, file_name.length() - prefix_length - suffix_length));
 
-        if (function_name.empty())
+        if (file_function_name.empty())
             continue;
 
-        ASTPtr ast = tryLoadObject(UserDefinedSQLObjectType::Function, function_name, dir_path + it.name(), /* check_file_exists= */ false);
-        if (ast)
-            function_names_and_queries.emplace_back(function_name, ast);
+        String file_path = dir_path + it.name();
+        ReadBufferFromFile in(file_path);
+        String file_content;
+        readStringUntilEOF(file_content, in);
+
+        auto asts = parseAllCreateFunctionStatements(file_content, getContext());
+        for (const auto & ast : asts)
+        {
+            String name = extractFunctionName(ast);
+            if (!name.empty())
+                function_names_and_queries.emplace_back(name, ast);
+        }
     }
 
     setAllObjects(function_names_and_queries);
@@ -169,11 +234,43 @@ void UserDefinedSQLObjectsDiskStorage::loadObjectsImpl()
 
 void UserDefinedSQLObjectsDiskStorage::reloadObject(UserDefinedSQLObjectType object_type, const String & object_name)
 {
-    auto ast = tryLoadObject(object_type, object_name);
-    if (ast)
-        setObject(object_name, *ast);
-    else
-        removeObject(object_name);
+    String file_path = getFilePath(object_type, object_name);
+    if (!fs::exists(file_path))
+    {
+        UserDefinedSQLObjectsStorageBase::removeObject(object_name);
+        return;
+    }
+
+    String file_content;
+    try
+    {
+        ReadBufferFromFile in(file_path);
+        readStringUntilEOF(file_content, in);
+    }
+    catch (...)
+    {
+        tryLogCurrentException(log, fmt::format("while reading file {}", file_path));
+        return;
+    }
+
+    if (object_type != UserDefinedSQLObjectType::Function)
+        return;
+
+    auto asts = parseAllCreateFunctionStatements(file_content, getContext());
+    if (asts.empty())
+    {
+        UserDefinedSQLObjectsStorageBase::removeObject(object_name);
+        return;
+    }
+
+    // Update in-memory state only — file on disk is the source of truth
+    UserDefinedSQLObjectsStorageBase::removeObject(object_name);
+    for (const auto & ast : asts)
+    {
+        String name = extractFunctionName(ast);
+        if (!name.empty())
+            UserDefinedSQLObjectsStorageBase::setObject(name, *ast);
+    }
 }
 
 
@@ -200,36 +297,77 @@ bool UserDefinedSQLObjectsDiskStorage::storeObjectImpl(
     String file_path = getFilePath(object_type, object_name);
     LOG_DEBUG(log, "Storing user-defined object {} to file {}", backQuote(object_name), file_path);
 
-    if (fs::exists(file_path))
-    {
-        if (throw_if_exists)
-            throw Exception(ErrorCodes::FUNCTION_ALREADY_EXISTS, "File {} for user-defined function '{}' already exists", file_path, object_name);
-
-        if (!replace_if_exists)
-            return false;
-    }
-
     WriteBufferFromOwnString create_statement_buf;
     IAST::FormatSettings format_settings(/*one_line=*/false);
     create_object_query->format(create_statement_buf, format_settings);
     writeChar('\n', create_statement_buf);
     String create_statement = create_statement_buf.str();
 
+    String existing_content;
+    bool statement_in_file = false;
+
+    if (fs::exists(file_path))
+    {
+        ReadBufferFromFile existing(file_path);
+        readStringUntilEOF(existing_content, existing);
+
+        /// Check if the exact same CREATE statement already exists in the file.
+        /// For overloads (e.g. WASM functions with different signatures), the file
+        /// may contain multiple CREATE statements — only throw if this exact one
+        /// is already present.
+        statement_in_file = (existing_content.find(create_statement) != String::npos);
+        if (statement_in_file)
+        {
+            if (throw_if_exists)
+                throw Exception(ErrorCodes::FUNCTION_ALREADY_EXISTS, "User-defined function '{}' already exists", object_name);
+
+            if (!replace_if_exists)
+                return false;
+
+            /// replace_if_exists: strip the old statement before writing the replacement.
+            auto old_asts = parseAllCreateFunctionStatements(existing_content, getContext());
+            std::vector<ASTPtr> remaining;
+            IAST::FormatSettings fmt_settings(/*one_line=*/false);
+            for (const auto & old_ast : old_asts)
+            {
+                WriteBufferFromOwnString buf;
+                old_ast->format(buf, fmt_settings);
+                writeChar('\n', buf);
+                if (buf.str() != create_statement)
+                    remaining.push_back(old_ast);
+            }
+            if (remaining.empty())
+            {
+                /// All matching statements were replaced — file is now empty.
+                existing_content.clear();
+            }
+            else
+            {
+                WriteBufferFromOwnString buf;
+                for (const auto & ast : remaining)
+                {
+                    ast->format(buf, fmt_settings);
+                    writeChar('\n', buf);
+                }
+                existing_content = buf.str();
+            }
+        }
+    }
+
+    /// New overload (not already in file): always append.
+    String combined_content = existing_content + "\n" + create_statement;
     String temp_file_path = file_path + ".tmp";
 
     try
     {
-        WriteBufferFromFile out(temp_file_path, create_statement.size());
-        writeString(create_statement, out);
+        WriteBufferFromFile out(temp_file_path, combined_content.size());
+        writeString(combined_content, out);
         out.next();
         if (settings[Setting::fsync_metadata])
             out.sync();
         out.close();
 
-        if (replace_if_exists)
-            fs::rename(temp_file_path, file_path);
-        else
-            renameNoReplace(temp_file_path, file_path);
+        fs::rename(temp_file_path, file_path);
     }
     catch (...)
     {
@@ -246,18 +384,117 @@ bool UserDefinedSQLObjectsDiskStorage::removeObjectImpl(
     const ContextPtr & /*current_context*/,
     UserDefinedSQLObjectType object_type,
     const String & object_name,
+    const Strings & argument_type_names,
     bool throw_if_not_exists)
 {
     String file_path = getFilePath(object_type, object_name);
     LOG_DEBUG(log, "Removing user defined object {} stored in file {}", backQuote(object_name), file_path);
 
-    bool existed = fs::remove(file_path);
-
-    if (!existed)
+    if (!fs::exists(file_path))
     {
         if (throw_if_not_exists)
             throw Exception(ErrorCodes::UNKNOWN_FUNCTION, "User-defined function '{}' doesn't exist", object_name);
         return false;
+    }
+
+    if (object_type != UserDefinedSQLObjectType::Function)
+    {
+        fs::remove(file_path);
+        return true;
+    }
+
+    String file_content;
+    {
+        ReadBufferFromFile in(file_path);
+        readStringUntilEOF(file_content, in);
+    }
+
+    auto asts = parseAllCreateFunctionStatements(file_content, getContext());
+    std::vector<ASTPtr> remaining;
+    bool found = false;
+    bool overload_found = false;
+    for (const auto & ast : asts)
+    {
+        String name = extractFunctionName(ast);
+        if (name != object_name)
+        {
+            remaining.push_back(ast);
+            continue;
+        }
+        found = true;
+
+        /// If dropping all overloads, remove this statement.
+        /// If dropping a specific overload, only remove if signature matches.
+        if (argument_type_names.empty())
+        {
+            overload_found = true;
+            continue;
+        }
+
+        auto query_types = extractArgumentTypeNames(ast);
+        if (argumentsMatch(query_types, argument_type_names))
+        {
+            overload_found = true;
+            continue;
+        }
+
+        remaining.push_back(ast);
+    }
+
+    if (!found)
+    {
+        if (throw_if_not_exists)
+            throw Exception(ErrorCodes::UNKNOWN_FUNCTION, "User-defined function '{}' doesn't exist", object_name);
+        return false;
+    }
+
+    if (argument_type_names.empty() && !found)
+    {
+        if (throw_if_not_exists)
+            throw Exception(ErrorCodes::UNKNOWN_FUNCTION, "User-defined function '{}' doesn't exist", object_name);
+        return false;
+    }
+    if (!argument_type_names.empty() && !overload_found)
+    {
+        if (throw_if_not_exists)
+            throw Exception(ErrorCodes::UNKNOWN_FUNCTION, "User-defined function '{}' doesn't exist", object_name);
+        return false;
+    }
+
+    if (overload_found && remaining.empty())
+    {
+        fs::remove(file_path);
+    }
+    else if (overload_found && !remaining.empty())
+    {
+        /// Rewrite remaining overloads to a temp file and atomically rename.
+        String temp_file_path = file_path + ".tmp";
+        String combined_content;
+        {
+            WriteBufferFromOwnString buf;
+            IAST::FormatSettings format_settings(/*one_line=*/false);
+            for (const auto & ast : remaining)
+            {
+                ast->format(buf, format_settings);
+                writeChar('\n', buf);
+            }
+            combined_content = buf.str();
+        }
+
+        try
+        {
+            WriteBufferFromFile out(temp_file_path, combined_content.size());
+            writeString(combined_content, out);
+            out.next();
+            out.close();
+
+            fs::rename(temp_file_path, file_path);
+        }
+        catch (...)
+        {
+            fs::remove(temp_file_path);
+            throw;
+        }
     }
 
     LOG_TRACE(log, "Object {} removed", backQuote(object_name));

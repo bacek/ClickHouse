@@ -9,6 +9,7 @@
 #include <Functions/FunctionVariantAdaptor.h>
 #include <Functions/TypeMismatchStrictness.h>
 
+#include <Columns/ColumnConst.h>
 #include <Columns/ColumnNullable.h>
 #include <Columns/ColumnVariant.h>
 #include <Interpreters/castColumn.h>
@@ -81,11 +82,35 @@ static ColumnPtr expandColumnByFilter(ColumnPtr column, const PaddedPODArray<UIn
 }
 
 ColumnPtr ExecutableFunctionVariantAdaptor::executeImpl(
-    const ColumnsWithTypeAndName & arguments, const DataTypePtr & result_type, size_t, bool dry_run) const
+    const ColumnsWithTypeAndName & arguments, const DataTypePtr & result_type, size_t input_rows_count, bool dry_run) const
 {
-    auto column = arguments[variant_argument_index].column->convertToFullColumnIfConst();
+    /// A constant Variant argument holds a single value, so keep it as a single row and let the
+    /// nested function see it as a constant. Expanding it here would copy the value once per row —
+    /// for a large geometry that is gigabytes — and would also hide the constness from the nested
+    /// function, which may have a cheaper path for constant arguments.
+    /// A single row is either NULL or exactly one variant, so only the two paths below can be
+    /// reached; anything else falls back to expansion.
+    ColumnPtr column = arguments[variant_argument_index].column;
+    bool variant_arg_is_const = false;
+    if (const auto * const_column = typeid_cast<const ColumnConst *>(column.get()))
+    {
+        const auto & const_variant = assert_cast<const ColumnVariant &>(const_column->getDataColumn());
+        if (const_variant.hasOnlyNulls() || const_variant.getGlobalDiscriminatorOfOneNoneEmptyVariantNoNulls())
+        {
+            column = const_column->getDataColumnPtr();
+            variant_arg_is_const = true;
+        }
+    }
+    if (!variant_arg_is_const)
+        column = column->convertToFullColumnIfConst();
+
     const auto & variant_column = assert_cast<const ColumnVariant &>(*column);
-    if (variant_column.empty())
+
+    /// Number of rows the result must have. For a constant argument the Variant column holds one
+    /// row while the result still spans the whole block.
+    const size_t result_rows = variant_arg_is_const ? input_rows_count : variant_column.size();
+
+    if (variant_column.empty() || result_rows == 0)
         return result_type->createColumn();
 
     const auto & variant_type = assert_cast<const DataTypeVariant &>(*arguments[variant_argument_index].type);
@@ -143,7 +168,7 @@ ColumnPtr ExecutableFunctionVariantAdaptor::executeImpl(
     if (variant_column.hasOnlyNulls())
     {
         auto result = result_type->createColumn();
-        result->insertManyDefaults(variant_column.size());
+        result->insertManyDefaults(result_rows);
         return result;
     }
 
@@ -159,8 +184,12 @@ ColumnPtr ExecutableFunctionVariantAdaptor::executeImpl(
         {
             if (i == variant_argument_index)
             {
+                ColumnPtr variant = variant_column.getVariantPtrByGlobalDiscriminator(global_discr);
+                if (variant_arg_is_const)
+                    variant = ColumnConst::create(variant, result_rows);
+
                 ColumnWithTypeAndName arg{
-                    variant_column.getVariantPtrByGlobalDiscriminator(global_discr),
+                    variant,
                     variant_types[global_discr],
                     arguments[i].name,
                 };
@@ -179,18 +208,20 @@ ColumnPtr ExecutableFunctionVariantAdaptor::executeImpl(
         {
             /// Type is incompatible and throw_on_type_mismatch is false — return NULLs for all rows.
             auto res = result_type->createColumn();
-            res->insertManyDefaults(variant_column.size());
+            res->insertManyDefaults(result_rows);
             return res;
         }
         DataTypePtr nested_result_type = func_base->getResultType();
-        ColumnPtr nested_result = try_execute(func_base, new_arguments, nested_result_type, variant_column.size(), dry_run);
+        ColumnPtr nested_result = try_execute(func_base, new_arguments, nested_result_type, result_rows, dry_run);
         if (!nested_result)
         {
             /// execute() failed with a type-related error and throw_on_type_mismatch is false — return NULLs for all rows.
             auto res = result_type->createColumn();
-            res->insertManyDefaults(variant_column.size());
+            res->insertManyDefaults(result_rows);
             return res;
         }
+        /// The tail below (makeNullableSafe, castColumn) expects a full column.
+        nested_result = nested_result->convertToFullColumnIfConst();
         removeLowCardinalityFromResult(nested_result_type, nested_result);
 
         /// If result is Nullable(Nothing) or Nothing, just return column filled with NULLs/defaults.
