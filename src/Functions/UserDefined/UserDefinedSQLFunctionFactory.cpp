@@ -159,7 +159,11 @@ checkCanBeRegistered(const ContextPtr & context, const String & function_name, c
     if (FunctionFactory::instance().hasNameOrAlias(function_name))
         throw Exception(ErrorCodes::FUNCTION_ALREADY_EXISTS, "The function '{}' already exists", function_name);
 
-    if (AggregateFunctionFactory::instance().hasNameOrAlias(function_name))
+    /// A WASM UDF with is_aggregate=1 is also registered in AggregateFunctionFactory, under a
+    /// creator that resolves the function by name on every call. That registration outlives DROP
+    /// FUNCTION, so a name the WASM factory owns must not block re-creating the function.
+    if (AggregateFunctionFactory::instance().hasNameOrAlias(function_name)
+        && !UserDefinedWebAssemblyFunctionFactory::instance().ownsAggregateName(function_name))
         throw Exception(ErrorCodes::FUNCTION_ALREADY_EXISTS, "The aggregate function '{}' already exists", function_name);
 
     if (UserDefinedExecutableFunctionFactory::instance().has(
@@ -176,7 +180,14 @@ checkCanBeRegistered(const ContextPtr & context, const String & function_name, c
 
 static void checkCanBeUnregistered(const ContextPtr & context, const String & function_name)
 {
-    if (FunctionFactory::instance().hasNameOrAlias(function_name) || AggregateFunctionFactory::instance().hasNameOrAlias(function_name))
+    if (FunctionFactory::instance().hasNameOrAlias(function_name))
+        throw Exception(ErrorCodes::CANNOT_DROP_FUNCTION, "Cannot drop system function '{}'", function_name);
+
+    /// AggregateFunctionFactory check: skip if the name belongs to a WASM user-defined aggregate
+    /// function (dual-registered there but living in the WASM factory). ownsAggregateName() rather
+    /// than has(), because the aggregate registration stays behind after the function is dropped.
+    if (AggregateFunctionFactory::instance().hasNameOrAlias(function_name)
+        && !UserDefinedWebAssemblyFunctionFactory::instance().ownsAggregateName(function_name))
         throw Exception(ErrorCodes::CANNOT_DROP_FUNCTION, "Cannot drop system function '{}'", function_name);
 
     if (UserDefinedExecutableFunctionFactory::instance().has(
