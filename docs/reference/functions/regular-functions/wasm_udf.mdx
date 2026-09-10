@@ -44,8 +44,7 @@ Enable WebAssembly support in your ClickHouse configuration:
 
 Available Engine Implementations:
 
-- `wasmtime` (default, recommended) — uses [WasmTime](https://github.com/bytecodealliance/wasmtime)
-- `wasmedge` — uses [WasmEdge](https://github.com/WasmEdge/WasmEdge)
+- `wasmtime` (default, and currently the only one) — uses [Wasmtime](https://github.com/bytecodealliance/wasmtime)
 
 ## Quick Start
 
@@ -203,7 +202,7 @@ LANGUAGE WASM
 FROM 'module_name' [:: 'source_function_name']
 ARGUMENTS ( [name type[, ...]] | [type[, ...]] )
 RETURNS return_type
-[ABI ROW_DIRECT | ABI BUFFERED_V1 | ABI ASSEMBLYSCRIPT | ABI COLUMNAR_V1]
+[ABI ROW_DIRECT | ABI BUFFERED_V1 | ABI ASSEMBLYSCRIPT]
 [DETERMINISTIC]
 [SHA256_HASH 'hex']
 [SETTINGS key = value[, ...]];
@@ -217,14 +216,44 @@ RETURNS return_type
 - `ABI`: Application Binary Interface version
   - `ROW_DIRECT`: Direct type mapping, row-by-row processing
   - `BUFFERED_V1`: Block-based processing with serialization
-  - `COLUMNAR_V1`: Block-based processing with columnar wire format (no serialization overhead)
   - `ASSEMBLYSCRIPT`: Row-by-row processing for modules produced by the [AssemblyScript](https://www.assemblyscript.org) compiler. Numeric types map to AssemblyScript primitives; ClickHouse `String` maps to AssemblyScript `string`.
-  - `COLUMNAR_V1`: Block-based processing with columnar wire format (no serialization overhead)
 - `DETERMINISTIC`: Declares the function as deterministic — always returns the same output for the same input. When specified, ClickHouse may constant-fold calls where all arguments are constants: the function is evaluated once at query analysis time and the result is reused for every row.
 - `SHA256_HASH`: Expected module hash for verification (auto-filled if omitted), can be used to ensure the correct WASM module loaded across different replicas.
 - `SETTINGS`: Per-function settings
     - `serialization_format` String — Format used to serialize argument blocks passed to the module and to parse the returned result. Used only by `ABI BUFFERED_V1`. Supported values: `MsgPack`, `JSONEachRow`, `CSV`, `TSV`, `TSVRaw`, `RowBinary`, `Buffers`, and [`ColumnBinary`](/reference/formats/ColumnBinary). Default: `MsgPack`. Block-based formats such as `Buffers` and `ColumnBinary` must return a single column whose type matches the declared function signature.
-    - `webassembly_udf_enable_fuel` Bool — Enables finite fuel budgeting for the function. Default: `true`. When `false`, the query-level setting `webassembly_udf_max_fuel` is ignored for this function. Disabling fuel limits may improve performance when using the `wasmtime` engine. However, for untrusted or buggy guest code, it can increase the risk of runaway execution.
+    - `webassembly_udf_enable_fuel` Bool — Enables finite fuel budgeting for the function. Default: `true`. When `false`, the query-level setting `webassembly_udf_max_fuel` is ignored for this function. Disabling fuel limits may improve performance. However, for untrusted or buggy guest code, it can increase the risk of runaway execution.
+
+## NULL handling {#null-handling}
+
+A WASM UDF is never handed a nullable argument column. `NULL` arguments are handled by ClickHouse
+around the call, exactly as they are for built-in functions: the `Nullable` wrappers are stripped
+before the module runs and the module sees only the nested values.
+
+What happens to a `NULL` row after that depends on whether the declared return type can be
+`Nullable`, and the two cases behave differently:
+
+- For a return type that can be wrapped, such as `UInt64` or `String`, the null maps of all
+  arguments are combined onto the result. A row whose argument is `NULL` yields `NULL` without the
+  module deciding anything about it, and the declared return type is not the type of the
+  expression: a function declared `RETURNS UInt64` called with a `Nullable(String)` argument
+  produces `Nullable(UInt64)`, because the wrapper is reapplied on the way out.
+- For a return type that cannot be wrapped - `Array`, `Tuple` and `Map` - there is no `NULL` to
+  return, so nothing is propagated. Null rows are replaced by the default value of the nested
+  argument type and the module is called on those, `f(default(x))`. A function declared
+  `RETURNS Array(UInt64)` called with a `Nullable(String)` argument still produces
+  `Array(UInt64)`, and the `NULL` row gets whatever the module computes for the empty string.
+
+The module cannot distinguish "the argument was `NULL`" from "the argument was the default
+value", because it is never shown the difference. A function that needs that distinction has to
+take it as a separate argument - for example an explicit `isNull(x)` flag alongside
+`ifNull(x, ...)`.
+
+Declaring `RETURNS Nullable(...)` does not change any of this. It only tells ClickHouse to expect
+a nullable result column back from the module, which the module must then actually produce: with
+`ABI BUFFERED_V1` the returned block has to carry the nullability the chosen
+`serialization_format` encodes, such as the `COL_IS_NULLABLE` flag and null map of
+[`ColumnBinary`](/reference/formats/ColumnBinary). A module that returns a plain non-nullable
+column against a declared `Nullable` return type is rejected.
 
 ## ABIs Versions
 
@@ -265,7 +294,7 @@ This ABI is experimental and subject to change in future releases.
 
 Processes entire blocks at once using a (de)serialization through WASM memory. Supports any argument and return types.
 
-Data is exchanged through buffers in WASM memory. A buffer is an 8-byte structure holding a pointer to the data and the size of the data (two little-endian `u32` values). Buffers are passed by handle — a pointer to this structure, not to the data itself. The guest code must export two functions to create and destroy these buffers.
+Data is exchanged through buffers in WASM memory. A buffer is an 8-byte structure holding a pointer to the data and the size of the data (two little-endian `u32` values). Buffers are passed by handle — a pointer to this structure, not to the data itself. The guest code must export two functions to create and destroy these buffers. When the size is non-zero, the data pointer must also be non-zero: a buffer that declares a positive size but points at linear-memory offset `0` is not a valid buffer, and the guest code must not produce one; ClickHouse rejects such a buffer and fails the query with a `WASM_ERROR`.
 
 For each input block, ClickHouse:
 
@@ -275,7 +304,9 @@ For each input block, ClickHouse:
 4. Reads the result buffer: it must contain exactly one column with exactly the same number of rows, serialized in the same format. For formats with named fields, such as `JSONEachRow`, the result column must be named `result`.
 5. Calls `clickhouse_destroy_buffer` on both the input buffer (if any) and the result buffer handles. The guest code must not free the result buffer itself, and must not return the input handle as the result — it would then be destroyed twice.
 
-The function is invoked once per input block: a large query is split into several blocks by the query pipeline (the maximum number of rows per call can additionally be capped with the `webassembly_udf_max_input_block_size` setting), so the row count passed on each call is the size of that block, not of the whole query.
+The function is invoked once per input block: a large query is split into several blocks by the query pipeline, so the row count passed on each call is the size of that block, not of the whole query.
+
+A pipeline block can still be too wide for the module's linear memory, so it is divided further. By default `webassembly_udf_input_split_memory_ratio` splits it dynamically: ClickHouse measures the serialized rows and starts a new call before the input would grow past that fraction of the guest's linear memory, so the row count varies with the data. A non-zero `webassembly_udf_max_input_block_size` replaces this with a fixed cap of that many rows per call, and a ratio of `0` passes the whole block in one call. A call is never taken below one row, so a row too large for the module's memory on its own still fails inside the guest.
 
 <Note>
 The exact bytes inside the buffers are defined by the chosen format, and the guest code must decode and encode them itself. In particular, for `String` values:
@@ -418,81 +449,6 @@ SELECT str_reverse(toString(number + 100)) FROM numbers(3);
 201
 ```
 
-### ABI COLUMNAR_V1
-
-:::note
-This ABI is experimental and subject to change in future releases.
-:::
-
-A high-performance ABI that passes columnar data directly in WASM linear memory without any (de)serialization overhead.
-
-Instead of serializing data through MsgPack or RowBinary, ClickHouse writes columns in a compact columnar wire format and passes pointers to the WASM module. The guest code reads columns directly from memory and writes results back in the same format. This eliminates serialization/deserialization costs, which can be significant for large blocks.
-
-The module exports the same buffer allocation functions as `BUFFERED_V1`:
-
-```
-(module
-  ;; Allocate a new buffer of specified size
-  (func (export "clickhouse_create_buffer")
-    (param $size i32)
-    (result i32))
-
-  ;; Free a buffer by its handle
-  (func (export "clickhouse_destroy_buffer")
-    (param $handle i32)
-    (result))
-
-  ;; User-defined function — same signature as BUFFERED_V1
-  (func (export "my_func")
-    (param $input_handle i32)
-    (param $n_rows i32)
-    (result i32))
-)
-```
-
-Input columns are laid out in WASM memory as:
-
-```
-[ColumnarV1Header: 8 bytes]
-[ColDescriptor × num_columns: 40 bytes each]
-[Column data blocks]
-```
-
-The 8-byte header contains two `uint32` fields: `num_rows` then `num_cols`.
-
-Each `ColDescriptor` is exactly 40 bytes and contains five `uint64` fields
-(all byte offsets are absolute from the start of the frame buffer):
-
-- `type` (8 bytes) — column type identifier (see below)
-- `null_offset` (8 bytes) — absolute offset to the `u8[num_rows]` null map (0 if not nullable; 1 = null, 0 = non-null)
-- `offsets_offset` (8 bytes) — absolute offset to the `uint64[num_rows+1]` offsets array (for `COL_BYTES` columns; 0 otherwise)
-- `data_offset` (8 bytes) — absolute offset to the column data block
-- `data_size` (8 bytes) — size of the data block in bytes
-
-Base column types:
-
-- `0` — `COL_BYTES` — variable-length byte strings (`String`); paired with `offsets_offset` array and data block of raw bytes (no null terminators)
-- `1` — `COL_FIXED8` — 1-byte fixed-width scalars (`Int8`, `UInt8`)
-- `2` — `COL_FIXED16` — 2-byte fixed-width scalars (`Int16`, `UInt16`)
-- `3` — `COL_FIXED32` — 4-byte fixed-width scalars (`Int32`, `UInt32`, `Float32`)
-- `4` — `COL_FIXED64` — 8-byte fixed-width scalars (`Int64`, `UInt64`, `Float64`, `DateTime64`)
-- `5` — `COL_COMPLEX` — recursive format for `Array(T)` and `Tuple(T…)`
-- `6` — `COL_VARIANT` — discriminated union (`Variant(…)`)
-
-Modifier flags (OR'd onto the base type):
-
-- `COL_IS_NULLABLE` (`0x20`) — nullable column; `null_offset` carries a `u8[num_rows]` null map
-- `COL_IS_CONST` (`0x80`) — constant column; only 1 row of data is stored; the reader replicates it to the full row count
-
-Example usage:
-
-```sql
-CREATE FUNCTION str_byte_sum
-    LANGUAGE WASM ABI COLUMNAR_V1 FROM 'my_module' :: 'byte_sum'
-    ARGUMENTS (s String) RETURNS UInt64
-    DETERMINISTIC;
-```
-
 ### ABI ASSEMBLYSCRIPT
 
 Targets modules produced by the [AssemblyScript](https://www.assemblyscript.org) compiler. Each row triggers one call into the exported function, mapping ClickHouse values to AssemblyScript primitives and string objects.
@@ -541,87 +497,6 @@ CREATE FUNCTION as_greet
     ARGUMENTS (name String) RETURNS String;
 ```
 
-### ABI COLUMNAR_V1 {#abi-columnar-v1}
-
-<Note>
-This ABI is experimental and subject to change in future releases.
-</Note>
-
-<Note>
-For most use cases, the `BUFFERED_V1` ABI is recommended as the general-purpose interface. Use `COLUMNAR_V1` only when you need to eliminate serialization overhead for large data blocks.
-</Note>
-
-A high-performance ABI that passes columnar data directly in WASM linear memory without (de)serialization overhead.
-
-Unlike `BUFFERED_V1`, which serializes each row as a self-contained block, ClickHouse writes entire columns in a compact wire format and passes pointers to the WASM module. The guest code reads columns directly from memory and writes results back in the same format. This eliminates per-row serialization and deserialization costs, which can be significant for large blocks.
-
-The module exports the same buffer allocation functions as `BUFFERED_V1`:
-
-```
-(module
-  ;; Allocate a new buffer of specified size
-  (func (export "clickhouse_create_buffer")
-    (param $size i32)
-    (result i32))
-
-  ;; Free a buffer by its handle
-  (func (export "clickhouse_destroy_buffer")
-    (param $handle i32)
-    (result))
-
-  ;; User-defined function — same signature as BUFFERED_V1
-  (func (export "my_func")
-    (param $input_handle i32)
-    (param $n_rows i32)
-    (result i32))
-)
-```
-
-Input columns are laid out in WASM memory as:
-
-```
-[ColumnarV1Header: 8 bytes]
-[ColDescriptor × num_columns: 40 bytes each]
-[Column data blocks]
-```
-
-The 8-byte header contains two `uint32` fields: `num_rows` then `num_cols`.
-
-Each `ColDescriptor` is exactly 40 bytes and contains five `uint64` fields
-(all byte offsets are absolute from the start of the frame buffer):
-
-- `type` (8 bytes) — column type identifier (see below)
-- `null_offset` (8 bytes) — absolute offset to the `u8[num_rows]` null map (0 if not nullable; 1 = null, 0 = non-null)
-- `offsets_offset` (8 bytes) — absolute offset to the `uint64[num_rows+1]` offsets array (for `COL_BYTES` columns; 0 otherwise)
-- `data_offset` (8 bytes) — absolute offset to the column data block
-- `data_size` (8 bytes) — size of the data block in bytes
-
-Base column types:
-
-- `0` — `COL_BYTES` — variable-length byte strings (`String`); paired with `offsets_offset` array and data block of raw bytes (no null terminators)
-- `1` — `COL_FIXED8` — 1-byte fixed-width scalars (`Int8`, `UInt8`)
-- `2` — `COL_FIXED16` — 2-byte fixed-width scalars (`Int16`, `UInt16`)
-- `3` — `COL_FIXED32` — 4-byte fixed-width scalars (`Int32`, `UInt32`, `Float32`)
-- `4` — `COL_FIXED64` — 8-byte fixed-width scalars (`Int64`, `UInt64`, `Float64`, `DateTime64`)
-- `5` — `COL_COMPLEX` — recursive format for `Array(T)`, `Tuple(T…)`, and `Map(K, V)`
-- `6` — `COL_VARIANT` — discriminated union (`Variant(…)`)
-- `7` — `COL_FIXEDN` — fixed-width scalars of any other width (`UUID`, `IPv6`, `Int128`/`UInt128`, `Int256`/`UInt256`, `Decimal128`/`Decimal256`, …)
-- `8` — `COL_LOWCARD` — top-level `LowCardinality(T)`; dictionary sub-column plus a compact index array (nested `LowCardinality` still materializes to `T` via `COL_COMPLEX`/base types instead)
-
-Modifier flags (OR'd onto the base type):
-
-- `COL_IS_NULLABLE` (`0x20`) — nullable column; `null_offset` carries a `u8[num_rows]` null map
-- `COL_IS_CONST` (`0x80`) — constant column; only 1 row of data is stored; the reader replicates it to the full row count
-
-Example usage:
-
-```sql
-CREATE FUNCTION str_byte_sum
-    LANGUAGE WASM ABI COLUMNAR_V1 FROM 'my_module' :: 'byte_sum'
-    ARGUMENTS (s String) RETURNS UInt64
-    DETERMINISTIC;
-```
-
 ### Note for developing UDFs in Rust
 
 For Rust programs we provide a helper crate [clickhouse-wasm-udf](https://crates.io/crates/clickhouse-wasm-udf) to simplify development of WebAssembly UDFs for ClickHouse. The crate provides function for memory management, so you don't need to implement `clickhouse_create_buffer` and `clickhouse_destroy_buffer` functions manually, but rather add the crate as a dependency. Also there are macros `#[clickhouse_wasm_udf]` to wrap your regular Rust functions into the required ABI format.
@@ -659,7 +534,9 @@ The following query-level settings control WebAssembly UDF execution:
 
 - `webassembly_udf_max_memory` — Memory limit in bytes per WebAssembly UDF instance.
 
-- `webassembly_udf_max_input_block_size` — Maximum number of rows passed to a WebAssembly UDF in a single block. Set to 0 (the default) for no fixed row cap: the input block is then split dynamically, only when its estimated serialized size would exceed half of the guest's current linear memory. A block that fits in that budget is passed to the guest in a single call.
+- `webassembly_udf_max_input_block_size` — Maximum number of rows passed to a WebAssembly UDF in a single block, for every ABI. Set to 0 to let `webassembly_udf_input_split_memory_ratio` size the calls of an `ABI BUFFERED_V1` function; other ABIs then receive the whole pipeline block.
+
+- `webassembly_udf_input_split_memory_ratio` — The fraction of the linear memory a module declares it starts with (of its memory ceiling, for a module that starts with no pages) that one call's input may occupy. Used to split the blocks of an `ABI BUFFERED_V1` function when `webassembly_udf_max_input_block_size` is 0; other ABIs carry no serialized input block and ignore it. Default: `0.5`, leaving the rest of the memory to the guest's own working set — a ratio close to 1 can still fail inside the guest's allocator. Set to 0, or set `compatibility` to a version before 26.9, to pass the whole pipeline block in one call. Must be at least 0 and at most 1.
 
 - `webassembly_udf_max_instances` — Maximum number of WebAssembly UDF instances that can run in parallel per function.
 

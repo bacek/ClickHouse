@@ -11,7 +11,7 @@
 
 #include <Common/typeid_cast.h>
 #include <Common/Exception.h>
-#include <Formats/ColumnarV1Wire.h>
+#include <Formats/ColumnBinaryWire.h>
 
 #include <limits>
 
@@ -28,6 +28,37 @@ namespace ErrorCodes
 //     CH's normal heap-allocation path (eliminates the conservative-size scan entirely;
 //     useful to measure the overhead of the two-phase layout vs. a plain WriteBuffer).
 
+void ColumnBinaryOutputFormat::checkNumCols(size_t num_cols) const
+{
+    if (num_cols != header_->columns())
+        throw Exception(ErrorCodes::INCORRECT_DATA,
+            "ColumnBinary: block has {} columns, expected {}",
+            num_cols, header_->columns());
+}
+
+void ColumnBinaryOutputFormat::checkColumnStructure(size_t i, const IColumn & column) const
+{
+    // Mirror `ColumnBinaryInputFormat`'s read-side check exactly: the reader decodes each
+    // column against `header_->getByPosition(i).type` and rejects a structural mismatch, so a
+    // writer that only enforces the column *count* fails open on the public
+    // `IOutputFormat::write` path - a formatter built with a `UInt64` header would happily
+    // serialize a same-count `String` block, emitting a frame that disagrees with the
+    // advertised sample header and that the matching reader then refuses. Require the same
+    // exact schema the reader does, so the mismatch is caught before the frame is written
+    // rather than after it is read back.
+    // `COL_IS_CONST` legitimately serializes a `ColumnConst` wrapper, which never structurally
+    // equals the plain column the declared type creates; compare what it wraps, as the reader
+    // does on its side.
+    const IColumn & actual = isColumnConst(column)
+        ? static_cast<const ColumnConst &>(column).getDataColumn()
+        : column;
+    const auto & expected_type = header_->getByPosition(i).type;
+    if (!actual.structureEquals(*expected_type->createColumn()))
+        throw Exception(ErrorCodes::INCORRECT_DATA,
+            "ColumnBinary: column {} is {}, which does not match the declared type {}",
+            i, actual.getName(), expected_type->getName());
+}
+
 std::optional<uint64_t> ColumnBinaryOutputFormat::precomputeSerializedSize(const Block & block, size_t rows) const
 {
     if (disable_preallocation_)
@@ -35,6 +66,11 @@ std::optional<uint64_t> ColumnBinaryOutputFormat::precomputeSerializedSize(const
 
     if (rows == 0 || block.columns() == 0)
         return std::nullopt;
+
+    // Mirror consume()'s exact-match requirement: otherwise the size probe and the write
+    // could model a different number of columns, and the buffered WASM path would reserve a
+    // guest buffer that consume() does not fill.
+    checkNumCols(block.columns());
 
     // The frame header's num_rows field is a uint32_t, and buildColDescriptor's row-count
     // arithmetic (e.g. (num_rows + 1) for String/Array offsets) is only overflow-safe up to
@@ -45,33 +81,33 @@ std::optional<uint64_t> ColumnBinaryOutputFormat::precomputeSerializedSize(const
             "ColumnBinary: block has {} rows, exceeding the maximum representable row count ({})",
             rows, std::numeric_limits<uint32_t>::max());
 
-    const uint64_t hdr_desc_size = ColumnarV1::COLUMNAR_HEADER_BYTES + block.columns() * ColumnarV1::COLUMNAR_DESC_BYTES;
+    const uint64_t hdr_desc_size = ColumnBinaryWire::FRAME_HEADER_BYTES + block.columns() * ColumnBinaryWire::COL_DESC_BYTES;
     uint64_t cursor = hdr_desc_size;
 
     for (size_t i = 0; i < block.columns(); ++i)
     {
-        const IColumn & raw_col = *block.getByPosition(i).column;
-        bool is_const = isColumnConst(raw_col);
-        const IColumn * actual = is_const
-            ? &static_cast<const ColumnConst &>(raw_col).getDataColumn()
-            : &raw_col;
+        // Strip `Sparse` / `Replicated` wrappers exactly as `consume` does below (keeping the
+        // const wrapper), so both passes model the same layout. `buildColDescriptor` has no
+        // notion of them: a sparse `String` would miss the `ColumnString` branch and throw,
+        // and a sparse fixed-width column would be mis-sized, since
+        // `ColumnSparse::sizeOfValueIfFixed` reports the value plus offset width. Today the
+        // only caller is the buffered WASM path, whose function does not override
+        // `useDefaultImplementationForSparseColumns` / `...ForReplicatedColumns`, so
+        // `IExecutableFunction` has already removed both before `executeImpl` runs - but the
+        // two passes must not disagree about the frame size if that ever changes.
+        const ColumnPtr & raw_ptr = block.getByPosition(i).column;
+        bool is_const = isColumnConst(*raw_ptr);
+        ColumnPtr stripped = is_const
+            ? removeSpecialRepresentations(static_cast<const ColumnConst &>(*raw_ptr).getDataColumnPtr())
+            : removeSpecialRepresentations(raw_ptr);
+        const IColumn * actual = stripped.get();
+        checkColumnStructure(i, *actual);
         bool is_nullable = typeid_cast<const ColumnNullable *>(actual) != nullptr;
         uint32_t col_rows = is_const ? 1u : static_cast<uint32_t>(rows);
 
-        ColumnarV1::ColDescriptor desc{};
-        cursor = ColumnarV1::buildColDescriptor(actual, is_const, is_nullable, col_rows, cursor, desc);
+        ColumnBinaryWire::ColDescriptor desc{};
+        cursor = ColumnBinaryWire::buildColDescriptor(actual, is_const, is_nullable, col_rows, cursor, desc);
     }
-
-    // Callers that preallocate straight from this return value (e.g. the buffered WASM guest
-    // buffer) would otherwise allocate an oversized buffer before consume()'s equivalent check
-    // ever runs. Throw here too so an oversized frame is rejected before any allocation happens,
-    // not only before the actual write.
-    // 0 is the pre-existing-setting compatibility fallback and means "no cap", not a literal
-    // zero-byte limit — see the matching check in consume() below.
-    if (max_frame_size_ != 0 && cursor - hdr_desc_size > max_frame_size_)
-        throw Exception(ErrorCodes::INCORRECT_DATA,
-            "ColumnBinary: frame data size {} exceeds column_binary_max_frame_size limit {}",
-            cursor - hdr_desc_size, max_frame_size_);
 
     return cursor;
 }
@@ -88,11 +124,19 @@ void ColumnBinaryOutputFormat::consume(Chunk chunk)
             "ColumnBinary: chunk has {} rows, exceeding the maximum representable row count ({})",
             chunk.getNumRows(), std::numeric_limits<uint32_t>::max());
 
+    // `ColumnBinary` is schema-driven: `ColumnBinaryInputFormat::checkNumCols` rejects any
+    // frame whose `num_cols` differs from the schema. Clamping to the smaller of the two here
+    // would fail open on the public `IOutputFormat::write` path - extra columns silently
+    // dropped, missing columns emitting a frame that disagrees with the advertised sample
+    // header (and that the matching reader then refuses) - so require the exact match the
+    // reader does.
+    checkNumCols(chunk.getNumColumns());
+
     uint32_t num_rows = static_cast<uint32_t>(chunk.getNumRows());
-    uint32_t num_cols = static_cast<uint32_t>(std::min<size_t>(chunk.getNumColumns(), header_->columns()));
+    uint32_t num_cols = static_cast<uint32_t>(chunk.getNumColumns());
 
     // Layout pass: build descriptors (compute offsets and total size).
-    const uint64_t hdr_desc_size = ColumnarV1::COLUMNAR_HEADER_BYTES + num_cols * ColumnarV1::COLUMNAR_DESC_BYTES;
+    const uint64_t hdr_desc_size = ColumnBinaryWire::FRAME_HEADER_BYTES + num_cols * ColumnBinaryWire::COL_DESC_BYTES;
     uint64_t cursor = hdr_desc_size;
 
     // `expectMaterializedColumns` returns false for this format so that a top-level
@@ -118,7 +162,7 @@ void ColumnBinaryOutputFormat::consume(Chunk chunk)
         chunk.setColumns(std::move(columns), num_rows);
     }
 
-    std::vector<ColumnarV1::ColDescriptor> descs(num_cols);
+    std::vector<ColumnBinaryWire::ColDescriptor> descs(num_cols);
     for (uint32_t i = 0; i < num_cols; ++i)
     {
         const IColumn & raw_col = *chunk.getColumns()[i];
@@ -126,18 +170,11 @@ void ColumnBinaryOutputFormat::consume(Chunk chunk)
         const IColumn * actual = is_const
             ? &static_cast<const ColumnConst &>(raw_col).getDataColumn()
             : &raw_col;
+        checkColumnStructure(i, *actual);
         bool is_nullable = typeid_cast<const ColumnNullable *>(actual) != nullptr;
         uint32_t col_rows = is_const ? 1u : num_rows;
-        cursor = ColumnarV1::buildColDescriptor(actual, is_const, is_nullable, col_rows, cursor, descs[i]);
+        cursor = ColumnBinaryWire::buildColDescriptor(actual, is_const, is_nullable, col_rows, cursor, descs[i]);
     }
-
-    // Mirror ColumnBinaryInputFormat's read-side check: reject before allocating/writing
-    // rather than emitting a frame the same setting would refuse to read back. 0 means
-    // "no cap" (the pre-existing-setting compatibility fallback), not a zero-byte limit.
-    if (max_frame_size_ != 0 && cursor - hdr_desc_size > max_frame_size_)
-        throw Exception(ErrorCodes::INCORRECT_DATA,
-            "ColumnBinary: frame data size {} exceeds column_binary_max_frame_size limit {}",
-            cursor - hdr_desc_size, max_frame_size_);
 
     // Get write destination: use the pre-allocated region in out when available,
     // otherwise fall back to a temporary buffer (e.g. when the caller did not
@@ -163,11 +200,10 @@ void ColumnBinaryOutputFormat::consume(Chunk chunk)
     }
 
     // Write header and descriptor table.
-    std::memcpy(buf,     &num_rows, 4);
-    std::memcpy(buf + 4, &num_cols, 4);
-    std::memcpy(buf + ColumnarV1::COLUMNAR_HEADER_BYTES,
+    ColumnBinaryWire::writeFrameHeader(buf, num_rows, num_cols);
+    std::memcpy(buf + ColumnBinaryWire::FRAME_HEADER_BYTES,
                 descs.data(),
-                num_cols * ColumnarV1::COLUMNAR_DESC_BYTES);
+                num_cols * ColumnBinaryWire::COL_DESC_BYTES);
 
     // Write column data.
     std::span<uint8_t> buf_span{buf, cursor};
@@ -180,7 +216,7 @@ void ColumnBinaryOutputFormat::consume(Chunk chunk)
             : &raw_col;
         bool is_nullable = typeid_cast<const ColumnNullable *>(actual) != nullptr;
         uint32_t col_rows = is_const ? 1u : num_rows;
-        ColumnarV1::writeColData(actual, is_nullable, col_rows, descs[i], buf_span);
+        ColumnBinaryWire::writeColData(actual, is_nullable, col_rows, descs[i], buf_span);
     }
 
     if (!use_prealloc)
@@ -190,17 +226,15 @@ void ColumnBinaryOutputFormat::consume(Chunk chunk)
 }
 
 ColumnBinaryOutputFormat::ColumnBinaryOutputFormat(WriteBuffer & out_, SharedHeader header,
-                                                   bool disable_preallocation,
-                                                   UInt64 max_frame_size)
+                                                   bool disable_preallocation)
     : IOutputFormat(header, out_)
     , header_(header)
     , disable_preallocation_(disable_preallocation)
-    , max_frame_size_(max_frame_size)
 {
     // Reject unsupported signatures (nested Nullable/Variant, Map, >8-byte fixed-width
     // types) here so callers find out at format construction, not on the first block.
     for (const auto & col : header_->getColumnsWithTypeAndName())
-        ColumnarV1::validateColumnarV1SupportedType(col.type);
+        ColumnBinaryWire::validateColumnBinaryWireSupportedType(col.type);
 }
 
 void registerOutputFormatColumnBinary(FormatFactory & factory)
@@ -211,12 +245,11 @@ void registerOutputFormatColumnBinary(FormatFactory & factory)
         const FormatSettings & format_settings,
         FormatFilterInfoPtr /*format_filter_info*/)
     {
-        ColumnarV1::checkColumnBinaryFormatIsAllowed(format_settings.column_binary.allow_experimental);
+        ColumnBinaryWire::checkColumnBinaryFormatIsAllowed(format_settings.column_binary.allow_experimental);
         return std::make_shared<ColumnBinaryOutputFormat>(
             buf,
             std::make_shared<const Block>(sample),
-            format_settings.column_binary.disable_preallocation,
-            format_settings.column_binary.max_frame_size);
+            format_settings.column_binary.disable_preallocation);
     });
     factory.markOutputFormatSupportsParallelFormatting("ColumnBinary");
     factory.markOutputFormatNotTTYFriendly("ColumnBinary");

@@ -104,3 +104,42 @@ Span * batch_row_count_json(Span * input, uint32_t num_rows) {
     out->size = (uint32_t)(pos - out->data);
     return out;
 }
+
+/* Same as batch_row_count_json, but emits the `RETURNS Array(UInt32)` result in
+   RowBinary: a varint element count (always 1, so a single byte) followed by the
+   batch's row count as a little-endian uint32. Needed to exercise the binary wires,
+   where `SerializationDynamic::serializeBinary` prepends each row's runtime type. */
+Span * batch_row_count_row_binary(Span * input, uint32_t num_rows) {
+    (void)input;
+    Span * out = clickhouse_create_buffer(num_rows * 5);
+    if (out == NULL) return NULL;
+    uint8_t * pos = out->data;
+    for (uint32_t row = 0; row < num_rows; row++) {
+        *pos++ = 1;
+        *pos++ = (uint8_t)(num_rows & 0xFF);
+        *pos++ = (uint8_t)((num_rows >> 8) & 0xFF);
+        *pos++ = (uint8_t)((num_rows >> 16) & 0xFF);
+        *pos++ = (uint8_t)((num_rows >> 24) & 0xFF);
+    }
+    return out;
+}
+
+/* Same as batch_row_count_json, but emits the `RETURNS Array(UInt32)` result in
+   MsgPack: `fixarray` of one element followed by a `uint32` (0xce and four
+   big-endian bytes). Needed to exercise the MsgPack wire, whose per-value
+   headers no in-memory byte count can see. */
+Span * batch_row_count_msgpack(Span * input, uint32_t num_rows) {
+    (void)input;
+    Span * out = clickhouse_create_buffer(num_rows * 6);
+    if (out == NULL) return NULL;
+    uint8_t * pos = out->data;
+    for (uint32_t row = 0; row < num_rows; row++) {
+        *pos++ = 0x91;
+        *pos++ = 0xce;
+        *pos++ = (uint8_t)((num_rows >> 24) & 0xFF);
+        *pos++ = (uint8_t)((num_rows >> 16) & 0xFF);
+        *pos++ = (uint8_t)((num_rows >> 8) & 0xFF);
+        *pos++ = (uint8_t)(num_rows & 0xFF);
+    }
+    return out;
+}

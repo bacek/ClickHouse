@@ -91,7 +91,8 @@ public:
     }
 
     MergeTreeIndexFormat getPhysicalFormat(
-        const IMergeTreeDataPart & part,
+        const MergeTreeDataPartChecksums & checksums,
+        const IDataPartStorage & storage,
         const std::string & relative_path_prefix) const override;
 };
 

@@ -271,10 +271,11 @@ MergeTreeIndexConditionPtr MergeTreeIndexSpatialBbox::createIndexCondition(
 /// Only physical discovery: the invalidated-system-column and part-type-compatibility checks
 /// live in the non-virtual `IMergeTreeIndex::getDeserializedFormat` that calls this.
 MergeTreeIndexFormat MergeTreeIndexSpatialBbox::getPhysicalFormat(
-    const IMergeTreeDataPart & part,
+    const MergeTreeDataPartChecksums & checksums,
+    const IDataPartStorage & storage,
     const std::string & relative_path_prefix) const
 {
-    if (indexFileExistsInChecksums(part.checksums, relative_path_prefix, ".idx2", &part.getDataPartStorage()))
+    if (indexFileExistsInChecksums(checksums, relative_path_prefix, ".idx2", &storage))
         return {2, {{MergeTreeIndexSubstream::Type::Regular, "", ".idx2"}}};
     return {0 /* unknown */, {}};
 }

@@ -13,6 +13,7 @@
 #include <Columns/ColumnArray.h>
 #include <Columns/ColumnTuple.h>
 #include <Columns/ColumnString.h>
+#include <Columns/ColumnSparse.h>
 #include <Columns/ColumnFixedString.h>
 #include <Columns/ColumnVector.h>
 
@@ -28,7 +29,7 @@
 #include <Processors/Formats/IRowInputFormat.h>
 
 #include <Formats/FormatSettings.h>
-#include <Formats/ColumnarV1Wire.h>
+#include <Formats/ColumnBinaryWire.h>
 
 #include <Common/typeid_cast.h>
 
@@ -221,9 +222,12 @@ TEST(ColumnBinary, ConstColumnRoundTrip)
         auto chunk = input.read();
         ASSERT_EQ(chunk.getNumColumns(), 1u);
         ASSERT_EQ(chunk.getNumRows(), 5u);
-        const auto & decoded = typeid_cast<const ColumnConst &>(*chunk.getColumns()[0]);
-        const auto & decoded_inner = typeid_cast<const ColumnInt32 &>(decoded.getDataColumn());
-        EXPECT_EQ(decoded_inner.getData()[0], 42);
+        // The reader materializes a `COL_IS_CONST` column: const is a wire-level encoding of a
+        // repeated value, not part of the chunk's data model, and the chunk has to match the
+        // header structurally. So the value must appear once per row.
+        const auto & decoded = typeid_cast<const ColumnInt32 &>(*chunk.getColumns()[0]);
+        for (size_t i = 0; i < 5; ++i)
+            EXPECT_EQ(decoded.getData()[i], 42);
     }
 }
 
@@ -441,9 +445,9 @@ TEST(ColumnBinary, ConstMultiColumnRoundTrip)
         auto chunk = input.read();
         ASSERT_EQ(chunk.getNumColumns(), 2u);
         ASSERT_EQ(chunk.getNumRows(), 3u);
-        const auto & col0 = typeid_cast<const ColumnConst &>(*chunk.getColumns()[0]);
-        const auto & inner = typeid_cast<const ColumnInt64 &>(col0.getDataColumn());
-        EXPECT_EQ(inner.getData()[0], 999);
+        const auto & col0 = typeid_cast<const ColumnInt64 &>(*chunk.getColumns()[0]);
+        for (size_t i = 0; i < 3; ++i)
+            EXPECT_EQ(col0.getData()[i], 999);
         const auto & col1 = typeid_cast<const ColumnString &>(*chunk.getColumns()[1]);
         EXPECT_EQ(getStringAt(col1, 0), "a");
         EXPECT_EQ(getStringAt(col1, 1), "b");
@@ -656,9 +660,9 @@ TEST(ColumnBinary, ConstStringRoundTrip)
         auto chunk = input.read();
         ASSERT_EQ(chunk.getNumColumns(), 1u);
         ASSERT_EQ(chunk.getNumRows(), 4u);
-        const auto & decoded = typeid_cast<const ColumnConst &>(*chunk.getColumns()[0]);
-        const auto & inner_decoded = typeid_cast<const ColumnString &>(decoded.getDataColumn());
-        EXPECT_EQ(getStringAt(inner_decoded, 0), "constant");
+        const auto & decoded = typeid_cast<const ColumnString &>(*chunk.getColumns()[0]);
+        for (size_t i = 0; i < 4; ++i)
+            EXPECT_EQ(getStringAt(decoded, i), "constant");
     }
 }
 
@@ -689,10 +693,13 @@ TEST(ColumnBinary, ConstNullableRoundTrip)
         auto chunk = input.read();
         ASSERT_EQ(chunk.getNumColumns(), 1u);
         ASSERT_EQ(chunk.getNumRows(), 3u);
-        const auto & decoded = typeid_cast<const ColumnConst &>(*chunk.getColumns()[0]);
-        const auto & decoded_nullable = typeid_cast<const ColumnNullable &>(decoded.getDataColumn());
+        const auto & decoded_nullable = typeid_cast<const ColumnNullable &>(*chunk.getColumns()[0]);
         const auto & inner = typeid_cast<const ColumnInt32 &>(decoded_nullable.getNestedColumn());
-        EXPECT_EQ(inner.getData()[0], 42);
+        for (size_t i = 0; i < 3; ++i)
+        {
+            EXPECT_FALSE(decoded_nullable.isNullAt(i));
+            EXPECT_EQ(inner.getData()[i], 42);
+        }
     }
 }
 
@@ -807,14 +814,15 @@ TEST(ColumnBinary, ConstArrayRoundTrip)
         auto chunk = input.read();
         ASSERT_EQ(chunk.getNumColumns(), 1u);
         ASSERT_EQ(chunk.getNumRows(), 2u);
-        const auto & decoded = typeid_cast<const ColumnConst &>(*chunk.getColumns()[0]);
-        const auto & inner_decoded = typeid_cast<const ColumnArray &>(decoded.getDataColumn());
-        const auto & data = typeid_cast<const ColumnUInt64 &>(inner_decoded.getData());
-        const auto & offsets = inner_decoded.getOffsets();
-        EXPECT_EQ(offsets[0], 3);
-        EXPECT_EQ(data.getData()[0], 1);
-        EXPECT_EQ(data.getData()[1], 2);
-        EXPECT_EQ(data.getData()[2], 3);
+        const auto & decoded = typeid_cast<const ColumnArray &>(*chunk.getColumns()[0]);
+        const auto & data = typeid_cast<const ColumnUInt64 &>(decoded.getData());
+        const auto & offsets = decoded.getOffsets();
+        // Both rows carry the same array, materialized once per row.
+        ASSERT_EQ(offsets[0], 3);
+        ASSERT_EQ(offsets[1], 6);
+        for (size_t row = 0; row < 2; ++row)
+            for (size_t i = 0; i < 3; ++i)
+                EXPECT_EQ(data.getData()[row * 3 + i], i + 1);
     }
 }
 
@@ -1306,112 +1314,6 @@ TEST(ColumnBinary, ArrayTupleRoundTrip)
     }
 }
 
-// ── column_binary_max_frame_size must be enforced before preallocation ───────
-//
-// The setting is checked both in precomputeSerializedSize (before the caller
-// allocates a buffer sized from its return value, as the buffered WASM path
-// does) and in consume (before actually writing). This test targets the
-// precompute-time check specifically: a large row count with a tiny
-// max_frame_size must throw before any oversized allocation happens.
-
-TEST(ColumnBinary, MaxFrameSizeRejectsOversizedPrecompute)
-{
-    DataTypes types = {std::make_shared<DataTypeString>()};
-    auto col = ColumnString::create();
-    for (int i = 0; i < 1000; ++i)
-        col->insertData("0123456789", 10);
-    size_t rows = col->size();
-    Block header;
-    header.insert(ColumnWithTypeAndName{std::move(col), types[0], "col0"});
-    Block block_for_precompute = header;
-
-    WriteBufferFromOwnString obuf;
-    ColumnBinaryOutputFormat output(obuf, std::make_shared<const Block>(header),
-                                    /*disable_preallocation=*/false, /*max_frame_size=*/64);
-    // Exercise precomputeSerializedSize directly (not write()/consume()): this is the entry
-    // point a caller preallocating from its return value uses, e.g. the buffered WASM path.
-    EXPECT_THROW(output.precomputeSerializedSize(block_for_precompute, rows), DB::Exception);
-}
-
-// A frame within the configured limit must still succeed normally.
-
-TEST(ColumnBinary, MaxFrameSizeAllowsFrameWithinLimit)
-{
-    DataTypes types = {std::make_shared<DataTypeUInt8>()};
-    auto col = ColumnUInt8::create();
-    col->getData().push_back(static_cast<UInt8>(42));
-    Block header;
-    header.insert(ColumnWithTypeAndName{std::move(col), types[0], "col0"});
-
-    WriteBufferFromOwnString obuf;
-    {
-        ColumnBinaryOutputFormat output(obuf, std::make_shared<const Block>(header),
-                                        /*disable_preallocation=*/false, /*max_frame_size=*/1024);
-        output.write(header);
-    }
-    obuf.finalize();
-
-    ReadBufferFromString rb{obuf.str()};
-    ColumnBinaryInputFormat input(rb, header, RowInputFormatParams{}, FormatSettings{});
-    auto chunk = input.read();
-    ASSERT_EQ(chunk.getNumColumns(), 1u);
-    ASSERT_EQ(chunk.getNumRows(), 1u);
-    const auto & decoded = typeid_cast<const ColumnUInt8 &>(*chunk.getColumns()[0]);
-    EXPECT_EQ(decoded.getData()[0], 42);
-}
-
-// ── column_binary_max_frame_size = 0 must mean "no cap", not a zero-byte limit ──
-//
-// 0 is the setting's compatibility-fallback value for a `compatibility` setting
-// pinned to a version before this setting existed (SettingsChangesHistory.cpp).
-// Checking `frame_size > max_frame_size_` without special-casing 0 would reject
-// every non-empty frame in that configuration, breaking every ColumnBinary
-// read/write and every buffered WASM call using it. Exercise all three
-// enforcement sites: output precompute, output consume/write, and input read.
-
-TEST(ColumnBinary, MaxFrameSizeZeroMeansUnlimitedOnPrecompute)
-{
-    DataTypes types = {std::make_shared<DataTypeString>()};
-    auto col = ColumnString::create();
-    for (int i = 0; i < 1000; ++i)
-        col->insertData("0123456789", 10);
-    size_t rows = col->size();
-    Block header;
-    header.insert(ColumnWithTypeAndName{std::move(col), types[0], "col0"});
-    Block block_for_precompute = header;
-
-    WriteBufferFromOwnString obuf;
-    ColumnBinaryOutputFormat output(obuf, std::make_shared<const Block>(header),
-                                    /*disable_preallocation=*/false, /*max_frame_size=*/0);
-    EXPECT_NO_THROW(output.precomputeSerializedSize(block_for_precompute, rows));
-}
-
-TEST(ColumnBinary, MaxFrameSizeZeroMeansUnlimitedRoundTrip)
-{
-    DataTypes types = {std::make_shared<DataTypeString>()};
-    auto col = ColumnString::create();
-    for (int i = 0; i < 1000; ++i)
-        col->insertData("0123456789", 10);
-    Block header;
-    header.insert(ColumnWithTypeAndName{std::move(col), types[0], "col0"});
-
-    WriteBufferFromOwnString obuf;
-    {
-        ColumnBinaryOutputFormat output(obuf, std::make_shared<const Block>(header),
-                                        /*disable_preallocation=*/false, /*max_frame_size=*/0);
-        output.write(header);
-    }
-    obuf.finalize();
-
-    FormatSettings format_settings;
-    format_settings.column_binary.max_frame_size = 0;
-    ReadBufferFromString rb{obuf.str()};
-    ColumnBinaryInputFormat input(rb, header, RowInputFormatParams{}, format_settings);
-    auto chunk = input.read();
-    ASSERT_EQ(chunk.getNumColumns(), 1u);
-    ASSERT_EQ(chunk.getNumRows(), 1000u);
-}
-
 // ── Frame validator must reject descriptors pointing into header/descriptor metadata ──
 //
 // A descriptor with data_offset=0, data_size=1 leaves data_end unchanged at
@@ -1423,15 +1325,14 @@ TEST(ColumnBinary, MaxFrameSizeZeroMeansUnlimitedRoundTrip)
 
 TEST(ColumnBinary, FrameValidatorRejectsDataOffsetInsideHeader)
 {
-    using namespace ColumnarV1;
+    using namespace ColumnBinaryWire;
 
     const uint32_t num_rows = 1;
     const uint32_t num_cols = 1;
-    const size_t hdr_desc_size = COLUMNAR_HEADER_BYTES + COLUMNAR_DESC_BYTES;
+    const size_t hdr_desc_size = FRAME_HEADER_BYTES + COL_DESC_BYTES;
 
     std::string frame(hdr_desc_size, '\0');
-    std::memcpy(frame.data(), &num_rows, 4);
-    std::memcpy(frame.data() + 4, &num_cols, 4);
+    ColumnBinaryWire::writeFrameHeader(reinterpret_cast<uint8_t *>(frame.data()), num_rows, num_cols);
 
     ColDescriptor desc{};
     desc.type = COL_FIXED64;
@@ -1439,7 +1340,7 @@ TEST(ColumnBinary, FrameValidatorRejectsDataOffsetInsideHeader)
     desc.offsets_offset = 0;
     desc.data_offset = 0;  // points at the frame header, not a real data section
     desc.data_size = 1;
-    std::memcpy(frame.data() + COLUMNAR_HEADER_BYTES, &desc, COLUMNAR_DESC_BYTES);
+    std::memcpy(frame.data() + FRAME_HEADER_BYTES, &desc, COL_DESC_BYTES);
 
     Block header;
     header.insert(ColumnWithTypeAndName{ColumnUInt64::create(), std::make_shared<DataTypeUInt64>(), "col0"});
@@ -1451,16 +1352,15 @@ TEST(ColumnBinary, FrameValidatorRejectsDataOffsetInsideHeader)
 
 TEST(ColumnBinary, FrameValidatorRejectsNullOffsetInsideHeader)
 {
-    using namespace ColumnarV1;
+    using namespace ColumnBinaryWire;
 
     const uint32_t num_rows = 1;
     const uint32_t num_cols = 1;
-    const size_t hdr_desc_size = COLUMNAR_HEADER_BYTES + COLUMNAR_DESC_BYTES;
+    const size_t hdr_desc_size = FRAME_HEADER_BYTES + COL_DESC_BYTES;
     const uint64_t data_off = hdr_desc_size;
 
     std::string frame(hdr_desc_size + 8, '\0');
-    std::memcpy(frame.data(), &num_rows, 4);
-    std::memcpy(frame.data() + 4, &num_cols, 4);
+    ColumnBinaryWire::writeFrameHeader(reinterpret_cast<uint8_t *>(frame.data()), num_rows, num_cols);
 
     ColDescriptor desc{};
     desc.type = COL_FIXED64 | COL_IS_NULLABLE;
@@ -1468,7 +1368,7 @@ TEST(ColumnBinary, FrameValidatorRejectsNullOffsetInsideHeader)
     desc.offsets_offset = 0;
     desc.data_offset = data_off;
     desc.data_size = 8;
-    std::memcpy(frame.data() + COLUMNAR_HEADER_BYTES, &desc, COLUMNAR_DESC_BYTES);
+    std::memcpy(frame.data() + FRAME_HEADER_BYTES, &desc, COL_DESC_BYTES);
 
     auto nested_type = std::make_shared<DataTypeUInt64>();
     auto col = ColumnNullable::create(ColumnUInt64::create(), ColumnUInt8::create());
@@ -1489,16 +1389,15 @@ TEST(ColumnBinary, FrameValidatorRejectsNullOffsetInsideHeader)
 
 TEST(ColumnBinary, FrameValidatorRejectsCrossColumnNullOffset)
 {
-    using namespace ColumnarV1;
+    using namespace ColumnBinaryWire;
 
     const uint32_t num_rows = 1;
     const uint32_t num_cols = 2;
-    const size_t hdr_desc_size = COLUMNAR_HEADER_BYTES + 2 * COLUMNAR_DESC_BYTES;
+    const size_t hdr_desc_size = FRAME_HEADER_BYTES + 2 * COL_DESC_BYTES;
 
     // Genuine layout: col0 = [hdr_desc_size, 100), col1 = [100, 108).
     std::string frame(108, '\0');
-    std::memcpy(frame.data(), &num_rows, 4);
-    std::memcpy(frame.data() + 4, &num_cols, 4);
+    ColumnBinaryWire::writeFrameHeader(reinterpret_cast<uint8_t *>(frame.data()), num_rows, num_cols);
 
     ColDescriptor desc0{};
     desc0.type = COL_FIXED64 | COL_IS_NULLABLE;
@@ -1506,7 +1405,7 @@ TEST(ColumnBinary, FrameValidatorRejectsCrossColumnNullOffset)
     desc0.offsets_offset = 0;
     desc0.data_offset = hdr_desc_size + 4;
     desc0.data_size = 8;
-    std::memcpy(frame.data() + COLUMNAR_HEADER_BYTES, &desc0, COLUMNAR_DESC_BYTES);
+    std::memcpy(frame.data() + FRAME_HEADER_BYTES, &desc0, COL_DESC_BYTES);
 
     ColDescriptor desc1{};
     desc1.type = COL_FIXED64;
@@ -1514,7 +1413,7 @@ TEST(ColumnBinary, FrameValidatorRejectsCrossColumnNullOffset)
     desc1.offsets_offset = 0;
     desc1.data_offset = 100;
     desc1.data_size = 8;
-    std::memcpy(frame.data() + COLUMNAR_HEADER_BYTES + COLUMNAR_DESC_BYTES, &desc1, COLUMNAR_DESC_BYTES);
+    std::memcpy(frame.data() + FRAME_HEADER_BYTES + COL_DESC_BYTES, &desc1, COL_DESC_BYTES);
 
     auto uint64_type = std::make_shared<DataTypeUInt64>();
     Block header;
@@ -1530,19 +1429,18 @@ TEST(ColumnBinary, FrameValidatorRejectsCrossColumnNullOffset)
 
 TEST(ColumnBinary, FrameValidatorRejectsCrossColumnDataOffset)
 {
-    using namespace ColumnarV1;
+    using namespace ColumnBinaryWire;
 
     const uint32_t num_rows = 1;
     const uint32_t num_cols = 2;
-    const size_t hdr_desc_size = COLUMNAR_HEADER_BYTES + 2 * COLUMNAR_DESC_BYTES;
+    const size_t hdr_desc_size = FRAME_HEADER_BYTES + 2 * COL_DESC_BYTES;
 
     // Both descriptors point at the *second* column's payload, so col0 would decode col1's
     // bytes. Rejecting this is the ordered-layout invariant: once col0's region has been
     // stretched over [96, 104), col1's own range no longer starts at or after that region's
     // end, which is exactly what the check detects.
     std::string frame(hdr_desc_size + 16, '\0');
-    std::memcpy(frame.data(), &num_rows, 4);
-    std::memcpy(frame.data() + 4, &num_cols, 4);
+    ColumnBinaryWire::writeFrameHeader(reinterpret_cast<uint8_t *>(frame.data()), num_rows, num_cols);
 
     ColDescriptor desc{};
     desc.type = COL_FIXED64;
@@ -1550,8 +1448,8 @@ TEST(ColumnBinary, FrameValidatorRejectsCrossColumnDataOffset)
     desc.offsets_offset = 0;
     desc.data_offset = hdr_desc_size + 8;
     desc.data_size = 8;
-    std::memcpy(frame.data() + COLUMNAR_HEADER_BYTES, &desc, COLUMNAR_DESC_BYTES);
-    std::memcpy(frame.data() + COLUMNAR_HEADER_BYTES + COLUMNAR_DESC_BYTES, &desc, COLUMNAR_DESC_BYTES);
+    std::memcpy(frame.data() + FRAME_HEADER_BYTES, &desc, COL_DESC_BYTES);
+    std::memcpy(frame.data() + FRAME_HEADER_BYTES + COL_DESC_BYTES, &desc, COL_DESC_BYTES);
 
     auto uint64_type = std::make_shared<DataTypeUInt64>();
     Block header;
@@ -1565,11 +1463,11 @@ TEST(ColumnBinary, FrameValidatorRejectsCrossColumnDataOffset)
 
 TEST(ColumnBinary, FrameValidatorRejectsCrossColumnStringOffsets)
 {
-    using namespace ColumnarV1;
+    using namespace ColumnBinaryWire;
 
     const uint32_t num_rows = 1;
     const uint32_t num_cols = 2;
-    const size_t hdr_desc_size = COLUMNAR_HEADER_BYTES + 2 * COLUMNAR_DESC_BYTES;
+    const size_t hdr_desc_size = FRAME_HEADER_BYTES + 2 * COL_DESC_BYTES;
 
     // col0 is an empty `String` column: its offsets array must live in its own region, which
     // here is the empty range [hdr_desc_size + 16, hdr_desc_size + 16). Point the offsets
@@ -1578,8 +1476,7 @@ TEST(ColumnBinary, FrameValidatorRejectsCrossColumnStringOffsets)
     // row count worth of offsets out of col1's bytes.
     const uint64_t col1_data = hdr_desc_size + 16;
     std::string frame(col1_data + 24, '\0');
-    std::memcpy(frame.data(), &num_rows, 4);
-    std::memcpy(frame.data() + 4, &num_cols, 4);
+    ColumnBinaryWire::writeFrameHeader(reinterpret_cast<uint8_t *>(frame.data()), num_rows, num_cols);
 
     ColDescriptor desc0{};
     desc0.type = COL_BYTES;
@@ -1587,7 +1484,7 @@ TEST(ColumnBinary, FrameValidatorRejectsCrossColumnStringOffsets)
     desc0.offsets_offset = col1_data + 4;  // inside col1's region, not col0's own
     desc0.data_offset = col1_data;
     desc0.data_size = 0;
-    std::memcpy(frame.data() + COLUMNAR_HEADER_BYTES, &desc0, COLUMNAR_DESC_BYTES);
+    std::memcpy(frame.data() + FRAME_HEADER_BYTES, &desc0, COL_DESC_BYTES);
 
     ColDescriptor desc1{};
     desc1.type = COL_FIXEDN;
@@ -1595,7 +1492,7 @@ TEST(ColumnBinary, FrameValidatorRejectsCrossColumnStringOffsets)
     desc1.offsets_offset = 0;
     desc1.data_offset = col1_data;
     desc1.data_size = 24;
-    std::memcpy(frame.data() + COLUMNAR_HEADER_BYTES + COLUMNAR_DESC_BYTES, &desc1, COLUMNAR_DESC_BYTES);
+    std::memcpy(frame.data() + FRAME_HEADER_BYTES + COL_DESC_BYTES, &desc1, COL_DESC_BYTES);
 
     Block header;
     header.insert(ColumnWithTypeAndName{ColumnString::create(), std::make_shared<DataTypeString>(), "col0"});
@@ -1638,4 +1535,154 @@ TEST(ColumnBinary, ZeroRowConstColumnRoundTrip)
     ASSERT_EQ(chunk.getNumColumns(), 1u);
     ASSERT_EQ(chunk.getNumRows(), 0u);
     EXPECT_EQ(chunk.getColumns()[0]->size(), 0u);
+}
+
+// ── precomputeSerializedSize must model the same layout as consume ───────────
+//
+// consume() strips Sparse/Replicated wrappers before building descriptors, so
+// precomputeSerializedSize() has to as well: buildColDescriptor has no notion of
+// them, and a sparse String would miss the ColumnString branch and throw instead
+// of returning a size. The two passes disagreeing would mis-size the buffer a
+// caller preallocates from the precomputed value.
+
+TEST(ColumnBinary, PrecomputeStripsSparseAndMatchesConsume)
+{
+    auto type = std::make_shared<DataTypeString>();
+
+    auto values = ColumnString::create();
+    values->insertDefault();          // ColumnSparse's values[0] is the default value
+    values->insertData("abc", 3);
+    auto offsets = ColumnUInt64::create();
+    offsets->getData().push_back(3);  // only row 3 is non-default
+
+    const size_t rows = 5;
+    auto sparse = ColumnSparse::create(std::move(values), std::move(offsets), rows);
+    ASSERT_TRUE(typeid_cast<const ColumnSparse *>(sparse.get()) != nullptr);
+
+    Block header;
+    header.insert(ColumnWithTypeAndName{type->createColumn(), type, "col0"});
+
+    Block block;
+    block.insert(ColumnWithTypeAndName{std::move(sparse), type, "col0"});
+
+    WriteBufferFromOwnString obuf;
+    ColumnBinaryOutputFormat output(obuf, std::make_shared<const Block>(header),
+                                    /*disable_preallocation=*/false);
+
+    std::optional<uint64_t> precomputed;
+    ASSERT_NO_THROW(precomputed = output.precomputeSerializedSize(block, rows));
+    ASSERT_TRUE(precomputed.has_value());
+
+    // The size consume() actually writes must match what precompute promised.
+    output.write(block);
+    EXPECT_EQ(obuf.str().size(), *precomputed);
+}
+
+// ── the writer must enforce the same exact column count the reader requires ──
+//
+// ColumnBinaryInputFormat::checkNumCols rejects anything but an exact match
+// against the schema, so the writer clamping to min(chunk columns, header
+// columns) would fail open: extra columns silently dropped, missing columns
+// producing a frame whose num_cols disagrees with the advertised header (and,
+// on the preallocated buffered-WASM path, a precomputed size that consume does
+// not fill).
+
+TEST(ColumnBinary, WriterRejectsColumnCountMismatch)
+{
+    auto type = std::make_shared<DataTypeUInt64>();
+
+    Block header;
+    header.insert(ColumnWithTypeAndName{type->createColumn(), type, "col0"});
+    header.insert(ColumnWithTypeAndName{type->createColumn(), type, "col1"});
+
+    auto make_col = [&](UInt64 v)
+    {
+        auto c = ColumnUInt64::create();
+        c->getData().push_back(v);
+        return c;
+    };
+
+    // Too few columns.
+    {
+        Block block;
+        block.insert(ColumnWithTypeAndName{make_col(1), type, "col0"});
+
+        WriteBufferFromOwnString obuf;
+        ColumnBinaryOutputFormat output(obuf, std::make_shared<const Block>(header),
+                                        /*disable_preallocation=*/false);
+        EXPECT_THROW(output.precomputeSerializedSize(block, 1), DB::Exception);
+        EXPECT_THROW(output.write(block), DB::Exception);
+    }
+
+    // Too many columns.
+    {
+        Block block;
+        block.insert(ColumnWithTypeAndName{make_col(1), type, "col0"});
+        block.insert(ColumnWithTypeAndName{make_col(2), type, "col1"});
+        block.insert(ColumnWithTypeAndName{make_col(3), type, "col2"});
+
+        WriteBufferFromOwnString obuf;
+        ColumnBinaryOutputFormat output(obuf, std::make_shared<const Block>(header),
+                                        /*disable_preallocation=*/false);
+        EXPECT_THROW(output.precomputeSerializedSize(block, 1), DB::Exception);
+        EXPECT_THROW(output.write(block), DB::Exception);
+    }
+}
+
+TEST(ColumnBinary, WriterRejectsColumnTypeMismatch)
+{
+    auto declared_type = std::make_shared<DataTypeUInt64>();
+    auto other_type = std::make_shared<DataTypeString>();
+
+    Block header;
+    header.insert(ColumnWithTypeAndName{declared_type->createColumn(), declared_type, "col0"});
+
+    // Same column count, wrong type: the reader decodes against the declared type and
+    // rejects the frame (see ColumnBinaryInputFormat's structureEquals check), so the
+    // writer must refuse to emit it rather than produce something unreadable.
+    {
+        auto c = ColumnString::create();
+        c->insertData("abc", 3);
+
+        Block block;
+        block.insert(ColumnWithTypeAndName{std::move(c), other_type, "col0"});
+
+        WriteBufferFromOwnString obuf;
+        ColumnBinaryOutputFormat output(obuf, std::make_shared<const Block>(header),
+                                        /*disable_preallocation=*/false);
+        EXPECT_THROW(output.precomputeSerializedSize(block, 1), DB::Exception);
+        EXPECT_THROW(output.write(block), DB::Exception);
+    }
+
+    // A same-width but differently-typed column is still a mismatch: Int64 and UInt64 are
+    // both 8 bytes, so only a structural check (not a size check) catches this.
+    {
+        auto int_type = std::make_shared<DataTypeInt64>();
+        auto c = ColumnInt64::create();
+        c->getData().push_back(-1);
+
+        Block block;
+        block.insert(ColumnWithTypeAndName{std::move(c), int_type, "col0"});
+
+        WriteBufferFromOwnString obuf;
+        ColumnBinaryOutputFormat output(obuf, std::make_shared<const Block>(header),
+                                        /*disable_preallocation=*/false);
+        EXPECT_THROW(output.precomputeSerializedSize(block, 1), DB::Exception);
+        EXPECT_THROW(output.write(block), DB::Exception);
+    }
+
+    // The matching type still writes cleanly, so the new check does not reject valid frames.
+    {
+        auto c = ColumnUInt64::create();
+        c->getData().push_back(7);
+
+        Block block;
+        block.insert(ColumnWithTypeAndName{std::move(c), declared_type, "col0"});
+
+        WriteBufferFromOwnString obuf;
+        ColumnBinaryOutputFormat output(obuf, std::make_shared<const Block>(header),
+                                        /*disable_preallocation=*/false);
+        EXPECT_NO_THROW(output.precomputeSerializedSize(block, 1));
+        EXPECT_NO_THROW(output.write(block));
+    }
 }

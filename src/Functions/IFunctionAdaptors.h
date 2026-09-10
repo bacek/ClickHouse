@@ -25,6 +25,7 @@ protected:
     bool useDefaultImplementationForConstants() const final { return function->useDefaultImplementationForConstants(); }
     bool useDefaultImplementationForLowCardinalityColumns() const final { return function->useDefaultImplementationForLowCardinalityColumns(); }
     bool useDefaultImplementationForSparseColumns() const final { return function->useDefaultImplementationForSparseColumns(); }
+    bool useDefaultImplementationForReplicatedColumns() const final { return function->useDefaultImplementationForReplicatedColumns(); }
 
     ColumnNumbers getArgumentsThatAreAlwaysConstant() const final { return function->getArgumentsThatAreAlwaysConstant(); }
     bool canBeExecutedOnDefaultArguments() const override { return function->canBeExecutedOnDefaultArguments(); }
@@ -85,6 +86,8 @@ public:
     int getSpatialExpandArg() const override { return function->getSpatialExpandArg(); }
 
 
+    bool isVolumeReducing() const override { return function->isVolumeReducing(); }
+
     bool isInjective(const ColumnsWithTypeAndName & sample_columns) const override { return function->isInjective(sample_columns); }
 
     ComparisonOrderDomain getComparisonOrderDomain() const override
@@ -140,6 +143,7 @@ public:
     bool isStateful() const override { return function->isStateful(); }
     bool isVariadic() const override { return function->isVariadic(); }
     bool isServerConstant() const override { return function->isServerConstant(); }
+    bool isVolumeReducing() const override { return function->isVolumeReducing(); }
     bool isShortCircuit(IFunctionBase::ShortCircuitSettings & settings, size_t number_of_arguments) const override { return function->isShortCircuit(settings, number_of_arguments); }
     bool isHigherOrderFunction() const override { return function->isHigherOrderFunction(); }
     bool allowsOmittingParentheses() const override { return function->allowsOmittingParentheses(); }
