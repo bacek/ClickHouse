@@ -503,6 +503,290 @@ private:
     OutputFormatPtr probe_format;
 };
 
+// ─────────────────────────────────────────────────────────────────────────────
+// COLUMNAR_V1 ABI
+//
+// Wire format (all offsets are byte offsets from the buffer start):
+//
+//   BufHeader (8 bytes): num_rows:u32, num_cols:u32
+//   ColDescriptor[num_cols] (40 bytes each):
+//     type:u64, null_offset:u64, offsets_offset:u64, data_offset:u64, data_size:u64
+//   Data blocks at the described offsets.
+//
+//   type bits: ColType (0-6) | COL_IS_NULLABLE (0x20) | COL_IS_CONST (0x80)
+//
+//   COL_BYTES  (0): start-based u64 offsets[rows+1] + chars (no null terminators)
+//   COL_FIXED8 (1): u8[rows]
+//   COL_FIXED16(2): u16[rows]
+//   COL_FIXED64(4): u64/f64[rows]
+//   Any type | COL_IS_NULLABLE: null_map[rows] at null_offset, then column data
+//
+// The WASM export is <function_name>_col(i32 buf_handle, i32 num_rows) -> i32.
+// The caller (CH) allocates the input buffer with clickhouse_create_buffer,
+// fills it, then invokes the function.  The function returns a handle to an
+// output buffer (same layout, 1 column) which CH reads and frees.
+// ─────────────────────────────────────────────────────────────────────────────
+
+class UserDefinedWebAssemblyFunctionColumnarV1 : public UserDefinedWebAssemblyFunction
+{
+public:
+    template <typename... Args>
+    explicit UserDefinedWebAssemblyFunctionColumnarV1(Args &&... args)
+        : UserDefinedWebAssemblyFunction(std::forward<Args>(args)...)
+    {
+        // WASM export name matches the registered function name directly
+        col_function_name = function_name;
+        checkSignature();
+        // Reject unsupported argument/result signatures at CREATE FUNCTION time rather
+        // than on the first call: see validateColumnBinaryWireSupportedType for the exact list.
+        // COLUMNAR_V1 writes the same frame as the `ColumnBinary` wire, so it supports exactly
+        // the types that wire supports.
+        for (const auto & arg : arguments)
+            validateColumnBinaryWireSupportedType(arg);
+        validateColumnBinaryWireSupportedType(result_type);
+    }
+
+    bool requiresGuestLinearMemory() const override { return true; }
+
+    bool serializesInputBlockToGuestMemory() const override { return true; }
+
+    // Direct columnar execution — bypasses RowBinary batching.
+    // Called from FunctionUserDefinedWasm::executeImpl() for ColumnarV1 functions.
+    MutableColumnPtr executeColumnar(
+        WebAssembly::WasmCompartment * compartment,
+        const ColumnsWithTypeAndName & cols,
+        size_t input_rows_count,
+        ContextPtr,
+        StopToken stop_token) const
+    {
+        ProfileEventTimeIncrement<Microseconds> timer(ProfileEvents::WasmTotalExecuteMicroseconds);
+
+        if (input_rows_count == 0)
+            return result_type->createColumn();
+
+        if (input_rows_count >= std::numeric_limits<uint32_t>::max())
+            throw Exception(ErrorCodes::TOO_LARGE_STRING_SIZE, "Too large number of rows: {}", input_rows_count);
+
+        // ── Build the columnar input buffer ──────────────────────────────────
+        const uint32_t num_cols = static_cast<uint32_t>(cols.size());
+
+        std::vector<ColDescriptor> descs; // STYLE_CHECK_ALLOW_STD_CONTAINERS
+        std::vector<const IColumn *> inner_cols; // STYLE_CHECK_ALLOW_STD_CONTAINERS
+        std::vector<bool> is_nullable_flags; // STYLE_CHECK_ALLOW_STD_CONTAINERS
+        std::vector<uint32_t> row_counts; // STYLE_CHECK_ALLOW_STD_CONTAINERS
+        std::vector<ColumnPtr> casted_columns; // STYLE_CHECK_ALLOW_STD_CONTAINERS -- keeps casted columns alive through writeColData below
+
+        const uint64_t total_buf_size = buildColumnarLayout(
+            cols, input_rows_count, /* declared_positions */ {},
+            descs, inner_cols, is_nullable_flags, row_counts, casted_columns);
+
+        // ── Allocate buffer in WASM memory ───────────────────────────────────
+        {
+            auto wmm = std::make_unique<WasmMemoryManagerV01>(compartment, stop_token);
+            WasmMemoryGuard wasm_input = nullptr;
+
+            // Scope the serialization timer to the allocate-and-write phase only. It must
+            // not extend over `compartment->invoke` below (guest execution, which is neither
+            // serialization nor host work) nor over the read-back block (already counted by
+            // `WasmDeserializationMicroseconds`); otherwise `WasmSerializationMicroseconds`
+            // reports very nearly the whole of `WasmTotalExecuteMicroseconds` and double
+            // counts the deserialization time, making the COLUMNAR_V1 profile unreadable and
+            // incomparable with the BUFFERED_V1 path, whose timers are already disjoint.
+            {
+                ProfileEventTimeIncrement<Microseconds> timer_ser(ProfileEvents::WasmSerializationMicroseconds);
+
+                wasm_input = allocateInWasmMemory(wmm.get(), total_buf_size);
+                auto wasm_mem = wasm_input.getMemoryView();
+                // Same defensive check as the buffered path's fallback branch: a buggy
+                // clickhouse_create_buffer implementation in the WASM module could return a
+                // handle to a smaller buffer than requested. Without it, the header/descriptor
+                // memcpys and writeColData below would write past the end of the real guest
+                // buffer instead of throwing.
+                if (wasm_mem.size() != total_buf_size)
+                    throw Exception(ErrorCodes::WASM_ERROR,
+                        "Cannot allocate WASM buffer of size {}, got {}. "
+                        "Maybe '{}' function implementation in WebAssembly module is incorrect",
+                        total_buf_size, wasm_mem.size(), WasmMemoryManagerV01::allocate_function_name);
+
+                // Write header. The frame is the one `ColumnBinaryWire.h` defines - magic,
+                // version and reserved word ahead of the row and column counts - so that a guest
+                // reads the same header whichever of the two registration paths reached it.
+                writeFrameHeader(wasm_mem.data(), static_cast<uint32_t>(input_rows_count), num_cols);
+
+                // Write descriptors
+                for (uint32_t ci = 0; ci < num_cols; ++ci)
+                    std::memcpy(wasm_mem.data() + FRAME_HEADER_BYTES + ci * COL_DESC_BYTES,
+                                &descs[ci], COL_DESC_BYTES);
+
+                // Write column data
+                for (uint32_t ci = 0; ci < num_cols; ++ci)
+                    writeColData(inner_cols[ci], is_nullable_flags[ci], row_counts[ci],
+                                 descs[ci], wasm_mem);
+            }
+
+            // ── Invoke WASM ──────────────────────────────────────────────────
+            auto result_ptr = compartment->invoke<WasmPtr>(
+                col_function_name,
+                {wasm_input.getHandle(), static_cast<WasmSizeT>(input_rows_count)},
+                stop_token);
+
+            if (result_ptr == 0)
+                throw Exception(ErrorCodes::WASM_ERROR,
+                    "COLUMNAR_V1 function '{}' returned nullptr", col_function_name);
+
+            WasmMemoryGuard result_guard(wmm.get(), result_ptr);
+
+            // ── Read output ──────────────────────────────────────────────────
+            {
+                ProfileEventTimeIncrement<Microseconds> timer_de(ProfileEvents::WasmDeserializationMicroseconds);
+                auto out_view = result_guard.getMemoryView();
+                return readColumnarOutput(
+                    {out_view.data(), out_view.size()},
+                    result_type,
+                    input_rows_count);
+            }
+        }
+    }
+
+    // executeOnBlock is required by the base class but unused for ColumnarV1
+    // (FunctionUserDefinedWasm calls executeColumnar directly).
+    MutableColumnPtr executeOnBlock(
+        WebAssembly::WasmCompartment * compartment,
+        const Block & block,
+        ContextPtr context,
+        size_t num_rows,
+        StopToken stop_token) const override
+    {
+        ColumnsWithTypeAndName args;
+        args.reserve(block.columns());
+        for (size_t i = 0; i < block.columns(); ++i)
+            args.push_back(block.getByPosition(i));
+        return executeColumnar(compartment, args, num_rows, context, stop_token);
+    }
+
+    /// The exact bytes a call carrying `[start_idx, start_idx + length)` puts in guest memory.
+    ///
+    /// This ABI builds its buffer here rather than through a FormatFactory output, so what a
+    /// `serialization_format` would measure is not what the guest is handed - that setting names
+    /// the wire of the BUFFERED_V1 path and this ABI ignores it. The layout pass below is the very
+    /// one `executeColumnar` sizes its allocation with, so the measurement and the allocation
+    /// cannot disagree.
+    ///
+    /// `declared_positions` says where each entry of `cols` sits in the declared argument list; it
+    /// is empty when `cols` is that list in order. The cast to the declared type is what the size
+    /// depends on, and the declared type is found by an argument's declared position, not by where
+    /// it happens to land in a subset.
+    size_t measureColumnarBytes(
+        const ColumnsWithTypeAndName & cols,
+        size_t start_idx,
+        size_t length,
+        const std::vector<size_t> & declared_positions = {}) const // STYLE_CHECK_ALLOW_STD_CONTAINERS
+    {
+        ColumnsWithTypeAndName batch;
+        batch.reserve(cols.size());
+        for (const auto & col : cols)
+        {
+            /// A `ColumnConst` is one stored row broadcast to the batch and stays compact on this
+            /// wire, so it is passed through whole: cutting it would only rebuild the same const.
+            bool whole_column = isColumnConst(*col.column) || (start_idx == 0 && length == col.column->size());
+            batch.emplace_back(whole_column ? col.column : col.column->cut(start_idx, length), col.type, col.name);
+        }
+
+        std::vector<ColDescriptor> descs; // STYLE_CHECK_ALLOW_STD_CONTAINERS
+        std::vector<const IColumn *> inner_cols; // STYLE_CHECK_ALLOW_STD_CONTAINERS
+        std::vector<bool> is_nullable_flags; // STYLE_CHECK_ALLOW_STD_CONTAINERS
+        std::vector<uint32_t> row_counts; // STYLE_CHECK_ALLOW_STD_CONTAINERS
+        std::vector<ColumnPtr> casted_columns; // STYLE_CHECK_ALLOW_STD_CONTAINERS
+
+        return buildColumnarLayout(
+            batch, length, declared_positions, descs, inner_cols, is_nullable_flags, row_counts, casted_columns);
+    }
+
+private:
+    /// Fills the per-column descriptors of a COLUMNAR_V1 frame and returns the frame's total size.
+    /// `casted_columns` owns whatever the cast below produced and must outlive `inner_cols`, which
+    /// points into it.
+    uint64_t buildColumnarLayout(
+        const ColumnsWithTypeAndName & cols,
+        size_t input_rows_count,
+        const std::vector<size_t> & declared_positions, // STYLE_CHECK_ALLOW_STD_CONTAINERS
+        std::vector<ColDescriptor> & descs, // STYLE_CHECK_ALLOW_STD_CONTAINERS
+        std::vector<const IColumn *> & inner_cols, // STYLE_CHECK_ALLOW_STD_CONTAINERS
+        std::vector<bool> & is_nullable_flags, // STYLE_CHECK_ALLOW_STD_CONTAINERS
+        std::vector<uint32_t> & row_counts, // STYLE_CHECK_ALLOW_STD_CONTAINERS
+        std::vector<ColumnPtr> & casted_columns) const // STYLE_CHECK_ALLOW_STD_CONTAINERS
+    {
+        const uint32_t num_cols = static_cast<uint32_t>(cols.size());
+        uint64_t cursor = FRAME_HEADER_BYTES + num_cols * COL_DESC_BYTES;
+
+        descs.assign(num_cols, ColDescriptor{});
+        inner_cols.assign(num_cols, nullptr);
+        is_nullable_flags.assign(num_cols, false);
+        row_counts.assign(num_cols, 0);
+        casted_columns.assign(num_cols, nullptr);
+
+        for (uint32_t ci = 0; ci < num_cols; ++ci)
+        {
+            // Cast to the declared argument type: getReturnTypeImpl accepts numeric
+            // coercions (i32->i64, int->float, ...), but the wire only encodes a coarse
+            // width class (COL_FIXED8/16/32/64), not the declared width/signedness. Without
+            // this cast, a declared UInt64 argument passed as an actual UInt8 would still
+            // serialize as 1 byte, and the guest's get_u64-style reader would read past it.
+            //
+            // getReturnTypeImpl also accepts a genuinely Nullable(T) argument against a
+            // plain declared T (COLUMNAR_V1 derives is_nullable from the runtime column
+            // below, so it round-trips this correctly) -- but casting straight to the
+            // non-nullable declared type here would insert NULLs into an ordinary column
+            // and throw on the first real NULL. Cast to Nullable(declared type) instead
+            // whenever the actual argument is nullable, to fix the width/coercion while
+            // still preserving the null map for the is_nullable detection below.
+            const DataTypePtr & declared_arg_type = arguments[declared_positions.empty() ? ci : declared_positions[ci]];
+            DataTypePtr target_type = (cols[ci].type->isNullable() && !declared_arg_type->isNullable())
+                ? makeNullable(declared_arg_type)
+                : declared_arg_type;
+            casted_columns[ci] = cols[ci].type->equals(*target_type)
+                ? cols[ci].column
+                : castColumn(cols[ci], target_type);
+            const IColumn * col = casted_columns[ci].get();
+            bool is_const = false;
+
+            if (const auto * cc = typeid_cast<const ColumnConst *>(col))
+            {
+                col = &cc->getDataColumn();
+                is_const = true;
+            }
+
+            bool is_nullable = typeid_cast<const ColumnNullable *>(col) != nullptr;
+            uint32_t nrows = is_const ? 1u : static_cast<uint32_t>(input_rows_count);
+
+            is_nullable_flags[ci] = is_nullable;
+            inner_cols[ci] = col;
+            row_counts[ci] = nrows;
+
+            cursor = buildColDescriptor(col, is_const, is_nullable, nrows, cursor, descs[ci]);
+        }
+
+        return cursor;
+    }
+
+    void checkSignature() const
+    {
+        auto decl = wasm_module->getExport(col_function_name);
+        WasmFunctionDeclaration expected("", col_function_name,
+            {WasmValKind::I32, WasmValKind::I32}, WasmValKind::I32);
+        checkFunctionDeclarationMatches(decl, expected);
+        // Also require clickhouse_create_buffer / clickhouse_destroy_buffer
+        checkFunctionDeclarationMatches(
+            wasm_module->getExport(WasmMemoryManagerV01::allocate_function_name),
+            WasmMemoryManagerV01::allocateFunctionDeclaration());
+        checkFunctionDeclarationMatches(
+            wasm_module->getExport(WasmMemoryManagerV01::deallocate_function_name),
+            WasmMemoryManagerV01::deallocateFunctionDeclaration());
+    }
+
+    String col_function_name;
+};
+
 std::unique_ptr<UserDefinedWebAssemblyFunction> UserDefinedWebAssemblyFunction::create(
     std::shared_ptr<WebAssembly::WasmModule> wasm_module_,
     const String & function_name_,
@@ -524,6 +808,9 @@ std::unique_ptr<UserDefinedWebAssemblyFunction> UserDefinedWebAssemblyFunction::
         case WasmAbiVersion::AssemblyScript:
             return createUserDefinedWebAssemblyFunctionAssemblyScript(
                 wasm_module_, function_name_, argument_names_, arguments_, result_type_, std::move(function_settings), is_deterministic_);
+        case WasmAbiVersion::ColumnarV1:
+            return std::make_unique<UserDefinedWebAssemblyFunctionColumnarV1>(
+                wasm_module_, function_name_, argument_names_, arguments_, result_type_, std::move(function_settings), is_deterministic_);
     }
     throw Exception(
         ErrorCodes::LOGICAL_ERROR, "Unknown WebAssembly ABI version: {}", std::to_underlying(abi_type));
@@ -539,6 +826,8 @@ String toString(WasmAbiVersion abi_type)
             return "BUFFERED_V1";
         case WasmAbiVersion::AssemblyScript:
             return "ASSEMBLYSCRIPT";
+        case WasmAbiVersion::ColumnarV1:
+            return "COLUMNAR_V1";
     }
     throw Exception(
         ErrorCodes::LOGICAL_ERROR, "Unknown WebAssembly ABI version: {}", std::to_underlying(abi_type));
@@ -546,7 +835,7 @@ String toString(WasmAbiVersion abi_type)
 
 WasmAbiVersion getWasmAbiFromString(const String & str)
 {
-    for (auto abi_type : {WasmAbiVersion::RowDirect, WasmAbiVersion::BufferedV1, WasmAbiVersion::AssemblyScript})
+    for (auto abi_type : {WasmAbiVersion::RowDirect, WasmAbiVersion::BufferedV1, WasmAbiVersion::AssemblyScript, WasmAbiVersion::ColumnarV1})
         if (Poco::toUpper(str) == toString(abi_type))
             return abi_type;
 
@@ -696,11 +985,37 @@ public:
             if (arguments[i]->equals(*expected_arguments[i]))
                 continue;
 
-            /// Allow implicit coercions: same kind, i32→i64, any int→any float, f32→f64.
-            auto actual_kind = wasmKindForDataType(arguments[i].get());
-            auto expected_kind = wasmKindForDataType(expected_arguments[i].get());
-            if (actual_kind && expected_kind && canCoerce(*actual_kind, *expected_kind))
-                continue;
+            /// When useDefaultImplementationForNulls() returns false (non-nullable return
+            /// types such as Array), CH passes Nullable-wrapped argument types.
+            /// Strip Nullable and retry the exact-match / coercion checks below — but only
+            /// for COLUMNAR_V1: its executeColumnar derives is_nullable from the actual
+            /// runtime column, so a genuinely-Nullable argument against a non-nullable
+            /// declared parameter still round-trips correctly. BUFFERED_V1's
+            /// getArgumentsBlock instead casts the column down to the declared
+            /// (non-nullable) type before serialization, which would silently drop or fail
+            /// on real NULL values, so that path must not accept this relaxation at all —
+            /// neither for an exact type match nor for a numeric coercion.
+            bool allow_nullable_relaxation
+                = dynamic_cast<const UserDefinedWebAssemblyFunctionColumnarV1 *>(user_defined_function.get()) != nullptr;
+            if (allow_nullable_relaxation)
+            {
+                const DataTypePtr & stripped = removeNullable(arguments[i]);
+                if (stripped->equals(*expected_arguments[i]))
+                    continue;
+
+                /// Allow implicit coercions: same kind, i32→i64, any int→any float, f32→f64.
+                auto actual_kind = wasmKindForDataType(stripped.get());
+                auto expected_kind = wasmKindForDataType(expected_arguments[i].get());
+                if (actual_kind && expected_kind && canCoerce(*actual_kind, *expected_kind))
+                    continue;
+            }
+            else
+            {
+                auto actual_kind = wasmKindForDataType(arguments[i].get());
+                auto expected_kind = wasmKindForDataType(expected_arguments[i].get());
+                if (actual_kind && expected_kind && canCoerce(*actual_kind, *expected_kind))
+                    continue;
+            }
 
             auto get_type_names = std::views::transform([](const auto & arg) { return arg->getName(); });
             throw Exception(
@@ -777,6 +1092,90 @@ public:
         // `ColumnBinary`: bypass RowBinary batching, pass columns directly (ColumnConst stays const).
         try
         {
+            // COLUMNAR_V1: bypass RowBinary batching, pass columns directly (ColumnConst stays
+            // const) — but still apply the same webassembly_udf_max_input_block_size /
+            // guest-memory-budget splitting as the buffered path below, or a single large
+            // batch can still build an oversized guest buffer.
+            if (const auto * cv1 = dynamic_cast<const UserDefinedWebAssemblyFunctionColumnarV1 *>(user_defined_function.get()))
+            {
+                auto stop_token = interrupt_source.get_token();
+                auto expected_col = user_defined_function->getResultType()->createColumn();
+                MutableColumnPtr result_column = user_defined_function->getResultType()->createColumn();
+
+                auto flush_columnar_batch = [&](size_t batch_start, size_t end_idx)
+                {
+                    if (end_idx <= batch_start)
+                        return;
+                    size_t batch_size = end_idx - batch_start;
+                    ColumnsWithTypeAndName batch_cols;
+                    batch_cols.reserve(arguments.size());
+                    for (const auto & arg : arguments)
+                    {
+                        /// cut() materializes a copy of the whole range; when the batch already spans
+                        /// the entire column there is nothing to slice, so pass the column through.
+                        bool whole_column = batch_start == 0 && batch_size == arg.column->size();
+                        batch_cols.emplace_back(
+                            whole_column ? arg.column : arg.column->cut(batch_start, batch_size), arg.type, arg.name);
+                    }
+                    auto result = cv1->executeColumnar(compartment_ptr, batch_cols, batch_size, context, stop_token);
+                    // A guest that set COL_IS_CONST legitimately returns a ColumnConst; structureEquals
+                    // only holds between two ColumnConst instances, so compare the unwrapped nested
+                    // column against expected_col instead of rejecting every valid const result.
+                    const IColumn * result_for_check = result.get();
+                    if (const auto * result_const = typeid_cast<const ColumnConst *>(result_for_check))
+                        result_for_check = &result_const->getDataColumn();
+                    if (!result_for_check->structureEquals(*expected_col))
+                        throw Exception(ErrorCodes::WASM_ERROR,
+                            "COLUMNAR_V1: returned column structure {} does not match declared type {}",
+                            result->dumpStructure(),
+                            user_defined_function->getResultType()->getName());
+                    // A ColumnConst batch result must be materialized before it's accumulated:
+                    // ColumnConst::insertRangeFrom only bumps the row count, it doesn't copy in
+                    // the source's actual value, so concatenating a later (possibly different)
+                    // batch into a ColumnConst accumulator would silently keep repeating the
+                    // first batch's value for every row appended afterwards.
+                    result = IColumn::mutate(result->convertToFullColumnIfConst());
+                    if (result_column->empty())
+                        result_column = result->assumeMutable();
+                    else
+                        result_column->insertRangeFrom(*result, 0, result->size());
+                };
+
+                const size_t fixed_block_size = context->getSettingsRef()[Setting::webassembly_udf_max_input_block_size];
+                if (fixed_block_size > 0)
+                {
+                    for (size_t start = 0; start < input_rows_count; start += fixed_block_size)
+                        flush_columnar_batch(start, std::min(start + fixed_block_size, input_rows_count));
+                    return result_column;
+                }
+
+                // Sized against the same budget as the buffered path below, and by the same walk,
+                // so that both ABIs hand the guest calls of comparable size. What differs is only
+                // how a candidate is measured: this frame is built here rather than by an output
+                // format, so the walk is given the layout pass that sizes the real allocation.
+                const std::optional<size_t> budget = getInputBudget(compartment_ptr, fixed_block_size);
+                if (!budget)
+                {
+                    flush_columnar_batch(0, input_rows_count);
+                    return result_column;
+                }
+
+                const BatchMeasurer measure_columnar
+                    = [cv1](const ColumnsWithTypeAndName & batch_cols, size_t start_idx, size_t length,
+                            const std::vector<size_t> & declared_positions) // STYLE_CHECK_ALLOW_STD_CONTAINERS
+                    { return cv1->measureColumnarBytes(batch_cols, start_idx, length, declared_positions); };
+
+                size_t batch_start = 0;
+                while (batch_start < input_rows_count)
+                {
+                    const size_t batch_rows
+                        = chooseBatchRows(arguments, batch_start, input_rows_count - batch_start, *budget, measure_columnar);
+                    flush_columnar_batch(batch_start, batch_start + batch_rows);
+                    batch_start += batch_rows;
+                }
+                return result_column;
+            }
+
             return execute(compartment_ptr, arguments, input_rows_count);
         }
         catch (...)
@@ -862,6 +1261,12 @@ private:
         return static_cast<size_t>(static_cast<Float64>(*budget_basis) * memory_ratio);
     }
 
+    /// How a candidate batch is priced. The walk below is the same for every ABI; what a call
+    /// costs is not, because an ABI that builds its own buffer does not put on the wire what an
+    /// output format would write. Such an ABI hands its own layout pass in here.
+    using BatchMeasurer = std::function<size_t(
+        const ColumnsWithTypeAndName &, size_t, size_t, const std::vector<size_t> &)>; // STYLE_CHECK_ALLOW_STD_CONTAINERS
+
     /// The exact number of bytes one call carrying `[start, start + length)` puts on the wire.
     ///
     /// The batch is measured whole rather than assembled out of per-row measurements. A row has
@@ -906,7 +1311,8 @@ private:
     /// merely wide first row, which is a row like any other and does shrink out of a batch, at
     /// nothing. On a wire that does not carry constness `getArgumentsBlock` materializes the
     /// argument, and what comes back is the cost of its one row, which is the truth there.
-    size_t measureConstArgumentBytes(const ColumnsWithTypeAndName & arguments, size_t start_idx) const
+    size_t measureConstArgumentBytes(
+        const ColumnsWithTypeAndName & arguments, size_t start_idx, const BatchMeasurer & measure) const
     {
         ColumnsWithTypeAndName const_arguments;
         std::vector<size_t> declared_positions;
@@ -921,7 +1327,7 @@ private:
 
         if (const_arguments.empty())
             return 0;
-        return measureBatchBytes(const_arguments, start_idx, 1, declared_positions);
+        return measure(const_arguments, start_idx, 1, declared_positions);
     }
 
     /// How many rows the call starting at `start_idx` should carry, out of `remaining`.
@@ -946,8 +1352,16 @@ private:
     /// row count only means something for rows of a known width - a count fitted by narrow rows
     /// would have the next batch materialize that many wide rows before any measurement justified
     /// it, recreating the oversized call the split exists to avoid.
+    ///
+    /// `measure` prices a candidate. It defaults to the wire the buffered path writes; an ABI that
+    /// builds its own guest buffer passes the layout pass that sizes that buffer instead, so what
+    /// the walk compares against the budget is what the guest is really handed.
     size_t chooseBatchRows(
-        const ColumnsWithTypeAndName & arguments, size_t start_idx, size_t remaining, size_t budget) const
+        const ColumnsWithTypeAndName & arguments,
+        size_t start_idx,
+        size_t remaining,
+        size_t budget,
+        const BatchMeasurer & measure) const
     {
         /// A function without arguments is handed no input buffer, so no size bounds its calls.
         if (arguments.empty())
@@ -975,7 +1389,7 @@ private:
 
         for (size_t probe = 0; probe < max_probes; ++probe)
         {
-            const size_t measured = measureBatchBytes(arguments, start_idx, candidate);
+            const size_t measured = measure(arguments, start_idx, candidate, {});
             if (measured <= budget)
             {
                 largest_fitting = candidate;
@@ -992,7 +1406,7 @@ private:
                     /// same bytes once per call and takes from the guest whatever it amortizes
                     /// across a call. Hand it the whole block instead - exceeding the budget once
                     /// beats exceeding it on every call of a one-row split.
-                    if (measureConstArgumentBytes(arguments, start_idx) >= budget)
+                    if (measureConstArgumentBytes(arguments, start_idx, measure) >= budget)
                         return remaining;
                     /// Otherwise it is the row itself that does not fit, and it is still passed on
                     /// its own: whether the guest can hold it is for its allocator to say.
@@ -1106,8 +1520,14 @@ private:
             /// Take the rows a call can hold, measure the call, and start the next one where
             /// it ended. A stride derived from an average row size cannot bound a skewed block:
             /// one huge row among many tiny ones would still share a call with its neighbours.
+            const BatchMeasurer measure_wire = [this](
+                const ColumnsWithTypeAndName & batch_cols, size_t start_idx, size_t length,
+                const std::vector<size_t> & declared_positions) // STYLE_CHECK_ALLOW_STD_CONTAINERS
+            { return measureBatchBytes(batch_cols, start_idx, length, declared_positions); };
+
             while (batch_start < input_rows_count)
-                flush_batch(batch_start + chooseBatchRows(arguments, batch_start, input_rows_count - batch_start, *budget));
+                flush_batch(
+                    batch_start + chooseBatchRows(arguments, batch_start, input_rows_count - batch_start, *budget, measure_wire));
         }
         else if (fixed_block_size > 0)
         {
