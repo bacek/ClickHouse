@@ -1595,6 +1595,9 @@ The server successfully detected this situation and will download merged part fr
     M(WasmDeserializationMicroseconds, "Time spent reading the result back out of WebAssembly guest memory", ValueType::Microseconds) \
     M(WasmGuestExecuteMicroseconds, "Time spent inside the WebAssembly guest call itself", ValueType::Microseconds) \
     M(WasmTotalExecuteMicroseconds, "Total time spent in a WebAssembly UDF, marshalling included", ValueType::Microseconds) \
+    M(WasmInputBlockPrepMicroseconds, "Time spent slicing, casting and assembling the argument block of a WebAssembly UDF call", ValueType::Microseconds) \
+    M(WasmResultAssemblyMicroseconds, "Time spent checking and concatenating the per-call results of a WebAssembly UDF", ValueType::Microseconds) \
+    M(WasmFormatSetupMicroseconds, "Time spent building the format settings and sample header of a WebAssembly UDF call", ValueType::Microseconds) \
     M(WasmModuleInstatiate, "Number of WebAssembly compartments created", ValueType::Number) \
     M(WasmMemoryAllocated, "Total memory allocated for WebAssembly compartments", ValueType::Bytes) \
     \

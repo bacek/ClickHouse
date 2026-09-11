@@ -76,6 +76,9 @@ extern const Event WasmTotalExecuteMicroseconds;
 extern const Event WasmSerializationMicroseconds;
 extern const Event WasmDeserializationMicroseconds;
 extern const Event WasmGuestExecuteMicroseconds;
+extern const Event WasmInputBlockPrepMicroseconds;
+extern const Event WasmResultAssemblyMicroseconds;
+extern const Event WasmFormatSetupMicroseconds;
 }
 
 
@@ -404,8 +407,14 @@ public:
         // run three times per invocation (probe, real output format, input format), with
         // `block.cloneEmpty()` running twice on top of that. They are query-invariant, so hoisting
         // them changes nothing about which settings apply while removing the repeated work.
-        const FormatSettings format_settings = getFormatSettings(context);
-        const Block empty_header = block.cloneEmpty();
+        std::optional<FormatSettings> format_settings_holder;
+        Block empty_header;
+        {
+            ProfileEventTimeIncrement<Microseconds> timer_format_setup(ProfileEvents::WasmFormatSetupMicroseconds);
+            format_settings_holder.emplace(getFormatSettings(context));
+            empty_header = block.cloneEmpty();
+        }
+        const FormatSettings & format_settings = *format_settings_holder;
 
         WasmMemoryGuard wasm_data = nullptr;
         if (!block.empty())
@@ -1108,16 +1117,20 @@ public:
                         return;
                     size_t batch_size = end_idx - batch_start;
                     ColumnsWithTypeAndName batch_cols;
-                    batch_cols.reserve(arguments.size());
-                    for (const auto & arg : arguments)
                     {
-                        /// cut() materializes a copy of the whole range; when the batch already spans
-                        /// the entire column there is nothing to slice, so pass the column through.
-                        bool whole_column = batch_start == 0 && batch_size == arg.column->size();
-                        batch_cols.emplace_back(
-                            whole_column ? arg.column : arg.column->cut(batch_start, batch_size), arg.type, arg.name);
+                        ProfileEventTimeIncrement<Microseconds> timer_prep(ProfileEvents::WasmInputBlockPrepMicroseconds);
+                        batch_cols.reserve(arguments.size());
+                        for (const auto & arg : arguments)
+                        {
+                            /// cut() materializes a copy of the whole range; when the batch already spans
+                            /// the entire column there is nothing to slice, so pass the column through.
+                            bool whole_column = batch_start == 0 && batch_size == arg.column->size();
+                            batch_cols.emplace_back(
+                                whole_column ? arg.column : arg.column->cut(batch_start, batch_size), arg.type, arg.name);
+                        }
                     }
                     auto result = cv1->executeColumnar(compartment_ptr, batch_cols, batch_size, context, stop_token);
+                    ProfileEventTimeIncrement<Microseconds> timer_assembly(ProfileEvents::WasmResultAssemblyMicroseconds);
                     // A guest that set COL_IS_CONST legitimately returns a ColumnConst; structureEquals
                     // only holds between two ColumnConst instances, so compare the unwrapped nested
                     // column against expected_col instead of rejecting every valid const result.
@@ -1509,9 +1522,17 @@ private:
             if (end_idx <= batch_start)
                 return;
             const size_t batch_size = end_idx - batch_start;
-            auto block = getArgumentsBlock(arguments, batch_start, batch_size);
+            Block block;
+            {
+                ProfileEventTimeIncrement<Microseconds> timer_prep(ProfileEvents::WasmInputBlockPrepMicroseconds);
+                block = getArgumentsBlock(arguments, batch_start, batch_size);
+            }
             auto stop_token = interrupt_source.get_token();
-            appendBatchResult(result_column, user_defined_function->executeOnBlock(compartment, block, context, batch_size, stop_token));
+            auto batch_result = user_defined_function->executeOnBlock(compartment, block, context, batch_size, stop_token);
+            {
+                ProfileEventTimeIncrement<Microseconds> timer_assembly(ProfileEvents::WasmResultAssemblyMicroseconds);
+                appendBatchResult(result_column, std::move(batch_result));
+            }
             batch_start = end_idx;
         };
 
