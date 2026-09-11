@@ -691,6 +691,16 @@ public:
         size_t length,
         const std::vector<size_t> & declared_positions = {}) const // STYLE_CHECK_ALLOW_STD_CONTAINERS
     {
+        /// The walk probes several candidate batches per call, and a candidate that is priced by
+        /// cutting a copy pays a full materialization that the call itself only pays once. For
+        /// the shapes the fast path below covers the size of a range is arithmetic on the
+        /// original column (offset differences, row counts), so probing costs no copy at all.
+        if (declared_positions.empty() && length > 0)
+        {
+            if (auto fast = measureColumnarBytesInRange(cols, start_idx, length))
+                return *fast;
+        }
+
         ColumnsWithTypeAndName batch;
         batch.reserve(cols.size());
         for (const auto & col : cols)
@@ -709,6 +719,90 @@ public:
 
         return buildColumnarLayout(
             batch, length, declared_positions, descs, inner_cols, is_nullable_flags, row_counts, casted_columns);
+    }
+
+    /// The frame bytes of `[start_idx, start_idx + length)` rows of one column, added to
+    /// `cursor`, computed on the uncut column. Returns nullopt for any column shape whose size
+    /// this does not reproduce exactly, which sends the measurement back to the cutting path.
+    /// The cursor arithmetic mirrors `buildColDescriptor` branch for branch: a nullable's u8
+    /// null map, the 8-alignment and uint64 offsets array of COL_BYTES over the range's chars
+    /// (an offset difference, since ColumnString stores chars cumulatively), and the
+    /// 4-alignment-after-null-map and rows-times-width of the fixed-width fallback.
+    static std::optional<uint64_t> colRangeWireBytes(const IColumn * col, size_t start_idx, size_t length, uint64_t cursor)
+    {
+        bool is_nullable = false;
+        if (const auto * null_col = typeid_cast<const ColumnNullable *>(col))
+        {
+            is_nullable = true;
+            col = &null_col->getNestedColumn();
+        }
+
+        if (const auto * str_col = typeid_cast<const ColumnString *>(col))
+        {
+            if (is_nullable)
+                cursor += length;
+            cursor = alignWriteCursor(cursor, 8ull, nullptr);
+            cursor += (length + 1ull) * sizeof(uint64_t);
+            const auto & offs = str_col->getOffsets();
+            const uint64_t chars = offs[start_idx + length - 1]
+                - (start_idx == 0 ? static_cast<uint64_t>(0) : static_cast<uint64_t>(offs[start_idx - 1]));
+            cursor += chars;
+            return cursor;
+        }
+
+        /// Mirror buildColDescriptor's branch order before the fixed-width fallback: everything
+        /// it dispatches elsewhere (Variant, LowCardinality, Array, Tuple, and anything that is
+        /// not fixed-width) has no cheap range size here.
+        if (typeid_cast<const ColumnVariant *>(col)
+            || typeid_cast<const ColumnLowCardinality *>(col)
+            || typeid_cast<const ColumnArray *>(col)
+            || typeid_cast<const ColumnTuple *>(col)
+            || typeid_cast<const ColumnConst *>(col))
+            return std::nullopt;
+        const uint64_t elem_size = col->sizeOfValueIfFixed();
+        if (elem_size == 0)
+            return std::nullopt;
+        if (is_nullable)
+        {
+            cursor += length;
+            cursor = alignWriteCursor(cursor, 4ull, nullptr);
+        }
+        cursor += length * elem_size;
+        return cursor;
+    }
+
+    /// The whole-frame size of a candidate batch, measured on the original columns. Falls back
+    /// (nullopt) whenever a column would be cast to its declared type - the cast can change the
+    /// layout - or has a shape `colRangeWireBytes` does not cover. Const columns are measured as
+    /// their one stored row, exactly as `buildColumnarLayout` prices them.
+    std::optional<size_t> measureColumnarBytesInRange(const ColumnsWithTypeAndName & cols, size_t start_idx, size_t length) const
+    {
+        uint64_t cursor = FRAME_HEADER_BYTES + cols.size() * COL_DESC_BYTES;
+        for (size_t ci = 0; ci < cols.size(); ++ci)
+        {
+            const DataTypePtr & declared_arg_type = arguments[ci];
+            DataTypePtr target_type = (cols[ci].type->isNullable() && !declared_arg_type->isNullable())
+                ? makeNullable(declared_arg_type)
+                : declared_arg_type;
+            if (!cols[ci].type->equals(*target_type))
+                return std::nullopt;
+
+            const IColumn * col = cols[ci].column.get();
+            size_t range_start = start_idx;
+            size_t range_length = length;
+            if (const auto * cc = typeid_cast<const ColumnConst *>(col))
+            {
+                col = &cc->getDataColumn();
+                range_start = 0;
+                range_length = 1;
+            }
+
+            auto next = colRangeWireBytes(col, range_start, range_length, cursor);
+            if (!next)
+                return std::nullopt;
+            cursor = *next;
+        }
+        return static_cast<size_t>(cursor);
     }
 
 private:
@@ -1578,7 +1672,9 @@ private:
             /// Cut first, materialize second: `ColumnConst::cut` is O(1), while materializing
             /// the whole block first would make the per-row measurement O(rows^2). A wire that
             /// encodes constness itself keeps the wrapper instead of materializing at all.
-            ColumnPtr column = arguments[i].column->cut(start_idx, length);
+            ColumnPtr column = arguments[i].column;
+            if (start_idx != 0 || length != column->size())
+                column = column->cut(start_idx, length);
             if (!preserve_const_columns)
                 column = column->convertToFullColumnIfConst();
             String column_name = declared_idx < argument_names.size() && !argument_names[declared_idx].empty()
