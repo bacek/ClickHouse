@@ -421,7 +421,7 @@ public:
 
     MutableColumnPtr executeOnBlock(
         WasmCompartment * compartment, const Block & block, ContextPtr,
-        size_t num_rows, StopToken stop_token) const override
+        size_t row_offset, size_t num_rows, StopToken stop_token) const override
     {
         ProfileEventTimeIncrement<Microseconds> timer_execute(ProfileEvents::WasmTotalExecuteMicroseconds);
 
@@ -466,7 +466,7 @@ public:
             return false;
         };
 
-        for (size_t row_idx = 0; row_idx < num_rows; ++row_idx)
+        for (size_t row_idx = row_offset; row_idx < row_offset + num_rows; ++row_idx)
         {
             pinned_args.clear();
 

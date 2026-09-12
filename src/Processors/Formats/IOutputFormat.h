@@ -77,6 +77,12 @@ public:
 
     void write(const Block & block);
 
+    /// Writes only the rows [row_offset, row_offset + rows) of `block`. A format that reports
+    /// `supportsRowRange(block)` serializes that range straight from the source columns; every
+    /// other format falls back to slicing the range out and writing it as a whole block, so a
+    /// caller never has to branch on support itself.
+    void writeRowRange(const Block & block, size_t row_offset, size_t rows);
+
     void finalize();
 
     virtual bool expectMaterializedColumns() const { return true; }
@@ -85,7 +91,17 @@ public:
     /// If the format can predict its total serialized size for a given block, it may implement this
     /// to allow the output WriteBuffer to preallocate the exact space needed, avoiding reallocation.
     /// Returns std::nullopt if precomputation is not supported or not beneficial for this chunk.
-    virtual std::optional<uint64_t> precomputeSerializedSize(const Block & /*block*/, size_t /*rows*/) const { return std::nullopt; }
+    /// Sizes only the rows [row_offset, row_offset + rows) of the block. A non-zero `row_offset`
+    /// is passed only to a format that reports `supportsRowRange` for that block; every other
+    /// format is asked for whole blocks (`row_offset` 0) and can ignore the argument.
+    virtual std::optional<uint64_t> precomputeSerializedSize(const Block & /*block*/, size_t /*row_offset*/, size_t /*rows*/) const { return std::nullopt; }
+
+    /// Whether this format can address an arbitrary row range of `block` directly, letting a
+    /// caller that wants a slice pass its bounds instead of copying the slice out into a block of
+    /// its own. Depends on the block, not just on the format: a column layout whose row N is not
+    /// reachable by pointer arithmetic (Array, Tuple, Variant, LowCardinality) still has to be
+    /// sliced by the caller.
+    virtual bool supportsRowRange(const Block & /*block*/) const { return false; }
 
 
     void setTotals(const Block & totals);
@@ -178,6 +194,11 @@ protected:
     virtual void reattachBuffers() {}
 
     virtual void consume(Chunk) = 0;
+    /// Row-range counterpart of `consume`, called by `writeRowRange` with the prefix already
+    /// written. The default slices the range out of `block` and hands it to `consume`; a format
+    /// that reports `supportsRowRange` overrides this to serialize the range in place.
+    virtual void consumeRowRange(const Block & block, size_t row_offset, size_t rows);
+
     virtual void consumeTotals(Chunk) {}
     virtual void consumeExtremes(Chunk) {}
     virtual void finalizeImpl() {}

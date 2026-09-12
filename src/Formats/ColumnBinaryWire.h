@@ -274,6 +274,22 @@ inline uint32_t checkFitsUint32(uint64_t value, const char * what)
     return static_cast<uint32_t>(value);
 }
 
+// Whether `col` can be serialized starting at an arbitrary row (see `buildColDescriptor`'s
+// `row_offset`). Only layouts whose row N is reachable by pointer arithmetic qualify: strings
+// (offsets are cumulative, so a range is one subtraction) and fixed-width contiguous columns,
+// either of them optionally Nullable. Array/Tuple/Map/Variant/LowCardinality all carry per-row
+// structures a range write would have to rebase, so a caller wanting a sub-range of one of those
+// has to slice the column itself.
+inline bool supportsRowOffset(const IColumn & col)
+{
+    const IColumn * inner = &col;
+    if (const auto * null_col = typeid_cast<const ColumnNullable *>(inner))
+        inner = &null_col->getNestedColumn();
+    if (typeid_cast<const ColumnString *>(inner))
+        return true;
+    return inner->isFixedAndContiguous();
+}
+
 // Recursively check that `type` can round-trip through the ColumnBinary wire format,
 // throwing INCORRECT_DATA immediately with the exact reason otherwise. Without this,
 // callers only discover an unsupported signature (nested Nullable/Variant inside
@@ -499,8 +515,17 @@ inline uint64_t buildColDescriptor(
     uint32_t num_rows,
     uint64_t write_cursor,
     ColDescriptor & desc,
-    PaddingGaps * gaps = nullptr)
+    PaddingGaps * gaps = nullptr,
+    uint32_t row_offset = 0)
 {
+    // `row_offset` shifts the described range to rows [row_offset, row_offset + num_rows) of
+    // `col`. Only the layouts `supportsRowOffset` accepts can express that; the recursive
+    // sub-column calls below always describe a whole sub-column and pass 0.
+    if (row_offset != 0 && !supportsRowOffset(*col))
+        throw Exception(ErrorCodes::INCORRECT_DATA,
+            "ColumnBinary: column of type {} cannot be serialized from a row offset",
+            col->getName());
+
     // COL_COMPLEX (Array/Tuple) carries its own top-level null map (reserved below,
     // guarded by is_nullable); unwrap here so the Variant/Array/Tuple dispatch below
     // sees the actual complex column regardless of Nullable wrapping. COL_VARIANT
@@ -681,9 +706,16 @@ inline uint64_t buildColDescriptor(
         write_cursor += (num_rows + 1u) * sizeof(uint64_t);
 
         desc.data_offset = write_cursor;
-        uint64_t total_chars = str_col->getChars().size();
-        desc.data_size = total_chars;
-        write_cursor += total_chars;
+        // Size the range out of `offsets` (cumulative end positions) rather than out of the whole
+        // `chars` buffer, so a caller serializing a sub-range of a larger column does not have to
+        // copy that range into a column of its own first just to be able to measure it.
+        const auto & str_offsets = str_col->getOffsets();
+        const uint64_t chars_begin = row_offset != 0 ? str_offsets[row_offset - 1] : 0;
+        const uint64_t chars_end = num_rows != 0
+            ? str_offsets[static_cast<size_t>(row_offset) + num_rows - 1]
+            : chars_begin;
+        desc.data_size = chars_end - chars_begin;
+        write_cursor += desc.data_size;
         return write_cursor;
     }
 
@@ -726,8 +758,18 @@ inline void writeColData(
     bool is_nullable,
     uint32_t num_rows,
     const ColDescriptor & desc,
-    std::span<uint8_t> buf)
+    std::span<uint8_t> buf,
+    uint32_t row_offset = 0)
 {
+    // `row_offset` writes rows [row_offset, row_offset + num_rows) of `col`, matching the
+    // descriptor `buildColDescriptor` built for that same range. Only the layouts
+    // `supportsRowOffset` accepts can express it; the recursive sub-column calls below always
+    // write a whole sub-column and leave it at 0.
+    if (row_offset != 0 && !supportsRowOffset(*col))
+        throw Exception(ErrorCodes::INCORRECT_DATA,
+            "ColumnBinary: column of type {} cannot be serialized from a row offset",
+            col->getName());
+
     // Unwrap Nullable up front (mirrors buildColDescriptor) and write its null map
     // before dispatching on the concrete column, so COL_COMPLEX (Array/Tuple) gets
     // the same "null map first, then the actual payload" treatment as scalars/strings.
@@ -737,7 +779,7 @@ inline void writeColData(
         if (is_nullable && desc.null_offset)
         {
             const auto & nm = top_null_col->getNullMapData();
-            std::memcpy(buf.data() + desc.null_offset, nm.data(), num_rows);
+            std::memcpy(buf.data() + desc.null_offset, nm.data() + row_offset, num_rows);
         }
     }
 
@@ -874,33 +916,31 @@ inline void writeColData(
 
         // ColumnString here is not zero-terminated (see ColumnString::sizeAt) and its
         // offsets are cumulative end positions, which is exactly the wire layout: the
-        // wire is [0, off[0], off[1], ...] over a contiguous payload. So when the
-        // column starts at chars[0] the whole thing is two bulk copies rather than a
-        // memcpy and a store per row. For short values the per-row libc memcpy
-        // dispatch dominated this loop.
-        const uint64_t total_bytes = ch_offsets[num_rows - 1];
-        if (total_bytes == desc.data_size)
+        // wire is [0, off[0], off[1], ...] over a contiguous payload. So when the whole
+        // column is written the offsets copy over verbatim and the whole thing is two
+        // bulk copies rather than a memcpy and a store per row. For short values the
+        // per-row libc memcpy dispatch dominated this loop. A range starting past row 0
+        // cannot take this path even when its first row is empty (`chars_begin == 0`):
+        // the wire slot for row `row_offset + i` is `i + 1`, so the offsets still have
+        // to be shifted.
+        const uint64_t chars_begin = row_offset != 0 ? ch_offsets[row_offset - 1] : 0;
+        const uint64_t chars_end = ch_offsets[static_cast<size_t>(row_offset) + num_rows - 1];
+        if (row_offset == 0 && chars_end == chars.size())
         {
             std::memcpy(wire_offsets + sizeof(uint64_t), ch_offsets.data(),
                         static_cast<size_t>(num_rows) * sizeof(uint64_t));
-            std::memcpy(data_dst, chars.data(), total_bytes);
+            std::memcpy(data_dst, chars.data(), chars_end);
             return;
         }
 
-        // Offsets do not start at zero (a column sharing its chars buffer with a
-        // larger one): fall back to rebasing row by row.
-        uint64_t wire_pos = 0ull;
-        uint64_t ch_pos = 0ull;
+        // A sub-range of the column, or a column sharing its chars buffer with a larger
+        // one: the payload is still one contiguous run, so it is still a single bulk
+        // copy - only the offsets have to be rebased onto it.
+        std::memcpy(data_dst, chars.data() + chars_begin, chars_end - chars_begin);
         for (uint32_t i = 0; i < num_rows; ++i)
-        {
-            uint64_t str_end = ch_offsets[i];
-            uint64_t str_len = str_end - ch_pos;
-            std::memcpy(data_dst + wire_pos, chars.data() + ch_pos, str_len);
-            wire_pos += str_len;
             // Widen before the multiply: same wraparound as the Array branch above.
-            unalignedStore<uint64_t>(wire_offsets + (static_cast<uint64_t>(i) + 1u) * 8u, wire_pos);
-            ch_pos = str_end;
-        }
+            unalignedStore<uint64_t>(wire_offsets + (static_cast<uint64_t>(i) + 1u) * 8u,
+                                     ch_offsets[static_cast<size_t>(row_offset) + i] - chars_begin);
         return;
     }
 
@@ -910,7 +950,9 @@ inline void writeColData(
     // Widen before the multiply: num_rows * elem_sz in uint32_t arithmetic wraps once the
     // frame carries 2^32 / elem_sz rows, which the uint32_t row-count limit still permits, and
     // the column would then be written short while its descriptor claims the full size.
-    std::memcpy(buf.data() + desc.data_offset, raw, static_cast<uint64_t>(num_rows) * elem_sz);
+    std::memcpy(buf.data() + desc.data_offset,
+                raw + static_cast<uint64_t>(row_offset) * elem_sz,
+                static_cast<uint64_t>(num_rows) * elem_sz);
 }
 
 // Decode one column from a ColumnBinary frame given its pre-parsed descriptor.

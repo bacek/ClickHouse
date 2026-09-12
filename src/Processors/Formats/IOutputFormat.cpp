@@ -230,6 +230,36 @@ void IOutputFormat::write(const Block & block)
         flushImpl();
 }
 
+void IOutputFormat::writeRowRange(const Block & block, size_t row_offset, size_t rows)
+{
+    std::lock_guard lock(writing_mutex);
+
+    writeProgressIfNeededUnlocked();
+
+    writePrefixIfNeeded();
+    consumeRowRange(block, row_offset, rows);
+
+    if (framing)
+        writeFramingPayloadBoundary(FramedPacketKind::Data);
+
+    if (auto_flush)
+        flushImpl();
+}
+
+void IOutputFormat::consumeRowRange(const Block & block, size_t row_offset, size_t rows)
+{
+    if (row_offset == 0 && rows == block.rows())
+    {
+        consume(Chunk(block.getColumns(), rows));
+        return;
+    }
+
+    Columns sliced = block.getColumns();
+    for (auto & column : sliced)
+        column = column->cut(row_offset, rows);
+    consume(Chunk(std::move(sliced), rows));
+}
+
 void IOutputFormat::finalizeUnlocked()
 {
     if (finalized)

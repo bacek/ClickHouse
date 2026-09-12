@@ -185,7 +185,7 @@ public:
     }
 
     MutableColumnPtr
-    executeOnBlock(WebAssembly::WasmCompartment * compartment, const Block & block, ContextPtr, size_t num_rows, StopToken stop_token) const override
+    executeOnBlock(WebAssembly::WasmCompartment * compartment, const Block & block, ContextPtr, size_t row_offset, size_t num_rows, StopToken stop_token) const override
     {
         ProfileEventTimeIncrement<Microseconds> timer_execute(ProfileEvents::WasmTotalExecuteMicroseconds);
 
@@ -213,7 +213,7 @@ public:
 
         size_t num_columns = block.columns();
         VectorWithMemoryTracking<WasmVal> wasm_args(num_columns);
-        for (size_t row_idx = 0; row_idx < num_rows; ++row_idx)
+        for (size_t row_idx = row_offset; row_idx < row_offset + num_rows; ++row_idx)
         {
             for (size_t col_idx = 0; col_idx < num_columns; ++col_idx)
             {
@@ -391,7 +391,7 @@ public:
     }
 
     MutableColumnPtr
-    executeOnBlock(WebAssembly::WasmCompartment * compartment, const Block & block, ContextPtr context, size_t num_rows, StopToken stop_token) const override
+    executeOnBlock(WebAssembly::WasmCompartment * compartment, const Block & block, ContextPtr context, size_t row_offset, size_t num_rows, StopToken stop_token) const override
     {
         ProfileEventTimeIncrement<Microseconds> timer_execute(ProfileEvents::WasmTotalExecuteMicroseconds);
 
@@ -431,7 +431,7 @@ public:
             // same instance.
             NullWriteBuffer local_probe_wb;
             auto probe = context->getOutputFormat(serialization_format, local_probe_wb, empty_header, format_settings);
-            std::optional<uint64_t> precomputed = probe->precomputeSerializedSize(block, num_rows);
+            std::optional<uint64_t> precomputed = probe->precomputeSerializedSize(block, row_offset, num_rows);
 
             if (precomputed)
             {
@@ -452,7 +452,7 @@ public:
                 // write()+finalize() instead of formatBlock(): formatBlock calls flush()
                 // which triggers out.next() — fatal for WriteBufferFromPointer.
                 // auto_flush defaults to false so neither write() nor finalize() flush.
-                out->write(block);
+                out->writeRowRange(block, row_offset, num_rows);
                 out->finalize();
                 wb.cancel();
             }
@@ -466,7 +466,10 @@ public:
                 {
                     WriteBufferFromStringWithMemoryTracking buf(input_data);
                     auto out = context->getOutputFormat(serialization_format, buf, empty_header, format_settings);
-                    formatBlock(out, block);
+                    /// Same as formatBlock(), except it writes only the requested row range; a
+                    /// format without range support slices it out inside `writeRowRange`.
+                    out->writeRowRange(block, row_offset, num_rows);
+                    out->finalize();
                 }
                 wasm_data = allocateInWasmMemory(wmm.get(), input_data.size());
                 auto wasm_mem = wasm_data.getMemoryView();
@@ -663,9 +666,14 @@ public:
         WebAssembly::WasmCompartment * compartment,
         const Block & block,
         ContextPtr context,
+        size_t row_offset,
         size_t num_rows,
         StopToken stop_token) const override
     {
+        if (row_offset != 0)
+            throw Exception(ErrorCodes::LOGICAL_ERROR,
+                "ColumnarV1 ABI cannot execute a block from a row offset");
+
         ColumnsWithTypeAndName args;
         args.reserve(block.columns());
         for (size_t i = 0; i < block.columns(); ++i)
@@ -1402,7 +1410,7 @@ private:
         /// `ColumnBinary` states the size of a block without writing it. This is the very
         /// primitive `executeOnBlock` sizes the guest buffer with, so the measurement and the
         /// allocation cannot disagree, and it is exact for the whole block being measured.
-        if (auto precomputed = measure_out->precomputeSerializedSize(block, length))
+        if (auto precomputed = measure_out->precomputeSerializedSize(block, 0, length))
             return *precomputed;
 
         measure_out->write(block);
@@ -1610,19 +1618,49 @@ private:
         const size_t fixed_block_size = context->getSettingsRef()[Setting::webassembly_udf_max_input_block_size];
         const std::optional<size_t> budget = getInputBudget(compartment, fixed_block_size);
 
+        /// A wire that can address rows by offset (`IOutputFormat::supportsRowRange`) can both
+        /// price and serialize a range straight off the argument columns. Preparing the arguments
+        /// once - cast to the declared types - is one pass over the block instead of one deep copy
+        /// per probe and one more per call, and since the splitter probes several candidates per
+        /// batch, that copy used to cost a multiple of the batch it was sizing. It dominated the
+        /// call for a wide blob argument. Only a wire that carries constness qualifies: on the
+        /// others `getArgumentsBlock` materializes a const argument, and materializing it at full
+        /// block length is the very expansion the splitter exists to avoid.
+        std::optional<Block> prepared_block;
+        NullWriteBuffer range_measure_buf;
+        OutputFormatPtr range_measure_out;
+        if (budget && preserve_const_columns && !arguments.empty())
+        {
+            ProfileEventTimeIncrement<Microseconds> timer_prep(ProfileEvents::WasmInputBlockPrepMicroseconds);
+            Block candidate = getArgumentsBlock(arguments, 0, input_rows_count);
+            auto out = context->getOutputFormat(serialization_format, range_measure_buf, candidate.cloneEmpty());
+            if (out->supportsRowRange(candidate))
+            {
+                prepared_block.emplace(std::move(candidate));
+                range_measure_out = std::move(out);
+            }
+        }
+
         size_t batch_start = 0;
         auto flush_batch = [&](size_t end_idx)
         {
             if (end_idx <= batch_start)
                 return;
             const size_t batch_size = end_idx - batch_start;
-            Block block;
+            /// With `prepared_block` the batch is a row range of the block prepared above, so the
+            /// call carries its bounds; without it the rows have to be cut out into a block of
+            /// their own.
+            std::optional<Block> batch_block;
+            if (!prepared_block)
             {
                 ProfileEventTimeIncrement<Microseconds> timer_prep(ProfileEvents::WasmInputBlockPrepMicroseconds);
-                block = getArgumentsBlock(arguments, batch_start, batch_size);
+                batch_block.emplace(getArgumentsBlock(arguments, batch_start, batch_size));
             }
+            const Block & block = prepared_block ? *prepared_block : *batch_block;
+            const size_t row_offset = prepared_block ? batch_start : 0;
             auto stop_token = interrupt_source.get_token();
-            auto batch_result = user_defined_function->executeOnBlock(compartment, block, context, batch_size, stop_token);
+            auto batch_result
+                = user_defined_function->executeOnBlock(compartment, block, context, row_offset, batch_size, stop_token);
             {
                 ProfileEventTimeIncrement<Microseconds> timer_assembly(ProfileEvents::WasmResultAssemblyMicroseconds);
                 appendBatchResult(result_column, std::move(batch_result));
@@ -1635,10 +1673,17 @@ private:
             /// Take the rows a call can hold, measure the call, and start the next one where
             /// it ended. A stride derived from an average row size cannot bound a skewed block:
             /// one huge row among many tiny ones would still share a call with its neighbours.
-            const BatchMeasurer measure_wire = [this](
+            const BatchMeasurer measure_wire = [&](
                 const ColumnsWithTypeAndName & batch_cols, size_t start_idx, size_t length,
                 const std::vector<size_t> & declared_positions) // STYLE_CHECK_ALLOW_STD_CONTAINERS
-            { return measureBatchBytes(batch_cols, start_idx, length, declared_positions); };
+            {
+                /// `prepared_block` holds every argument in declared order, so it can only answer
+                /// for that same list - `chooseBatchRows` also measures subsets of the arguments
+                /// (see `measureConstArgumentBytes`), which still go through the copying path.
+                if (range_measure_out && declared_positions.empty() && &batch_cols == &arguments)
+                    return *range_measure_out->precomputeSerializedSize(*prepared_block, start_idx, length);
+                return measureBatchBytes(batch_cols, start_idx, length, declared_positions);
+            };
 
             while (batch_start < input_rows_count)
                 flush_batch(
@@ -2057,7 +2102,7 @@ private:
 
         auto compartment_entry = compartment_pool.acquire();
         StopSource stop_source;
-        auto result_col = wasm_function->executeOnBlock(&(*compartment_entry), block, context, num_groups, stop_source.get_token());
+        auto result_col = wasm_function->executeOnBlock(&(*compartment_entry), block, context, 0, num_groups, stop_source.get_token());
 
         if (result_col->size() != num_groups)
             throw Exception(ErrorCodes::WASM_ERROR,

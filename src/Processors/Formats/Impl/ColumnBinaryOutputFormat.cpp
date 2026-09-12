@@ -59,7 +59,26 @@ void ColumnBinaryOutputFormat::checkColumnStructure(size_t i, const IColumn & co
             i, actual.getName(), expected_type->getName());
 }
 
-std::optional<uint64_t> ColumnBinaryOutputFormat::precomputeSerializedSize(const Block & block, size_t rows) const
+bool ColumnBinaryOutputFormat::supportsRowRange(const Block & block) const
+{
+    // Without preallocation the caller has no size to work with, so there is nothing a row range
+    // could be used for; report the plain whole-block contract instead.
+    if (disable_preallocation_)
+        return false;
+
+    for (const auto & elem : block.getColumnsWithTypeAndName())
+    {
+        // A `ColumnConst` serializes its single data row whatever range is asked for, so it never
+        // constrains range addressing.
+        if (isColumnConst(*elem.column))
+            continue;
+        if (!ColumnBinaryWire::supportsRowOffset(*removeSpecialRepresentations(elem.column)))
+            return false;
+    }
+    return true;
+}
+
+std::optional<uint64_t> ColumnBinaryOutputFormat::precomputeSerializedSize(const Block & block, size_t row_offset, size_t rows) const
 {
     if (disable_preallocation_)
         return std::nullopt;
@@ -72,14 +91,7 @@ std::optional<uint64_t> ColumnBinaryOutputFormat::precomputeSerializedSize(const
     // guest buffer that consume() does not fill.
     checkNumCols(block.columns());
 
-    // The frame header's num_rows field is a uint32_t, and buildColDescriptor's row-count
-    // arithmetic (e.g. (num_rows + 1) for String/Array offsets) is only overflow-safe up to
-    // UINT32_MAX; reject before the narrowing cast below, rather than silently truncating
-    // (and, above 2^32, wrapping the +1 and under-sizing the frame).
-    if (rows >= std::numeric_limits<uint32_t>::max())
-        throw Exception(ErrorCodes::INCORRECT_DATA,
-            "ColumnBinary: block has {} rows, exceeding the maximum representable row count ({})",
-            rows, std::numeric_limits<uint32_t>::max());
+    checkRowCount(rows);
 
     const uint64_t hdr_desc_size = ColumnBinaryWire::FRAME_HEADER_BYTES + block.columns() * ColumnBinaryWire::COL_DESC_BYTES;
     uint64_t cursor = hdr_desc_size;
@@ -104,9 +116,12 @@ std::optional<uint64_t> ColumnBinaryOutputFormat::precomputeSerializedSize(const
         checkColumnStructure(i, *actual);
         bool is_nullable = typeid_cast<const ColumnNullable *>(actual) != nullptr;
         uint32_t col_rows = is_const ? 1u : static_cast<uint32_t>(rows);
+        // A const column carries its one data row at index 0 regardless of the range asked for.
+        uint32_t col_offset = is_const ? 0u : static_cast<uint32_t>(row_offset);
 
         ColumnBinaryWire::ColDescriptor desc{};
-        cursor = ColumnBinaryWire::buildColDescriptor(actual, is_const, is_nullable, col_rows, cursor, desc);
+        cursor = ColumnBinaryWire::buildColDescriptor(
+            actual, is_const, is_nullable, col_rows, cursor, desc, /* gaps */ nullptr, col_offset);
     }
 
     return cursor;
@@ -119,10 +134,7 @@ void ColumnBinaryOutputFormat::consume(Chunk chunk)
 
     // See the matching check in precomputeSerializedSize: reject before the narrowing cast
     // rather than silently truncating/wrapping the row count.
-    if (chunk.getNumRows() >= std::numeric_limits<uint32_t>::max())
-        throw Exception(ErrorCodes::INCORRECT_DATA,
-            "ColumnBinary: chunk has {} rows, exceeding the maximum representable row count ({})",
-            chunk.getNumRows(), std::numeric_limits<uint32_t>::max());
+    checkRowCount(chunk.getNumRows());
 
     // `ColumnBinary` is schema-driven: `ColumnBinaryInputFormat::checkNumCols` rejects any
     // frame whose `num_cols` differs from the schema. Clamping to the smaller of the two here
@@ -132,8 +144,43 @@ void ColumnBinaryOutputFormat::consume(Chunk chunk)
     // reader does.
     checkNumCols(chunk.getNumColumns());
 
-    uint32_t num_rows = static_cast<uint32_t>(chunk.getNumRows());
-    uint32_t num_cols = static_cast<uint32_t>(chunk.getNumColumns());
+    size_t num_rows = chunk.getNumRows();
+    writeFrame(chunk.detachColumns(), 0, num_rows);
+}
+
+void ColumnBinaryOutputFormat::consumeRowRange(const Block & block, size_t row_offset, size_t rows)
+{
+    // A layout `buildColDescriptor` cannot address by row (Array, Tuple, LowCardinality, ...) has
+    // to be sliced out first; the base implementation does exactly that and comes back through
+    // `consume`.
+    if (!supportsRowRange(block))
+    {
+        IOutputFormat::consumeRowRange(block, row_offset, rows);
+        return;
+    }
+
+    if (rows == 0)
+        return;
+
+    checkRowCount(rows);
+    checkNumCols(block.columns());
+    writeFrame(block.getColumns(), row_offset, rows);
+}
+
+void ColumnBinaryOutputFormat::checkRowCount(size_t rows) const
+{
+    // The frame header's num_rows field is a uint32_t and the descriptor arithmetic is only
+    // overflow-safe below that, so reject rather than silently truncating the row count.
+    if (rows >= std::numeric_limits<uint32_t>::max())
+        throw Exception(ErrorCodes::INCORRECT_DATA,
+            "ColumnBinary: frame has {} rows, exceeding the maximum representable row count ({})",
+            rows, std::numeric_limits<uint32_t>::max());
+}
+
+void ColumnBinaryOutputFormat::writeFrame(Columns columns, size_t row_offset, size_t rows)
+{
+    uint32_t num_rows = static_cast<uint32_t>(rows);
+    uint32_t num_cols = static_cast<uint32_t>(columns.size());
 
     // Layout pass: build descriptors (compute offsets and total size).
     const uint64_t hdr_desc_size = ColumnBinaryWire::FRAME_HEADER_BYTES + num_cols * ColumnBinaryWire::COL_DESC_BYTES;
@@ -146,27 +193,24 @@ void ColumnBinaryOutputFormat::consume(Chunk chunk)
     // through to the fixed-width path, whose `writeColData` calls `IColumn::getRawData`, and that
     // throws `NOT_IMPLEMENTED` for `ColumnSparse`. Strip those wrappers here - recursively, so
     // nested columns inside `Tuple` / `Array` are covered too - while keeping the const wrapper.
+    for (auto & col : columns)
     {
-        auto columns = chunk.detachColumns();
-        for (auto & col : columns)
+        if (const auto * const_col = typeid_cast<const ColumnConst *>(col.get()))
         {
-            if (const auto * const_col = typeid_cast<const ColumnConst *>(col.get()))
-            {
-                auto data = removeSpecialRepresentations(const_col->getDataColumnPtr());
-                if (data.get() != const_col->getDataColumnPtr().get())
-                    col = ColumnConst::create(std::move(data), const_col->size());
-            }
-            else
-                col = removeSpecialRepresentations(col);
+            auto data = removeSpecialRepresentations(const_col->getDataColumnPtr());
+            if (data.get() != const_col->getDataColumnPtr().get())
+                col = ColumnConst::create(std::move(data), const_col->size());
         }
-        chunk.setColumns(std::move(columns), num_rows);
+        else
+            col = removeSpecialRepresentations(col);
     }
 
     std::vector<ColumnBinaryWire::ColDescriptor> descs(num_cols);
+    std::vector<uint32_t> col_offsets(num_cols);
     ColumnBinaryWire::PaddingGaps gaps;
     for (uint32_t i = 0; i < num_cols; ++i)
     {
-        const IColumn & raw_col = *chunk.getColumns()[i];
+        const IColumn & raw_col = *columns[i];
         bool is_const = isColumnConst(raw_col);
         const IColumn * actual = is_const
             ? &static_cast<const ColumnConst &>(raw_col).getDataColumn()
@@ -174,7 +218,10 @@ void ColumnBinaryOutputFormat::consume(Chunk chunk)
         checkColumnStructure(i, *actual);
         bool is_nullable = typeid_cast<const ColumnNullable *>(actual) != nullptr;
         uint32_t col_rows = is_const ? 1u : num_rows;
-        cursor = ColumnBinaryWire::buildColDescriptor(actual, is_const, is_nullable, col_rows, cursor, descs[i], &gaps);
+        // A const column carries its one data row at index 0 regardless of the range asked for.
+        col_offsets[i] = is_const ? 0u : static_cast<uint32_t>(row_offset);
+        cursor = ColumnBinaryWire::buildColDescriptor(
+            actual, is_const, is_nullable, col_rows, cursor, descs[i], &gaps, col_offsets[i]);
     }
 
     // Get write destination: use the pre-allocated region in out when available,
@@ -212,14 +259,14 @@ void ColumnBinaryOutputFormat::consume(Chunk chunk)
     std::span<uint8_t> buf_span{buf, cursor};
     for (uint32_t i = 0; i < num_cols; ++i)
     {
-        const IColumn & raw_col = *chunk.getColumns()[i];
+        const IColumn & raw_col = *columns[i];
         bool is_const = isColumnConst(raw_col);
         const IColumn * actual = is_const
             ? &static_cast<const ColumnConst &>(raw_col).getDataColumn()
             : &raw_col;
         bool is_nullable = typeid_cast<const ColumnNullable *>(actual) != nullptr;
         uint32_t col_rows = is_const ? 1u : num_rows;
-        ColumnBinaryWire::writeColData(actual, is_nullable, col_rows, descs[i], buf_span);
+        ColumnBinaryWire::writeColData(actual, is_nullable, col_rows, descs[i], buf_span, col_offsets[i]);
     }
 
     if (!use_prealloc)

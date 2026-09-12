@@ -1570,12 +1570,215 @@ TEST(ColumnBinary, PrecomputeStripsSparseAndMatchesConsume)
                                     /*disable_preallocation=*/false);
 
     std::optional<uint64_t> precomputed;
-    ASSERT_NO_THROW(precomputed = output.precomputeSerializedSize(block, rows));
+    ASSERT_NO_THROW(precomputed = output.precomputeSerializedSize(block, 0, rows));
     ASSERT_TRUE(precomputed.has_value());
 
     // The size consume() actually writes must match what precompute promised.
     output.write(block);
     EXPECT_EQ(obuf.str().size(), *precomputed);
+}
+// ── a row-range measurement must equal a measurement of the cut-out range ────
+//
+// The buffered WASM path prices a candidate row range of its argument block
+// before deciding how many rows one call can hold. Sizing the range in place is
+// only sound if it gives the same answer as sizing a block that holds exactly
+// those rows - which is what the caller would otherwise have had to copy out.
+
+namespace
+{
+
+/// Builds a fresh format for `block` and returns the bytes writing it produces.
+std::string writtenBytes(const Block & block)
+{
+    WriteBufferFromOwnString obuf;
+    ColumnBinaryOutputFormat output(obuf, std::make_shared<const Block>(block.cloneEmpty()),
+                                    /*disable_preallocation=*/false);
+    output.write(block);
+    return obuf.str();
+}
+
+size_t writtenSize(const Block & block)
+{
+    return writtenBytes(block).size();
+}
+
+/// Builds a fresh format for `block` and returns the bytes writing the row range produces.
+std::string writtenRangeBytes(const Block & block, size_t row_offset, size_t rows)
+{
+    WriteBufferFromOwnString obuf;
+    ColumnBinaryOutputFormat output(obuf, std::make_shared<const Block>(block.cloneEmpty()),
+                                    /*disable_preallocation=*/false);
+    output.writeRowRange(block, row_offset, rows);
+    return obuf.str();
+}
+
+Block cutRows(const Block & block, size_t offset, size_t rows)
+{
+    Block cut = block;
+    for (auto & elem : cut)
+        elem.column = elem.column->cut(offset, rows);
+    return cut;
+}
+
+}
+
+TEST(ColumnBinary, PrecomputeRowRangeMatchesCutBlock)
+{
+    auto str_type = std::make_shared<DataTypeString>();
+    auto u64_type = std::make_shared<DataTypeUInt64>();
+    auto nullable_str_type = std::make_shared<DataTypeNullable>(str_type);
+
+    const size_t rows = 9;
+
+    // Uneven string lengths, so a range's byte count cannot come out right by accident.
+    auto strings = ColumnString::create();
+    auto nullable_values = ColumnString::create();
+    auto null_map = ColumnUInt8::create();
+    auto numbers = ColumnUInt64::create();
+    for (size_t i = 0; i < rows; ++i)
+    {
+        const std::string s(i * 7 + 1, static_cast<char>('a' + i));
+        strings->insertData(s.data(), s.size());
+        nullable_values->insertData(s.data(), s.size() / 2);
+        null_map->insertValue(i % 3 == 0 ? 1 : 0);
+        numbers->insertValue(i * 1000);
+    }
+
+    Block block;
+    block.insert(ColumnWithTypeAndName{std::move(strings), str_type, "s"});
+    block.insert(ColumnWithTypeAndName{std::move(numbers), u64_type, "n"});
+    block.insert(ColumnWithTypeAndName{
+        ColumnNullable::create(std::move(nullable_values), std::move(null_map)),
+        nullable_str_type, "ns"});
+    block.insert(ColumnWithTypeAndName{
+        ColumnConst::create(str_type->createColumnConst(1, Field("const"))->getPtr(), rows),
+        str_type, "c"});
+
+    WriteBufferFromOwnString probe_buf;
+    ColumnBinaryOutputFormat probe(probe_buf, std::make_shared<const Block>(block.cloneEmpty()),
+                                   /*disable_preallocation=*/false);
+    ASSERT_TRUE(probe.supportsRowRange(block));
+
+    for (size_t offset = 0; offset < rows; ++offset)
+    {
+        // A zero-row block has no size to precompute; `precomputeSerializedSize` returns
+        // nullopt for it whatever the offset, so the range form has nothing to match.
+        for (size_t length = 1; offset + length <= rows; ++length)
+        {
+            std::optional<uint64_t> ranged;
+            ASSERT_NO_THROW(ranged = probe.precomputeSerializedSize(block, offset, length))
+                << "offset " << offset << " length " << length;
+            ASSERT_TRUE(ranged.has_value());
+            EXPECT_EQ(*ranged, writtenSize(cutRows(block, offset, length)))
+                << "offset " << offset << " length " << length;
+        }
+    }
+}
+
+// A layout whose row N is not reachable by pointer arithmetic must decline the
+// range contract, so a caller wanting a slice of one falls back to copying it out.
+TEST(ColumnBinary, ArrayColumnDeclinesRowRange)
+{
+    auto array_type = std::make_shared<DataTypeArray>(std::make_shared<DataTypeUInt64>());
+
+    auto values = ColumnUInt64::create();
+    auto offsets = ColumnUInt64::create();
+    for (size_t i = 0; i < 4; ++i)
+    {
+        values->insertValue(i);
+        offsets->insertValue(i + 1);
+    }
+
+    Block block;
+    block.insert(ColumnWithTypeAndName{
+        ColumnArray::create(std::move(values), std::move(offsets)), array_type, "a"});
+
+    WriteBufferFromOwnString obuf;
+    ColumnBinaryOutputFormat output(obuf, std::make_shared<const Block>(block.cloneEmpty()),
+                                    /*disable_preallocation=*/false);
+    EXPECT_FALSE(output.supportsRowRange(block));
+    // Whole-block sizing still works; only the offset form is out of reach.
+    EXPECT_NO_THROW(output.precomputeSerializedSize(block, 0, block.rows()));
+}
+
+// ── a row-range write must be byte-for-byte the write of the cut-out range ────
+//
+// Having priced a row range in place, the buffered WASM path then has to write
+// that same range. Writing it out of the source column is only sound if the
+// frame is indistinguishable from the frame the copied-out block would produce -
+// the guest decodes both with the same reader.
+
+TEST(ColumnBinary, WriteRowRangeMatchesCutBlock)
+{
+    auto str_type = std::make_shared<DataTypeString>();
+    auto u64_type = std::make_shared<DataTypeUInt64>();
+    auto nullable_str_type = std::make_shared<DataTypeNullable>(str_type);
+    auto nullable_u64_type = std::make_shared<DataTypeNullable>(u64_type);
+
+    const size_t rows = 9;
+
+    // Uneven string lengths, so a rebased offsets array cannot come out right by accident.
+    auto strings = ColumnString::create();
+    auto nullable_values = ColumnString::create();
+    auto str_null_map = ColumnUInt8::create();
+    auto numbers = ColumnUInt64::create();
+    auto nullable_numbers = ColumnUInt64::create();
+    auto num_null_map = ColumnUInt8::create();
+    for (size_t i = 0; i < rows; ++i)
+    {
+        const std::string s(i * 7 + 1, static_cast<char>('a' + i));
+        strings->insertData(s.data(), s.size());
+        nullable_values->insertData(s.data(), s.size() / 2);
+        str_null_map->insertValue(i % 3 == 0 ? 1 : 0);
+        numbers->insertValue(i * 1000);
+        nullable_numbers->insertValue(i * 7);
+        num_null_map->insertValue(i % 4 == 1 ? 1 : 0);
+    }
+
+    Block block;
+    block.insert(ColumnWithTypeAndName{std::move(strings), str_type, "s"});
+    block.insert(ColumnWithTypeAndName{std::move(numbers), u64_type, "n"});
+    block.insert(ColumnWithTypeAndName{
+        ColumnNullable::create(std::move(nullable_values), std::move(str_null_map)),
+        nullable_str_type, "ns"});
+    block.insert(ColumnWithTypeAndName{
+        ColumnNullable::create(std::move(nullable_numbers), std::move(num_null_map)),
+        nullable_u64_type, "nn"});
+    block.insert(ColumnWithTypeAndName{
+        ColumnConst::create(str_type->createColumnConst(1, Field("const"))->getPtr(), rows),
+        str_type, "c"});
+
+    for (size_t offset = 0; offset < rows; ++offset)
+    {
+        for (size_t length = 1; offset + length <= rows; ++length)
+        {
+            const std::string ranged = writtenRangeBytes(block, offset, length);
+            EXPECT_EQ(ranged, writtenBytes(cutRows(block, offset, length)))
+                << "offset " << offset << " length " << length;
+        }
+    }
+}
+
+// A layout that declines the range contract must still be writable by range:
+// the base implementation cuts the slice out and writes that, so a caller does
+// not have to carry a fallback of its own.
+TEST(ColumnBinary, WriteRowRangeFallsBackForArrayColumn)
+{
+    auto array_type = std::make_shared<DataTypeArray>(std::make_shared<DataTypeUInt64>());
+
+    auto values = ColumnUInt64::create();
+    auto offsets = ColumnUInt64::create();
+    for (size_t i = 0; i < 12; ++i)
+    {
+        values->insertValue(i);
+        offsets->insertValue(i + 1);
+    }
+
+    Block block;
+    block.insert(ColumnWithTypeAndName{
+        ColumnArray::create(std::move(values), std::move(offsets)), array_type, "a"});
+
+    EXPECT_EQ(writtenRangeBytes(block, 3, 5), writtenBytes(cutRows(block, 3, 5)));
 }
 
 // ── the writer must enforce the same exact column count the reader requires ──
@@ -1610,7 +1813,7 @@ TEST(ColumnBinary, WriterRejectsColumnCountMismatch)
         WriteBufferFromOwnString obuf;
         ColumnBinaryOutputFormat output(obuf, std::make_shared<const Block>(header),
                                         /*disable_preallocation=*/false);
-        EXPECT_THROW(output.precomputeSerializedSize(block, 1), DB::Exception);
+        EXPECT_THROW(output.precomputeSerializedSize(block, 0, 1), DB::Exception);
         EXPECT_THROW(output.write(block), DB::Exception);
     }
 
@@ -1624,7 +1827,7 @@ TEST(ColumnBinary, WriterRejectsColumnCountMismatch)
         WriteBufferFromOwnString obuf;
         ColumnBinaryOutputFormat output(obuf, std::make_shared<const Block>(header),
                                         /*disable_preallocation=*/false);
-        EXPECT_THROW(output.precomputeSerializedSize(block, 1), DB::Exception);
+        EXPECT_THROW(output.precomputeSerializedSize(block, 0, 1), DB::Exception);
         EXPECT_THROW(output.write(block), DB::Exception);
     }
 }
@@ -1650,7 +1853,7 @@ TEST(ColumnBinary, WriterRejectsColumnTypeMismatch)
         WriteBufferFromOwnString obuf;
         ColumnBinaryOutputFormat output(obuf, std::make_shared<const Block>(header),
                                         /*disable_preallocation=*/false);
-        EXPECT_THROW(output.precomputeSerializedSize(block, 1), DB::Exception);
+        EXPECT_THROW(output.precomputeSerializedSize(block, 0, 1), DB::Exception);
         EXPECT_THROW(output.write(block), DB::Exception);
     }
 
@@ -1667,7 +1870,7 @@ TEST(ColumnBinary, WriterRejectsColumnTypeMismatch)
         WriteBufferFromOwnString obuf;
         ColumnBinaryOutputFormat output(obuf, std::make_shared<const Block>(header),
                                         /*disable_preallocation=*/false);
-        EXPECT_THROW(output.precomputeSerializedSize(block, 1), DB::Exception);
+        EXPECT_THROW(output.precomputeSerializedSize(block, 0, 1), DB::Exception);
         EXPECT_THROW(output.write(block), DB::Exception);
     }
 
@@ -1682,7 +1885,7 @@ TEST(ColumnBinary, WriterRejectsColumnTypeMismatch)
         WriteBufferFromOwnString obuf;
         ColumnBinaryOutputFormat output(obuf, std::make_shared<const Block>(header),
                                         /*disable_preallocation=*/false);
-        EXPECT_NO_THROW(output.precomputeSerializedSize(block, 1));
+        EXPECT_NO_THROW(output.precomputeSerializedSize(block, 0, 1));
         EXPECT_NO_THROW(output.write(block));
     }
 }

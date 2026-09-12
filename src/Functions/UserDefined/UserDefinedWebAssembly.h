@@ -52,7 +52,10 @@ private:
 class UserDefinedWebAssemblyFunction
 {
 public:
-    virtual MutableColumnPtr executeOnBlock(WebAssembly::WasmCompartment * compartment, const Block & block, ContextPtr context, size_t num_rows, StopToken stop_token) const = 0;
+    /// Runs the function over rows [row_offset, row_offset + num_rows) of `block`. A caller that
+    /// holds a whole block and wants a slice of it passes the bounds instead of cutting the slice
+    /// out, which for a wide argument is the difference between one deep copy per call and none.
+    virtual MutableColumnPtr executeOnBlock(WebAssembly::WasmCompartment * compartment, const Block & block, ContextPtr context, size_t row_offset, size_t num_rows, StopToken stop_token) const = 0;
 
     /// True when a call has to place data in, or read data from, the guest's linear memory. Such a
     /// function cannot run in a compartment whose memory can never hold a single page, while one
