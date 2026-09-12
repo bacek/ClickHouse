@@ -564,12 +564,17 @@ public:
 
     // Direct columnar execution — bypasses RowBinary batching.
     // Called from FunctionUserDefinedWasm::executeImpl() for ColumnarV1 functions.
+    /// `row_offset` names the first row of `cols` this call serializes, so a split call can hand
+    /// the guest a range of the original columns instead of a cut copy of them. Any column whose
+    /// layout cannot be addressed from a row offset is sliced per column inside
+    /// `buildColumnarLayout`, so the caller never has to look at column shapes.
     MutableColumnPtr executeColumnar(
         WebAssembly::WasmCompartment * compartment,
         const ColumnsWithTypeAndName & cols,
         size_t input_rows_count,
         ContextPtr,
-        StopToken stop_token) const
+        StopToken stop_token,
+        size_t row_offset = 0) const
     {
         ProfileEventTimeIncrement<Microseconds> timer(ProfileEvents::WasmTotalExecuteMicroseconds);
 
@@ -587,10 +592,11 @@ public:
         std::vector<bool> is_nullable_flags; // STYLE_CHECK_ALLOW_STD_CONTAINERS
         std::vector<uint32_t> row_counts; // STYLE_CHECK_ALLOW_STD_CONTAINERS
         std::vector<ColumnPtr> casted_columns; // STYLE_CHECK_ALLOW_STD_CONTAINERS -- keeps casted columns alive through writeColData below
+        std::vector<uint32_t> col_offsets; // STYLE_CHECK_ALLOW_STD_CONTAINERS
 
         const uint64_t total_buf_size = buildColumnarLayout(
             cols, input_rows_count, /* declared_positions */ {},
-            descs, inner_cols, is_nullable_flags, row_counts, casted_columns);
+            descs, inner_cols, is_nullable_flags, row_counts, casted_columns, col_offsets, row_offset);
 
         // ── Allocate buffer in WASM memory ───────────────────────────────────
         {
@@ -633,7 +639,7 @@ public:
                 // Write column data
                 for (uint32_t ci = 0; ci < num_cols; ++ci)
                     writeColData(inner_cols[ci], is_nullable_flags[ci], row_counts[ci],
-                                 descs[ci], wasm_mem);
+                                 descs[ci], wasm_mem, col_offsets[ci]);
             }
 
             // ── Invoke WASM ──────────────────────────────────────────────────
@@ -670,15 +676,11 @@ public:
         size_t num_rows,
         StopToken stop_token) const override
     {
-        if (row_offset != 0)
-            throw Exception(ErrorCodes::LOGICAL_ERROR,
-                "ColumnarV1 ABI cannot execute a block from a row offset");
-
         ColumnsWithTypeAndName args;
         args.reserve(block.columns());
         for (size_t i = 0; i < block.columns(); ++i)
             args.push_back(block.getByPosition(i));
-        return executeColumnar(compartment, args, num_rows, context, stop_token);
+        return executeColumnar(compartment, args, num_rows, context, stop_token, row_offset);
     }
 
     /// The exact bytes a call carrying `[start_idx, start_idx + length)` puts in guest memory.
@@ -724,9 +726,11 @@ public:
         std::vector<bool> is_nullable_flags; // STYLE_CHECK_ALLOW_STD_CONTAINERS
         std::vector<uint32_t> row_counts; // STYLE_CHECK_ALLOW_STD_CONTAINERS
         std::vector<ColumnPtr> casted_columns; // STYLE_CHECK_ALLOW_STD_CONTAINERS
+        std::vector<uint32_t> col_offsets; // STYLE_CHECK_ALLOW_STD_CONTAINERS
 
         return buildColumnarLayout(
-            batch, length, declared_positions, descs, inner_cols, is_nullable_flags, row_counts, casted_columns);
+            batch, length, declared_positions, descs, inner_cols, is_nullable_flags, row_counts, casted_columns,
+            col_offsets, /* row_offset */ 0);
     }
 
     /// The frame bytes of `[start_idx, start_idx + length)` rows of one column, added to
@@ -817,6 +821,12 @@ private:
     /// Fills the per-column descriptors of a COLUMNAR_V1 frame and returns the frame's total size.
     /// `casted_columns` owns whatever the cast below produced and must outlive `inner_cols`, which
     /// points into it.
+    ///
+    /// The frame covers `input_rows_count` rows starting at `row_offset` of each column.
+    /// `col_offsets` reports the row offset each column ended up being serialized from, which is
+    /// what `writeColData` has to be handed so that it reads the same rows the descriptor sized:
+    /// a const column is always its single stored row, and a column whose layout cannot be read
+    /// from a row offset is sliced here and therefore starts at 0 as well.
     uint64_t buildColumnarLayout(
         const ColumnsWithTypeAndName & cols,
         size_t input_rows_count,
@@ -825,7 +835,9 @@ private:
         std::vector<const IColumn *> & inner_cols, // STYLE_CHECK_ALLOW_STD_CONTAINERS
         std::vector<bool> & is_nullable_flags, // STYLE_CHECK_ALLOW_STD_CONTAINERS
         std::vector<uint32_t> & row_counts, // STYLE_CHECK_ALLOW_STD_CONTAINERS
-        std::vector<ColumnPtr> & casted_columns) const // STYLE_CHECK_ALLOW_STD_CONTAINERS
+        std::vector<ColumnPtr> & casted_columns, // STYLE_CHECK_ALLOW_STD_CONTAINERS
+        std::vector<uint32_t> & col_offsets, // STYLE_CHECK_ALLOW_STD_CONTAINERS
+        size_t row_offset) const
     {
         const uint32_t num_cols = static_cast<uint32_t>(cols.size());
         uint64_t cursor = FRAME_HEADER_BYTES + num_cols * COL_DESC_BYTES;
@@ -835,6 +847,7 @@ private:
         is_nullable_flags.assign(num_cols, false);
         row_counts.assign(num_cols, 0);
         casted_columns.assign(num_cols, nullptr);
+        col_offsets.assign(num_cols, 0);
 
         for (uint32_t ci = 0; ci < num_cols; ++ci)
         {
@@ -867,14 +880,34 @@ private:
                 is_const = true;
             }
 
+            // A `ColumnConst` carries its one stored row whatever range is asked for, so it is
+            // always read from offset 0. Everything else is read straight out of the original
+            // column at `row_offset` when the wire can address that layout by row; the shapes it
+            // cannot (Array, Tuple, LowCardinality, Variant) have to be sliced out first, and
+            // slicing only the columns that need it keeps the rest copy-free.
+            uint32_t col_offset = 0;
+            if (!is_const && row_offset != 0)
+            {
+                if (supportsRowOffset(*col))
+                {
+                    col_offset = static_cast<uint32_t>(row_offset);
+                }
+                else
+                {
+                    casted_columns[ci] = col->cut(row_offset, input_rows_count);
+                    col = casted_columns[ci].get();
+                }
+            }
+
             bool is_nullable = typeid_cast<const ColumnNullable *>(col) != nullptr;
             uint32_t nrows = is_const ? 1u : static_cast<uint32_t>(input_rows_count);
 
             is_nullable_flags[ci] = is_nullable;
             inner_cols[ci] = col;
             row_counts[ci] = nrows;
+            col_offsets[ci] = col_offset;
 
-            cursor = buildColDescriptor(col, is_const, is_nullable, nrows, cursor, descs[ci]);
+            cursor = buildColDescriptor(col, is_const, is_nullable, nrows, cursor, descs[ci], /* gaps */ nullptr, col_offset);
         }
 
         return cursor;
@@ -1218,20 +1251,11 @@ public:
                     if (end_idx <= batch_start)
                         return;
                     size_t batch_size = end_idx - batch_start;
-                    ColumnsWithTypeAndName batch_cols;
-                    {
-                        ProfileEventTimeIncrement<Microseconds> timer_prep(ProfileEvents::WasmInputBlockPrepMicroseconds);
-                        batch_cols.reserve(arguments.size());
-                        for (const auto & arg : arguments)
-                        {
-                            /// cut() materializes a copy of the whole range; when the batch already spans
-                            /// the entire column there is nothing to slice, so pass the column through.
-                            bool whole_column = batch_start == 0 && batch_size == arg.column->size();
-                            batch_cols.emplace_back(
-                                whole_column ? arg.column : arg.column->cut(batch_start, batch_size), arg.type, arg.name);
-                        }
-                    }
-                    auto result = cv1->executeColumnar(compartment_ptr, batch_cols, batch_size, context, stop_token);
+                    /// The batch is serialized straight out of `arguments` at `batch_start`; only a
+                    /// column whose layout cannot be read from a row offset is sliced, and that
+                    /// happens per column inside the layout pass.
+                    auto result = cv1->executeColumnar(
+                        compartment_ptr, arguments, batch_size, context, stop_token, batch_start);
                     ProfileEventTimeIncrement<Microseconds> timer_assembly(ProfileEvents::WasmResultAssemblyMicroseconds);
                     // A guest that set COL_IS_CONST legitimately returns a ColumnConst; structureEquals
                     // only holds between two ColumnConst instances, so compare the unwrapped nested
