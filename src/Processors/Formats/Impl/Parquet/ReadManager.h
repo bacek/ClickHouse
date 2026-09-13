@@ -1,6 +1,7 @@
 #pragma once
 
 #include <Processors/Formats/Impl/Parquet/Reader.h>
+#include <Common/Logger.h>
 
 namespace DB::Parquet
 {
@@ -62,6 +63,10 @@ public:
     void cancel() noexcept;
 
 private:
+    /// Hot paths below log at TEST level on every scheduling pass; keep the logger
+    /// hoisted so a disabled LOG_TEST still costs a load, not a name lookup.
+    const LoggerPtr log = getLogger("ParquetReadManager");
+
     using RowGroup = Reader::RowGroup;
     using RowSubgroup = Reader::RowSubgroup;
     using ColumnChunk = Reader::ColumnChunk;
