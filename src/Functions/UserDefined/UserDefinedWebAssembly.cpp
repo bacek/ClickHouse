@@ -554,13 +554,46 @@ public:
         // COLUMNAR_V1 writes the same frame as the `ColumnBinary` wire, so it supports exactly
         // the types that wire supports.
         for (const auto & arg : arguments)
+        {
             validateColumnBinaryWireSupportedType(arg);
+            // LowCardinality(Nullable(T)) is rejected outright. The COL_LOWCARD frame cannot
+            // distinguish it from a plain LowCardinality whose dictionary happens to begin with
+            // the default value: the dictionary null map never reaches the wire and the NULL
+            // rides as dictionary row 0 (ColumnUnique's sentinel). A byte-identical frame is
+            // ambiguous at the guest, so the only sound place to enforce this is here, where
+            // the dictionary's nullability is still known. Callers who need NULLs with this
+            // ABI declare Nullable(T) (COL_FIXED*/BYTES carry a null map) or plain
+            // LowCardinality(T).
+            if (arg->isLowCardinalityNullable())
+                throw Exception(
+                    ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT,
+                    "WebAssembly COLUMNAR_V1 does not support LowCardinality(Nullable(T)) arguments: {}; "
+                    "the LowCardinality wire frame cannot represent a nullable dictionary",
+                    arg->getName());
+        }
         validateColumnBinaryWireSupportedType(result_type);
+        // A LowCardinality result would have to arrive as a COL_LOWCARD output column, which the
+        // guest writer does not emit (readColumnarOutput would reject the frame at execution
+        // time). It is also precisely the type that the framework's "compute once per dictionary
+        // value" shortcut is built from — the shortcut ColumnBinaryWireLayout itself warns is
+        // "not necessarily what you want", because it silently runs the function on every
+        // materialized row instead.
+        if (result_type->lowCardinality())
+            throw Exception(
+                ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT,
+                "WebAssembly COLUMNAR_V1 does not support a LowCardinality result type: {}; "
+                "the guest cannot emit a LowCardinality column",
+                result_type->getName());
     }
 
     bool requiresGuestLinearMemory() const override { return true; }
 
     bool serializesInputBlockToGuestMemory() const override { return true; }
+
+    /// COLUMNAR_V1 encodes LowCardinality arguments as COL_LOWCARD; CH's default interception
+    /// would call convertLowCardinalityColumnsToFull before execute and the wire would never
+    /// see the dictionary. See UserDefinedWebAssembly.h.
+    bool useDefaultImplementationForLowCardinalityColumns() const override { return false; }
 
     // Direct columnar execution — bypasses RowBinary batching.
     // Called from FunctionUserDefinedWasm::executeImpl() for ColumnarV1 functions.
@@ -1147,9 +1180,29 @@ public:
                 if (stripped->equals(*expected_arguments[i]))
                     continue;
 
+                /// COLUMNAR_V1 with the default LowCardinality interception off (see
+                /// UserDefinedWebAssemblyFunctionColumnarV1::useDefaultImplementationForLowCardinalityColumns):
+                /// the dictionary wrapper survives to analysis, so a declared LowCardinality(T)
+                /// must match an actual T and vice versa. The runtime cast in buildColumnarLayout
+                /// resolves the difference in the column data — materializing a dictionary for a
+                /// declared plain type, or building one up for a declared LowCardinality. An
+                /// actual LowCardinality(Nullable(T)) column strips to Nullable(T) and keeps the
+                /// old materialized-with-null-map behavior (CH casts preserve nullability); a
+                /// *declared* LowCardinality(Nullable(T)) could never exist here (rejected at CREATE).
+                auto strip_lc = [](const DataTypePtr & type) -> DataTypePtr
+                {
+                    if (const auto * lc = typeid_cast<const DataTypeLowCardinality *>(type.get()))
+                        return lc->getDictionaryType();
+                    return type;
+                };
+                const DataTypePtr actual_cmp = removeNullable(strip_lc(stripped));
+                const DataTypePtr expected_cmp = removeNullable(strip_lc(expected_arguments[i]));
+                if (actual_cmp->equals(*expected_cmp))
+                    continue;
+
                 /// Allow implicit coercions: same kind, i32→i64, any int→any float, f32→f64.
-                auto actual_kind = wasmKindForDataType(stripped.get());
-                auto expected_kind = wasmKindForDataType(expected_arguments[i].get());
+                auto actual_kind = wasmKindForDataType(actual_cmp.get());
+                auto expected_kind = wasmKindForDataType(expected_cmp.get());
                 if (actual_kind && expected_kind && canCoerce(*actual_kind, *expected_kind))
                     continue;
             }
@@ -1177,6 +1230,17 @@ public:
     /// (isColumnConst(*column) in resolveFunction.cpp). Without this, executeImpl
     /// returns a plain ColumnVector which the Analyzer does not fold.
     bool useDefaultImplementationForConstants() const override { return user_defined_function->getIsDeterministic(); }
+
+    /// COLUMNAR_V1 turns the LowCardinality interception off so dictionaries reach the guest
+    /// as COL_LOWCARD; every other ABI keeps the default (materialize before execute). The
+    /// framework consults this on both sides: FunctionToFunctionBaseAdaptor forwards it around
+    /// executeImpl, and FunctionToOverloadResolverAdaptor forwards it around getReturnType, so
+    /// analysis sees the same raw LowCardinality argument types execution will receive.
+    bool useDefaultImplementationForLowCardinalityColumns() const override
+    {
+        return user_defined_function->useDefaultImplementationForLowCardinalityColumns();
+    }
+
     ColumnNumbers getArgumentsThatAreAlwaysConstant() const override { return {}; }
 
     bool isSuitableForConstantFolding() const override { return user_defined_function->getIsDeterministic(); }
@@ -2148,7 +2212,18 @@ private:
 
 /// Returns true if `actual` argument types are compatible with `expected` for WASM dispatch.
 /// Mirrors the per-argument matching logic in FunctionUserDefinedWasm::getReturnTypeImpl.
-static bool typesMatchOverload(const DataTypes & actual, const DataTypes & expected)
+/// Strip one outer LowCardinality wrapper, if present.
+static DataTypePtr stripLowCardinalityOnce(const DataTypePtr & type)
+{
+    if (const auto * lc = typeid_cast<const DataTypeLowCardinality *>(type.get()))
+        return lc->getDictionaryType();
+    return type;
+}
+
+static bool typesMatchOverload(
+    const DataTypes & actual,
+    const DataTypes & expected,
+    bool allow_low_cardinality_relaxation = false)
 {
     if (actual.size() != expected.size())
         return false;
@@ -2163,6 +2238,23 @@ static bool typesMatchOverload(const DataTypes & actual, const DataTypes & expec
         auto expected_kind = wasmKindForDataType(expected[i].get());
         if (actual_kind && expected_kind && *actual_kind == *expected_kind)
             continue;
+        // Mirror of FunctionUserDefinedWasm::getReturnTypeImpl's LowCardinality relaxation,
+        // gated to COLUMNAR_V1 overloads — the ones that keep the dictionary through to
+        // execution (COL_LOWCARD on the wire). A declared LowCardinality(T) matches an
+        // actual T and vice versa; buildColumnarLayout's cast materializes or builds up the
+        // dictionary per argument. LC(Nullable(T)) arguments are rejected at CREATE, so
+        // stripping here can never smuggle a nullable dictionary to the guest.
+        if (allow_low_cardinality_relaxation)
+        {
+            const DataTypePtr stripped_actual = removeNullable(stripLowCardinalityOnce(stripped));
+            const DataTypePtr stripped_expected = removeNullable(stripLowCardinalityOnce(expected[i]));
+            if (stripped_actual->equals(*stripped_expected))
+                continue;
+            auto lc_actual_kind = wasmKindForDataType(stripped_actual.get());
+            auto lc_expected_kind = wasmKindForDataType(stripped_expected.get());
+            if (lc_actual_kind && lc_expected_kind && *lc_actual_kind == *lc_expected_kind)
+                continue;
+        }
         // Allow CH geo types (Point, LineString, …) to satisfy a Geometry (Variant) parameter.
         // Constant-folded geo literals arrive as bare structural types (e.g. Tuple(Float64,Float64))
         // without the custom name, so we also accept structural matches against variant members.
@@ -2212,6 +2304,14 @@ public:
     {
         return overloads.empty() || overloads.front()->useDefaultImplementationForNulls();
     }
+    /// Forwarded on the same first-overload basis as useDefaultImplementationForNulls above.
+    /// A COLUMNAR_V1 overload keeps LowCardinality arguments intact for COL_LOWCARD; if a name
+    /// ever mixes ABIs, the materializing default wins and COLUMNAR_V1 overloads declared with
+    /// LowCardinality simply see materialized columns (the relaxation below still matches them).
+    bool useDefaultImplementationForLowCardinalityColumns() const override
+    {
+        return overloads.empty() || overloads.front()->useDefaultImplementationForLowCardinalityColumns();
+    }
     bool isSpatialPredicate() const override
     {
         return !overloads.empty() && overloads.front()->isSpatialPredicate();
@@ -2226,7 +2326,7 @@ public:
     {
         for (const auto & fn : overloads)
         {
-            if (typesMatchOverload(arguments, fn->getArgumentTypes()))
+            if (typesMatchOverload(arguments, fn->getArgumentTypes(), !fn->useDefaultImplementationForLowCardinalityColumns()))
                 return fn->getReturnTypeImpl(arguments);
         }
         auto get_names = std::views::transform([](const auto & t) { return t->getName(); });
@@ -2246,7 +2346,7 @@ public:
 
         for (const auto & fn : overloads)
         {
-            if (typesMatchOverload(types, fn->getArgumentTypes()))
+            if (typesMatchOverload(types, fn->getArgumentTypes(), !fn->useDefaultImplementationForLowCardinalityColumns()))
                 return std::make_unique<FunctionToFunctionBaseAdaptor>(fn, types, result_type);
         }
         throw Exception(

@@ -62,6 +62,15 @@ public:
     /// passing its arguments as WebAssembly values is indifferent to the memory configuration.
     virtual bool requiresGuestLinearMemory() const = 0;
 
+    /// Whether CH's default LowCardinality handling should stay on for this ABI.
+    /// COLUMNAR_V1 encodes LowCardinality arguments directly on the wire (COL_LOWCARD) and
+    /// overrides this to false, which lets dictionaries reach the guest at all: the default
+    /// implementation calls convertLowCardinalityColumnsToFull before execute, so the wire
+    /// never sees the dictionary otherwise. Turning it off also gives up the default path's
+    /// compute-once-per-dictionary-value shortcut when the *result* type is LowCardinality —
+    /// COLUMNAR_V1 rejects such signatures up front for that reason.
+    virtual bool useDefaultImplementationForLowCardinalityColumns() const { return true; }
+
     /// True when a call serializes the whole input block into the guest's linear memory through
     /// `serialization_format`, so what the memory has to hold is the serialized size of a batch.
     /// An ABI that hands the guest one row at a time - `ASSEMBLYSCRIPT` builds a separate object
@@ -69,6 +78,16 @@ public:
     /// input by a serialization it does not perform would bound it by bytes it never places
     /// there.
     virtual bool serializesInputBlockToGuestMemory() const = 0;
+
+    /// True when the ABI's wire encodes LowCardinality arguments as such (COLUMNAR_V1's
+    /// COL_LOWCARD), so CH's default "materialize every LowCardinality argument before
+    /// execute" interception must be turned off for it. Turning it off is what lets a
+    /// dictionary reach the guest at all; the default implementation otherwise calls
+    /// convertLowCardinalityColumnsToFull and the wire never sees the dictionary. It also
+    /// gives up the default path's compute-per-distinct-value shortcut when the *result*
+    /// type is LowCardinality — no WASM UDF declares one, so for these ABIs the shortcut
+    /// is worth nothing and the dictionary is worth something.
+    virtual bool supportsLowCardinalityArguments() const { return false; }
 
     virtual ~UserDefinedWebAssemblyFunction() = default;
 
