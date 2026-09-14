@@ -1,0 +1,24 @@
+-- corpus parses as expected --
+1	POINT (2 2)
+2	POINT (2 2)
+3	POINT Z (2 2 1.5)
+4	POINT M (2 2 1.5)
+5	POINT ZM (2 2 1.5 1.5)
+6	POINT Z (2 2 1.5)
+7	POINT ZM (102 102 1.5 1.5)
+8	SRID=4326;POINT (2 2)
+9	POINT (102 102)
+-- rtree join over all variants --
+1	10
+2	10
+3	10
+4	10
+5	10
+6	10
+7	20
+8	10
+9	20
+-- typed-wrapper join (plain and big-endian variants) --
+1	10
+2	10
+9	20

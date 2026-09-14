@@ -48,6 +48,45 @@ extern const int LOGICAL_ERROR;
 
 SpatialRTreeJoin::BGBox SpatialRTreeJoin::wkbBBox(std::string_view wkb)
 {
+    /// Fast path for the overwhelmingly common probe-side shape: a little-endian
+    /// POINT (plain WKB, EWKB Z/M/ZM flag bits, or ISO 1001/2001/3001 codes).
+    /// The generic scanner below allocates a read buffer and recurses through a
+    /// std::function for every probe row; for a single point that is pure overhead.
+    /// Anything this path is not certain about (big endian, SRID, wrong length,
+    /// other types) falls through to the generic scanner, which stays authoritative.
+    if (wkb.size() >= 21)
+    {
+        const auto * bytes = reinterpret_cast<const unsigned char *>(wkb.data());
+        if (bytes[0] == 1) /// little endian
+        {
+            UInt32 type_word;
+            memcpy(&type_word, bytes + 1, 4);
+
+            if (!(type_word & 0x20000000u)) /// no SRID
+            {
+                bool has_z = (type_word & 0x80000000u) != 0;
+                bool has_m = (type_word & 0x40000000u) != 0;
+                UInt32 base_type = type_word & 0x0FFFFFFFu;
+
+                if (base_type > 3000 && base_type < 4000)      { has_m = true;              base_type -= 3000; }
+                else if (base_type > 2000 && base_type < 3000) { has_z = true; has_m = true; base_type -= 2000; }
+                else if (base_type > 1000 && base_type < 2000) { has_z = true;              base_type -= 1000; }
+
+                if (base_type == 1)
+                {
+                    const size_t needed = 5 + 16 + (has_z ? 8 : 0) + (has_m ? 8 : 0);
+                    if (wkb.size() >= needed)
+                    {
+                        double x, y;
+                        memcpy(&x, bytes + 5, 8);
+                        memcpy(&y, bytes + 13, 8);
+                        return BGBox{BGPoint{x, y}, BGPoint{x, y}};
+                    }
+                }
+            }
+        }
+    }
+
     double xmin = std::numeric_limits<double>::infinity();
     double ymin = std::numeric_limits<double>::infinity();
     double xmax = -std::numeric_limits<double>::infinity();

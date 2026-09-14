@@ -1,0 +1,43 @@
+-- Probe-side bbox extraction (SpatialRTreeJoin::wkbBBox) must agree with the
+-- generic WKB scanner on every POINT encoding the probe column can carry:
+-- little/big endian, EWKB Z/M/ZM flag bits, ISO 1001/3001 codes, SRID flag.
+-- Expectations were captured from the generic scanner before the POINT fast path.
+
+DROP TABLE IF EXISTS rtree_bbox_pts;
+DROP TABLE IF EXISTS rtree_bbox_polys;
+
+CREATE TABLE rtree_bbox_pts (id Int32, wkb String) ENGINE = Memory;
+CREATE TABLE rtree_bbox_polys (id Int32, wkb String) ENGINE = Memory;
+
+-- Squares [0,4]x[0,4] and [100,104]x[100,104].
+INSERT INTO rtree_bbox_polys VALUES
+    (10, unhex('010300000001000000050000000000000000000000000000000000000000000000000010400000000000000000000000000000104000000000000010400000000000000000000000000000104000000000000000000000000000000000')),
+    (20, unhex('01030000000100000005000000000000000000594000000000000059400000000000005A4000000000000059400000000000005A400000000000005A4000000000000059400000000000005A4000000000000059400000000000005940'));
+
+-- (2,2) is inside polygon 10; (102,102) is inside polygon 20.
+INSERT INTO rtree_bbox_pts VALUES
+    (1,  unhex('010100000000000000000000400000000000000040')),
+    (2,  unhex('000000000140000000000000004000000000000000')),
+    (3,  unhex('010100008000000000000000400000000000000040000000000000F83F')),
+    (4,  unhex('010100004000000000000000400000000000000040000000000000F83F')),
+    (5,  unhex('01010000C000000000000000400000000000000040000000000000F83F000000000000F83F')),
+    (6,  unhex('01E903000000000000000000400000000000000040000000000000F83F')),
+    (7,  unhex('01B90B000000000000008059400000000000805940000000000000F83F000000000000F83F')),
+    (8,  unhex('0101000020E610000000000000000000400000000000000040')),
+    (9,  unhex('010100000000000000008059400000000000805940'));
+
+SELECT '-- corpus parses as expected --';
+SELECT id, st_asewkt(st_geomfromwkb(wkb)) FROM rtree_bbox_pts ORDER BY id;
+
+SELECT '-- rtree join over all variants --';
+SELECT t.id, p.id
+FROM rtree_bbox_pts t JOIN rtree_bbox_polys p
+ON st_within(t.wkb, p.wkb)
+ORDER BY t.id, p.id;
+
+SELECT '-- typed-wrapper join (plain and big-endian variants) --';
+SELECT t.id, p.id
+FROM rtree_bbox_pts t JOIN rtree_bbox_polys p
+ON pointInPolygon(readWKBPoint(t.wkb), readWKB(p.wkb))
+WHERE t.id IN (1, 2, 9)
+ORDER BY t.id, p.id;
