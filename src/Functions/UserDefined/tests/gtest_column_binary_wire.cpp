@@ -25,7 +25,16 @@
 #include <vector>
 
 #include <Columns/ColumnArray.h>
+#include <Columns/ColumnDecimal.h>
 #include <Columns/ColumnLowCardinality.h>
+#include <Columns/ColumnUnique.h>
+#include <DataTypes/DataTypeFixedString.h>
+#include <DataTypes/DataTypeIPv4andIPv6.h>
+#include <DataTypes/DataTypeUUID.h>
+#include <DataTypes/DataTypesDecimal.h>
+#include <fstream>
+#include <cstdlib>
+#include <unordered_map>
 #include <Columns/ColumnNullable.h>
 #include <Columns/ColumnString.h>
 #include <Columns/ColumnTuple.h>
@@ -1059,4 +1068,416 @@ TEST(ColumnBinaryWire, OutputRejectsDataOffsetInsideHeader)
 
     auto result_type = std::make_shared<DataTypeUInt64>();
     EXPECT_THROW(readColumnarOutput({buf.data(), buf.size()}, result_type, num_rows), DB::Exception);
+}
+
+// ── COL_FIXEDN ───────────────────────────────────────────────────────────────
+//
+// Fixed-width payloads whose width is not 1/2/4/8 (UUID, IPv6, Int128/UInt128,
+// Decimal128/256, FixedString(N) of any length) all share one tag; the element
+// width is only recorded as data_size/num_rows. These tests pin the encoder's
+// bytes and, via COLUMNAR_WIRE_DUMP_DIR, write each frame out verbatim so the
+// WASM-guest tests can decode exactly what the real writer produces instead of
+// reconstructing the layout from prose.
+
+namespace
+{
+
+struct EncodedFrame
+{
+    std::vector<uint8_t> bytes;
+    ColDescriptor desc;
+};
+
+UInt128 make_u128(uint64_t hi, uint64_t lo)
+{
+    UInt128 v = hi;
+    v <<= 64;
+    v |= lo;
+    return v;
+}
+
+// IColumn has no whole-column equals in this tree; compareAt per row is the
+// same structural comparison the decoders are checked with.
+bool columnsEqual(const IColumn & a, const IColumn & b)
+{
+    if (a.size() != b.size())
+        return false;
+    for (size_t i = 0; i < a.size(); ++i)
+        if (a.compareAt(i, i, b, 1) != 0)
+            return false;
+    return true;
+}
+
+// Mirrors UserDefinedWebAssemblyFunctionColumnarV1's single-column call sequence:
+// buildColDescriptor + writeColData with the same (stored_rows, frame_rows) split
+// the executor uses (a const column stores 1 row; the frame header carries the
+// block's row count).
+EncodedFrame encodeFrame(
+    const IColumn * col,
+    bool is_const,
+    bool is_nullable,
+    uint32_t stored_rows,
+    uint32_t frame_rows)
+{
+    ColDescriptor desc{};
+    uint64_t cursor = FRAME_HEADER_BYTES + COL_DESC_BYTES;
+    cursor = buildColDescriptor(col, is_const, is_nullable, stored_rows, cursor, desc);
+
+    EncodedFrame f;
+    f.desc = desc;
+    f.bytes.resize(cursor, 0);
+    writeFrameHeader(f.bytes.data(), frame_rows, /*num_cols=*/ 1);
+    std::memcpy(f.bytes.data() + FRAME_HEADER_BYTES, &desc, COL_DESC_BYTES);
+    writeColData(col, is_nullable, stored_rows, desc, {f.bytes.data(), f.bytes.size()});
+    return f;
+}
+
+// Writes the fixture files consumed by the chgeos guest tests
+// (chgeos tests/wire_fixtures/, regenerated with
+//   COLUMNAR_WIRE_DUMP_DIR=... unit_tests_dbms --gtest_filter='ColumnBinaryWire.*Dump'
+// ). No-op when the variable is unset, so the tests stay hermetic by default.
+void dumpFixture(const std::string & name, const std::vector<uint8_t> & bytes)
+{
+    const char * dir = ::getenv("COLUMNAR_WIRE_DUMP_DIR");
+    if (!dir)
+        return;
+    std::string path = std::string(dir) + "/" + name + ".bin";
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    out.write(reinterpret_cast<const char *>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+    ASSERT_TRUE(out.good()) << "cannot write fixture " << path;
+}
+
+MutableColumnPtr decodeFrame(const EncodedFrame & f, const DataTypePtr & type, uint32_t frame_rows)
+{
+    return readColumnFromDesc({f.bytes.data(), f.bytes.size()}, f.desc, frame_rows, type);
+}
+
+} // namespace
+
+TEST(ColumnBinaryWire, FixedString8UsesWidthClassedFixedTag)
+{
+    // The descriptor carries only a coarse width class (H3): any 8-byte element,
+    // including FixedString(8), takes COL_FIXED64, not COL_FIXEDN. A guest must
+    // get the logical interpretation from the declared type and use the tag only
+    // to validate the width.
+    auto fs_type = std::make_shared<DataTypeFixedString>(8);
+    auto col = fs_type->createColumn();
+    col->insertData("abcdefgh", 8);
+    col->insertData("ijklmnop", 8);
+
+    auto f = encodeFrame(col.get(), false, false, 2, 2);
+    EXPECT_EQ(f.desc.type, COL_FIXED64);
+    EXPECT_EQ(f.desc.offsets_offset, 0u);
+    EXPECT_EQ(f.desc.data_size, 16u);
+    { auto decoded_ = decodeFrame(f, fs_type, 2); EXPECT_TRUE(columnsEqual(*decoded_, *col)); }
+
+    dumpFixture("fixedwidth_fs8", f.bytes);
+}
+
+TEST(ColumnBinaryWire, FixedStringWidthClassesByLength)
+{
+    struct { size_t n; uint64_t expect_tag; } cases[] = {
+        {1, COL_FIXED8}, {2, COL_FIXED16}, {4, COL_FIXED32}, {8, COL_FIXED64}, {16, COL_FIXEDN},
+    };
+    for (auto & c : cases)
+    {
+        auto fs_type = std::make_shared<DataTypeFixedString>(c.n);
+        auto col = fs_type->createColumn();
+        const std::string value(c.n, 'x');
+        col->insertData(value.data(), c.n);
+        auto f = encodeFrame(col.get(), false, false, 1, 1);
+        EXPECT_EQ(f.desc.type, c.expect_tag) << "FixedString(" << c.n << ")";
+        EXPECT_EQ(f.desc.data_size, c.n);
+    }
+}
+
+TEST(ColumnBinaryWire, FixedString16EncodesAsFixedN)
+{
+    auto fs_type = std::make_shared<DataTypeFixedString>(16);
+    auto col = fs_type->createColumn();
+    col->insertData("0123456789abcdef", 16);
+    col->insertData("fedcba9876543210", 16);
+
+    auto f = encodeFrame(col.get(), false, false, 2, 2);
+    EXPECT_EQ(f.desc.type, COL_FIXEDN);
+    EXPECT_EQ(f.desc.data_size, 32u);
+    { auto decoded_ = decodeFrame(f, fs_type, 2); EXPECT_TRUE(columnsEqual(*decoded_, *col)); }
+
+    dumpFixture("fixedn_fs16", f.bytes);
+}
+
+TEST(ColumnBinaryWire, UUIDEncodesAsFixedN)
+{
+    auto uuid_type = std::make_shared<DataTypeUUID>();
+    auto col = uuid_type->createColumn();
+    auto & uuids = assert_cast<ColumnVector<UUID> &>(*col);
+    uuids.insertValue(UUID(make_u128(0x0123456789abcdefull, 0xfedcba9876543210ull)));
+    uuids.insertValue(UUID(make_u128(0, 1)));
+
+    auto f = encodeFrame(col.get(), false, false, 2, 2);
+    EXPECT_EQ(f.desc.type, COL_FIXEDN);
+    EXPECT_EQ(f.desc.data_size, 32u); // 2 rows x 16 B
+    { auto decoded_ = decodeFrame(f, uuid_type, 2); EXPECT_TRUE(columnsEqual(*decoded_, *col)); }
+
+    dumpFixture("fixedn_uuid", f.bytes);
+}
+
+TEST(ColumnBinaryWire, IPv6EncodesAsFixedN)
+{
+    auto ipv6_type = std::make_shared<DataTypeIPv6>();
+    auto col = ipv6_type->createColumn();
+    auto & ipv6s = assert_cast<ColumnVector<IPv6> &>(*col);
+    ipv6s.insertValue(IPv6(make_u128(0x20010db800000000ull, 0x0000000000000001ull))); // 2001:db8::1
+    ipv6s.insertValue(IPv6(make_u128(0x20010db800000000ull, 0x0000000000000002ull))); // 2001:db8::2
+
+    auto f = encodeFrame(col.get(), false, false, 2, 2);
+    EXPECT_EQ(f.desc.type, COL_FIXEDN);
+    EXPECT_EQ(f.desc.data_size, 32u);
+    { auto decoded_ = decodeFrame(f, ipv6_type, 2); EXPECT_TRUE(columnsEqual(*decoded_, *col)); }
+
+    dumpFixture("fixedn_ipv6", f.bytes);
+}
+
+TEST(ColumnBinaryWire, Decimal128EncodesAsFixedN)
+{
+    auto dec_type = std::make_shared<DataTypeDecimal<Decimal128>>(38, 4);
+    auto col = dec_type->createColumn();
+    auto & decs = assert_cast<ColumnDecimal<Decimal128> &>(*col);
+    decs.insertValue(Decimal128(Int128(1234567))); // 123.4567 at scale 4
+    decs.insertValue(Decimal128(Int128(-70000)));  // -7.0000
+
+    auto f = encodeFrame(col.get(), false, false, 2, 2);
+    EXPECT_EQ(f.desc.type, COL_FIXEDN);
+    EXPECT_EQ(f.desc.data_size, 32u); // 2 rows x 16 B
+    { auto decoded_ = decodeFrame(f, dec_type, 2); EXPECT_TRUE(columnsEqual(*decoded_, *col)); }
+
+    dumpFixture("fixedn_decimal128", f.bytes);
+}
+
+TEST(ColumnBinaryWire, NullableFixedStringEncodesAsFixedNWithNullMap)
+{
+    auto fs_type = std::make_shared<DataTypeNullable>(std::make_shared<DataTypeFixedString>(16));
+    auto col = fs_type->createColumn();
+    col->insertData("abcdefgh", 8);
+    col->insert(Field{}); // NULL
+    col->insertData("ijklmnop", 8);
+
+    // Nullable reaches buildColDescriptor as the wrapped column, exactly as the
+    // executor hands it over.
+    auto f = encodeFrame(col.get(), false, true, 3, 3);
+    EXPECT_EQ(f.desc.type, COL_FIXEDN | COL_IS_NULLABLE);
+    EXPECT_NE(f.desc.null_offset, 0u);
+    EXPECT_EQ(f.desc.data_size, 48u); // all 3 rows × 16 B written, nulls included
+    { auto decoded_ = decodeFrame(f, fs_type, 3); EXPECT_TRUE(columnsEqual(*decoded_, *col)); }
+
+    dumpFixture("fixedn_fs16_nullable", f.bytes);
+}
+
+TEST(ColumnBinaryWire, ConstFixedString8CarriesConstFlag)
+{
+    // The executor unwraps ColumnConst and passes is_const=true with 1 stored row;
+    // the frame header keeps the block's row count.
+    auto fs_type = std::make_shared<DataTypeFixedString>(8);
+    auto col = fs_type->createColumn();
+    col->insertData("const888", 8);
+
+    auto f = encodeFrame(col.get(), true, false, 1, 5);
+    EXPECT_EQ(f.desc.type, COL_FIXED64 | COL_IS_CONST); // width-classed, see FixedString8UsesWidthClassedFixedTag
+    EXPECT_EQ(f.desc.data_size, 8u); // one stored row, not five
+
+    auto decoded = decodeFrame(f, fs_type, 5);
+    const auto * cnst = typeid_cast<const ColumnConst *>(decoded.get());
+    ASSERT_NE(cnst, nullptr);
+    EXPECT_EQ(cnst->size(), 5u);
+    EXPECT_EQ(cnst->getDataAt(0), "const888");
+
+    dumpFixture("fixedwidth_fs8_const", f.bytes);
+}
+
+TEST(ColumnBinaryWire, ZeroRowFixedStringEncodesEmpty)
+{
+    // Width 16 keeps this in COL_FIXEDN (width ∉ {1,2,4,8}); a zero-row frame is
+    // the only place a guest must divide by row_count and guard zero.
+    auto fs_type = std::make_shared<DataTypeFixedString>(16);
+    auto col = fs_type->createColumn();
+
+    auto f = encodeFrame(col.get(), false, false, 0, 0);
+    EXPECT_EQ(f.desc.type, COL_FIXEDN);
+    EXPECT_EQ(f.desc.data_size, 0u);
+    { auto decoded_ = decodeFrame(f, fs_type, 0); EXPECT_TRUE(columnsEqual(*decoded_, *col)); }
+
+    dumpFixture("fixedn_zero_rows", f.bytes);
+}
+
+// ── COL_LOWCARD: index widths, dictionary-oversize, nullable, const ─────────
+
+namespace
+{
+
+// Builds a LowCardinality(String) column with an index column of the requested
+// width (1/2/4/8). ColumnLowCardinality keeps whatever unsigned index column it
+// is given, and the wire records the width via sizeOfValueIfFixed(), so this
+// pins every branch the guest's decoder must switch over.
+MutableColumnPtr makeLowCardinalityWithStringIndexWidth(UInt8 index_width, const std::vector<std::string> & values)
+{
+    auto holder = ColumnString::create();
+    holder->insertData("", 0); // ColumnUnique slot 0 = the nested default
+    std::unordered_map<std::string, UInt64> slot;
+    for (const auto & v : values)
+    {
+        if (!slot.contains(v))
+        {
+            holder->insertData(v.data(), v.size());
+            slot[v] = holder->size() - 1;
+        }
+    }
+
+    auto unique = DataTypeLowCardinality::createColumnUnique(DataTypeString(), std::move(holder));
+    // ColumnLowCardinality::create takes the unique column as a plain MutableColumnPtr
+    // (same conversion DataTypeLowCardinality::createColumn uses).
+
+    MutableColumnPtr indexes;
+    if (index_width == 1)
+        indexes = ColumnUInt8::create();
+    else if (index_width == 2)
+        indexes = ColumnUInt16::create();
+    else if (index_width == 4)
+        indexes = ColumnUInt32::create();
+    else
+        indexes = ColumnUInt64::create();
+    for (const auto & v : values)
+        indexes->insert(static_cast<UInt64>(slot.at(v)));
+
+    return ColumnLowCardinality::create(std::move(unique), std::move(indexes), false);
+}
+
+void checkLowCardinalityFrame(const EncodedFrame & f, const std::vector<std::string> & values, UInt8 expect_index_width)
+{
+    EXPECT_EQ(f.desc.type & ~uint64_t(COL_IS_CONST), uint64_t(COL_LOWCARD));
+    EXPECT_EQ(f.desc.null_offset, 0u); // nullability never rides on a null map for LC
+
+    const uint8_t * header = f.bytes.data() + f.desc.data_offset;
+    uint32_t dict_row_count = 0;
+    std::memcpy(&dict_row_count, header, 4);
+    EXPECT_EQ(header[4], expect_index_width);
+    // Bytes 5..7 are the memset pad; the dictionary descriptor follows at byte 8.
+    EXPECT_EQ(header[5], 0u);
+    EXPECT_EQ(header[6], 0u);
+    EXPECT_EQ(header[7], 0u);
+
+    // Index values must all be dictionary positions below dict_row_count.
+    for (uint32_t row = 0; row < values.size(); ++row)
+    {
+        uint64_t idx = 0;
+        std::memcpy(&idx, f.bytes.data() + f.desc.offsets_offset + uint64_t(row) * expect_index_width, expect_index_width);
+        EXPECT_LT(idx, dict_row_count);
+    }
+}
+
+} // namespace
+
+TEST(ColumnBinaryWire, LowCardinalityIndexWidthsEncodeAndDecode)
+{
+    const std::vector<std::string> values{"alpha", "beta", "alpha", "gamma", "beta", "alpha"};
+    const DataTypePtr lowcard_string = std::make_shared<DataTypeLowCardinality>(std::make_shared<DataTypeString>());
+
+    for (UInt8 width : {uint8_t(1), uint8_t(2), uint8_t(4), uint8_t(8)})
+    {
+        auto col = makeLowCardinalityWithStringIndexWidth(width, values);
+        auto f = encodeFrame(col.get(), false, false, static_cast<uint32_t>(values.size()), static_cast<uint32_t>(values.size()));
+        checkLowCardinalityFrame(f, values, width);
+        { auto decoded_ = decodeFrame(f, lowcard_string, static_cast<uint32_t>(values.size())); EXPECT_TRUE(columnsEqual(*decoded_, *col))
+            << "index width " << uint32_t(width); }
+
+        dumpFixture("lowcard_string_w" + std::to_string(width), f.bytes);
+    }
+}
+
+TEST(ColumnBinaryWire, LowCardinalityDictionaryCanExceedFrameRows)
+{
+    // ColumnUnique reserves leading special slots, so the dictionary is one row
+    // larger than the distinct values and need not relate to num_rows at all.
+    const std::vector<std::string> values{"only-one-value-here"};
+    auto col = makeLowCardinalityWithStringIndexWidth(1, values);
+
+    const auto & lc = static_cast<const ColumnLowCardinality &>(*col);
+    uint32_t dict_rows = static_cast<uint32_t>(lc.getDictionary().getNestedColumn()->size());
+    EXPECT_GT(dict_rows, 1u);
+
+    auto f = encodeFrame(col.get(), false, false, 1, 1);
+    const uint8_t * header = f.bytes.data() + f.desc.data_offset;
+    uint32_t dict_row_count = 0;
+    std::memcpy(&dict_row_count, header, 4);
+    EXPECT_EQ(dict_row_count, dict_rows);
+    EXPECT_GT(dict_row_count, 1u); // dict_row_count > num_rows — the reachable overflow case
+
+    const DataTypePtr lowcard_string = std::make_shared<DataTypeLowCardinality>(std::make_shared<DataTypeString>());
+    { auto decoded_ = decodeFrame(f, lowcard_string, 1); EXPECT_TRUE(columnsEqual(*decoded_, *col)); }
+
+    dumpFixture("lowcard_dict_gt_rows", f.bytes);
+}
+
+TEST(ColumnBinaryWire, LowCardinalityNullableStringRoundTrip)
+{
+    // The guest treats these as unsupported: null rides on ColumnUnique slot 0 and
+    // the wire does not say the dictionary is nullable. The host still round-trips
+    // it, and the guest-side rejection behaviour is pinned from this dump.
+    auto lowcard_nullable = std::make_shared<DataTypeLowCardinality>(
+        std::make_shared<DataTypeNullable>(std::make_shared<DataTypeString>()));
+    auto col = lowcard_nullable->createColumn();
+    col->insertData("beta", 4);
+    col->insert(Field{}); // NULL — lands on the dictionary's slot 0
+    col->insertData("beta", 4);
+
+    auto f = encodeFrame(col.get(), false, false, 3, 3);
+    EXPECT_EQ(f.desc.type, COL_LOWCARD);
+    EXPECT_EQ(f.desc.null_offset, 0u); // the dictionary null map is never written
+
+    auto decoded = decodeFrame(f, lowcard_nullable, 3);
+    EXPECT_TRUE(columnsEqual(*decoded, *col)) << "LowCardinality(Nullable(String)) round-trip";
+
+    dumpFixture("lowcard_nullable_string", f.bytes);
+}
+
+TEST(ColumnBinaryWire, ConstLowCardinalityString)
+{
+    // ColumnConst(LC): the executor unwraps to the LC column with is_const=true
+    // and a single stored index.
+    const std::vector<std::string> values{"const-value", "const-value"};
+    auto col = makeLowCardinalityWithStringIndexWidth(1, values);
+
+    auto f = encodeFrame(col.get(), true, false, 1, 7);
+    EXPECT_EQ(f.desc.type, COL_LOWCARD | COL_IS_CONST);
+
+    const DataTypePtr lowcard_string = std::make_shared<DataTypeLowCardinality>(std::make_shared<DataTypeString>());
+    auto decoded = decodeFrame(f, lowcard_string, 7);
+    const auto * cnst = typeid_cast<const ColumnConst *>(decoded.get());
+    ASSERT_NE(cnst, nullptr);
+    EXPECT_EQ(cnst->size(), 7u);
+
+    dumpFixture("lowcard_string_const", f.bytes);
+}
+
+// ── Fixture dumps for the WASM guest tests ──────────────────────────────────
+//
+// Every fixture above already writes its frame when COLUMNAR_WIRE_DUMP_DIR is
+// set; these are the plain (non-exotic) frames the guest tests pair against.
+TEST(ColumnBinaryWire, DumpPlainReferenceFrames)
+{
+    {
+        auto col = ColumnString::create();
+        col->insertData("one", 3);
+        col->insertData("two2", 4);
+        auto f = encodeFrame(col.get(), false, false, 2, 2);
+        EXPECT_EQ(f.desc.type, COL_BYTES);
+        dumpFixture("bytes_plain", f.bytes);
+    }
+    {
+        auto col = ColumnUInt64::create();
+        col->insert(11);
+        col->insert(22);
+        auto f = encodeFrame(col.get(), false, false, 2, 2);
+        EXPECT_EQ(f.desc.type, COL_FIXED64);
+        dumpFixture("fixed64_plain", f.bytes);
+    }
 }
