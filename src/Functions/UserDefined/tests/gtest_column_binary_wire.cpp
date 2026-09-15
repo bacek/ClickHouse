@@ -1480,4 +1480,24 @@ TEST(ColumnBinaryWire, DumpPlainReferenceFrames)
         EXPECT_EQ(f.desc.type, COL_FIXED64);
         dumpFixture("fixed64_plain", f.bytes);
     }
+    {
+        // Same column the VariantUInt64String layout test builds: the WASM guest
+        // fixture must show it reading per-row offsets as the uint32 the writer
+        // places there, so the dump has to come from this writer, not a hand job.
+        auto u64_sub = ColumnUInt64::create();
+        u64_sub->getData() = {10, 20};
+        auto str_sub = ColumnString::create();
+        str_sub->insertData("hi", 2);
+        auto disc_col = ColumnVector<UInt8>::create();
+        disc_col->getData() = {0, 1, 0, ColumnVariant::NULL_DISCRIMINATOR};
+        auto offs_col = ColumnVector<UInt64>::create();
+        offs_col->getData() = {0, 0, 1, 0};
+        MutableColumns variants;
+        variants.push_back(std::move(u64_sub));
+        variants.push_back(std::move(str_sub));
+        auto var_col = ColumnVariant::create(std::move(disc_col), std::move(offs_col), std::move(variants));
+        auto f = encodeFrame(var_col.get(), false, false, 4, 4);
+        EXPECT_EQ(f.desc.type, COL_VARIANT);
+        dumpFixture("variant_u64_string", f.bytes);
+    }
 }
