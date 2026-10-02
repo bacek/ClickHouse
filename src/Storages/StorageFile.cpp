@@ -116,7 +116,8 @@ namespace Setting
     extern const SettingsSeconds lock_acquire_timeout;
     extern const SettingsSeconds max_execution_time;
     extern const SettingsMaxThreads max_parsing_threads;
-    extern const SettingsNonZeroUInt64 max_read_buffer_size;
+     extern const SettingsNonZeroUInt64 max_read_buffer_size;
+     extern const SettingsUInt64 max_streams_for_file_reading;
     extern const SettingsBool optimize_count_from_files;
     extern const SettingsUInt64 output_format_compression_level;
     extern const SettingsUInt64 output_format_compression_zstd_window_log;
@@ -2477,6 +2478,10 @@ void ReadFromFile::initializePipeline(QueryPipelineBuilder & pipeline, const Bui
 
     if (max_num_streams > files_to_read)
         num_streams = files_to_read;
+
+    if (const UInt64 max_streams_for_file_reading = getContext()->getSettingsRef()[Setting::max_streams_for_file_reading])
+        if (num_streams > max_streams_for_file_reading)
+            num_streams = max_streams_for_file_reading;
 
     Pipes pipes;
     pipes.reserve(num_streams);

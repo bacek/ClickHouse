@@ -7474,6 +7474,10 @@ Use background I/O pool to read from MergeTree tables. This setting may increase
 If is not zero, limit the number of reading streams for MergeTree table.
 )", 0) \
     \
+    DECLARE(UInt64, max_streams_for_file_reading, 0, R"(
+If is not zero, limit the number of reading streams for the `file` table function and `StorageFile`. Each stream then reads multiple files sequentially via the internal file iterator. Lowering this below the file count reduces per-reader overhead (memory watermark division, prefetcher contention) at the cost of read parallelism. 0 = no cap (one stream per file, up to `max_threads`).
+)", 0) \
+    \
     DECLARE(Bool, force_grouping_standard_compatibility, true, R"(
 Make GROUPING function to return 1 when argument is not used as an aggregation key
 )", 0) \
