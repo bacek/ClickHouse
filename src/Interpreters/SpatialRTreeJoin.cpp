@@ -1,6 +1,8 @@
 #include <Interpreters/SpatialRTreeJoin.h>
 
+#include <algorithm>
 #include <bit>
+#include <cmath>
 #include <cstring>
 #include <limits>
 #include <thread>
@@ -442,6 +444,102 @@ const Block & SpatialRTreeJoin::getTotals() const
     return IJoin::getTotals();
 }
 
+void SpatialRTreeJoin::buildOccupancyGrid()
+{
+    grid_cells.clear();
+    /// A large right side is built in parallel and probed by comparatively few rows;
+    /// a serial grid pass over it would cost more than it saves.
+    static constexpr size_t kMaxGridEntries = 200'000;
+    if (pending_entries.size() > kMaxGridEntries)
+        return;
+    double min_x = std::numeric_limits<double>::infinity();
+    double min_y = min_x;
+    double max_x = -min_x;
+    double max_y = -min_x;
+    for (const auto & [box, pos] : pending_entries)
+    {
+        const double x0 = boost::geometry::get<boost::geometry::min_corner, 0>(box);
+        const double y0 = boost::geometry::get<boost::geometry::min_corner, 1>(box);
+        const double x1 = boost::geometry::get<boost::geometry::max_corner, 0>(box);
+        const double y1 = boost::geometry::get<boost::geometry::max_corner, 1>(box);
+        if (!std::isfinite(x0) || !std::isfinite(y0) || !std::isfinite(x1) || !std::isfinite(y1))
+            continue; /// such an entry is never returned by an intersects query either
+        min_x = std::min(min_x, x0);
+        min_y = std::min(min_y, y0);
+        max_x = std::max(max_x, x1);
+        max_y = std::max(max_y, y1);
+    }
+    if (!(max_x > min_x) || !(max_y > min_y))
+        return;
+
+    const double side = static_cast<double>(kGridSide);
+    grid_min_x = min_x;
+    grid_min_y = min_y;
+    grid_inv_dx = side / (max_x - min_x);
+    grid_inv_dy = side / (max_y - min_y);
+
+    auto cell = [&](double v, double lo, double inv)
+    {
+        const double c = std::floor((v - lo) * inv);
+        return static_cast<size_t>(std::clamp(c, 0.0, side - 1));
+    };
+
+    /// Cap total marking work; a right side of huge boxes gains nothing from the grid.
+    static constexpr size_t kMaxMarkedCells = 4 * kGridSide * kGridSide;
+    size_t marked = 0;
+    std::vector<UInt8> cells(kGridSide * kGridSide, 0);
+    for (const auto & [box, pos] : pending_entries)
+    {
+        const double x0 = boost::geometry::get<boost::geometry::min_corner, 0>(box);
+        const double y0 = boost::geometry::get<boost::geometry::min_corner, 1>(box);
+        const double x1 = boost::geometry::get<boost::geometry::max_corner, 0>(box);
+        const double y1 = boost::geometry::get<boost::geometry::max_corner, 1>(box);
+        if (!std::isfinite(x0) || !std::isfinite(y0) || !std::isfinite(x1) || !std::isfinite(y1))
+            continue;
+        const size_t cx0 = cell(x0, min_x, grid_inv_dx);
+        const size_t cx1 = cell(x1, min_x, grid_inv_dx);
+        const size_t cy0 = cell(y0, min_y, grid_inv_dy);
+        const size_t cy1 = cell(y1, min_y, grid_inv_dy);
+        marked += (cx1 - cx0 + 1) * (cy1 - cy0 + 1);
+        if (marked > kMaxMarkedCells)
+            return;
+        for (size_t cy = cy0; cy <= cy1; ++cy)
+            std::fill(cells.begin() + cy * kGridSide + cx0, cells.begin() + cy * kGridSide + cx1 + 1, UInt8{1});
+    }
+    grid_cells = std::move(cells);
+}
+
+bool SpatialRTreeJoin::gridMayHit(const BGBox & box) const
+{
+    if (grid_cells.empty())
+        return true;
+    const double x0 = boost::geometry::get<boost::geometry::min_corner, 0>(box);
+    const double y0 = boost::geometry::get<boost::geometry::min_corner, 1>(box);
+    const double x1 = boost::geometry::get<boost::geometry::max_corner, 0>(box);
+    const double y1 = boost::geometry::get<boost::geometry::max_corner, 1>(box);
+    if (!std::isfinite(x0) || !std::isfinite(y0) || !std::isfinite(x1) || !std::isfinite(y1))
+        return true;
+    const double side = static_cast<double>(kGridSide);
+    const double fx0 = std::floor((x0 - grid_min_x) * grid_inv_dx);
+    const double fx1 = std::floor((x1 - grid_min_x) * grid_inv_dx);
+    const double fy0 = std::floor((y0 - grid_min_y) * grid_inv_dy);
+    const double fy1 = std::floor((y1 - grid_min_y) * grid_inv_dy);
+    if (fx1 < 0 || fy1 < 0 || fx0 >= side || fy0 >= side)
+        return false; /// entirely outside the right side's extent
+    const size_t cx0 = static_cast<size_t>(std::max(fx0, 0.0));
+    const size_t cx1 = static_cast<size_t>(std::min(fx1, side - 1));
+    const size_t cy0 = static_cast<size_t>(std::max(fy0, 0.0));
+    const size_t cy1 = static_cast<size_t>(std::min(fy1, side - 1));
+    for (size_t cy = cy0; cy <= cy1; ++cy)
+    {
+        const UInt8 * row = grid_cells.data() + cy * kGridSide;
+        for (size_t cx = cx0; cx <= cx1; ++cx)
+            if (row[cx])
+                return true;
+    }
+    return false;
+}
+
 void SpatialRTreeJoin::runPostBuildPhase()
 {
     /// Bulk-load sub-trees in parallel using the packing (STR) algorithm.
@@ -458,6 +556,8 @@ void SpatialRTreeJoin::runPostBuildPhase()
     const size_t n = pending_entries.size();
     if (n == 0)
         return;
+
+    buildOccupancyGrid();
 
     static constexpr size_t kParallelThreshold = 200'000;
     const size_t num_parts = (n <= kParallelThreshold)
@@ -903,6 +1003,9 @@ JoinResultPtr SpatialRTreeJoin::joinBlock(Block left_block)
                 BGPoint{boost::geometry::get<boost::geometry::max_corner, 0>(bbox) + bbox_expand,
                         boost::geometry::get<boost::geometry::max_corner, 1>(bbox) + bbox_expand}};
         }
+
+        if (!gridMayHit(bbox))
+            continue;
 
         for (const auto & sub_tree : sub_trees)
         {

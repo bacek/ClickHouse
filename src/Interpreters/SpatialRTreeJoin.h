@@ -175,6 +175,16 @@ private:
     /// empty-result queries dominate and their cost scales with tree depth not output.
     std::vector<RTree> sub_trees;
 
+    /// Coarse occupancy grid over the right side's bounding boxes, built with the trees.
+    /// A probe whose (expanded) box touches no occupied cell cannot hit any tree, so
+    /// the tree walk is skipped; for a selective join that is nearly every probe row.
+    /// Empty `grid_cells` means the grid is disabled and every probe walks the trees.
+    static constexpr size_t kGridSide = 1024;
+    std::vector<UInt8> grid_cells;
+    double grid_min_x = 0, grid_min_y = 0, grid_inv_dx = 0, grid_inv_dy = 0;
+    bool gridMayHit(const BGBox & box) const;
+    void buildOccupancyGrid();
+
     size_t total_right_rows = 0;
     size_t total_right_bytes = 0;
 
