@@ -569,7 +569,7 @@ void SpatialRTreeJoin::runPostBuildPhase()
     /// region: a probe is rejected at the root of every tree it cannot touch instead of
     /// descending into all of them. Above it, the serial top-level nth_element costs more
     /// than probing saves, so slices stay contiguous in arrival order.
-    static constexpr size_t kMaxPartitionedEntries = 10'000'000;
+    static constexpr size_t kMaxPartitionedEntries = 1'000'000;
     auto build_slice = [this](size_t part, size_t begin, size_t end)
     {
         sub_trees[part] = RTree(pending_entries.begin() + begin, pending_entries.begin() + end);
