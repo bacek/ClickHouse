@@ -49,6 +49,7 @@ public:
     SpatialRTreeJoin(std::shared_ptr<TableJoin> table_join_, SharedHeader right_header_, double bbox_expand_ = 0.0);
 
     std::string getName() const override { return "SpatialRTreeJoin"; }
+    std::string getAlgorithm() const override { return "SPATIAL_RTREE"; }
     const TableJoin & getTableJoin() const override { return *table_join; }
 
     /// Parallel join is safe for all kinds.  For RIGHT JOIN the matched bitmap uses

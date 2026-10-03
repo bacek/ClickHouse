@@ -31,6 +31,7 @@ public:
         SharedHeader right_header_);
 
     std::string getName() const override { return "SpatialRTreeDoubleJoin"; }
+    std::string getAlgorithm() const override { return "SPATIAL_RTREE"; }
 
     JoinResultPtr joinBlock(Block left_block) override;
 
