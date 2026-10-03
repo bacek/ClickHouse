@@ -116,10 +116,15 @@ public:
         int expand_arg_index,
         double & out_bbox_expand);
 
-protected:
     using BGPoint = boost::geometry::model::d2::point_xy<double>;
     using BGBox   = boost::geometry::model::box<BGPoint>;
 
+    /// Scan raw WKB/EWKB bytes and return the bounding box without constructing
+    /// any geometry object. Handles 2D and 3D (Z/M) coordinates, EWKB SRID flag,
+    /// ISO WKB 3D type codes (1001-3007), and recursive multi-geometries.
+    static BGBox wkbBBox(std::string_view wkb);
+
+protected:
     struct RightPos
     {
         UInt32 block_idx;
@@ -130,10 +135,6 @@ protected:
         std::pair<BGBox, RightPos>,
         boost::geometry::index::quadratic<16>>;
 
-    /// Scan raw WKB/EWKB bytes and return the bounding box without constructing
-    /// any geometry object. Handles 2D and 3D (Z/M) coordinates, EWKB SRID flag,
-    /// ISO WKB 3D type codes (1001-3007), and recursive multi-geometries.
-    static BGBox wkbBBox(std::string_view wkb);
 
     const Block & getRightBlock(size_t idx) const { return right_blocks[idx]; }
     size_t rightBlocksCount() const { return right_blocks.size(); }

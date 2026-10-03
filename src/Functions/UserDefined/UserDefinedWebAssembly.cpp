@@ -11,6 +11,9 @@
 #include <Columns/ColumnArray.h>
 #include <Columns/ColumnConst.h>
 #include <Columns/ColumnString.h>
+#include <Columns/ColumnsNumber.h>
+#include <Interpreters/SpatialRTreeJoin.h>
+#include <Columns/ColumnString.h>
 #include <Columns/ColumnNullable.h>
 #include <Columns/ColumnMap.h>
 #include <Columns/ColumnLowCardinality.h>
@@ -1311,77 +1314,85 @@ public:
             // batch can still build an oversized guest buffer.
             if (const auto * cv1 = dynamic_cast<const UserDefinedWebAssemblyFunctionColumnarV1 *>(user_defined_function.get()))
             {
-                auto stop_token = interrupt_source.get_token();
-                auto expected_col = user_defined_function->getResultType()->createColumn();
-                MutableColumnPtr result_column = user_defined_function->getResultType()->createColumn();
-
-                auto flush_columnar_batch = [&](size_t batch_start, size_t end_idx)
+                auto run_columnar = [&](const ColumnsWithTypeAndName & args, size_t rows) -> ColumnPtr
                 {
-                    if (end_idx <= batch_start)
-                        return;
-                    size_t batch_size = end_idx - batch_start;
-                    /// The batch is serialized straight out of `arguments` at `batch_start`; only a
-                    /// column whose layout cannot be read from a row offset is sliced, and that
-                    /// happens per column inside the layout pass.
-                    auto result = cv1->executeColumnar(
-                        compartment_ptr, arguments, batch_size, context, stop_token, batch_start);
-                    ProfileEventTimeIncrement<Microseconds> timer_assembly(ProfileEvents::WasmResultAssemblyMicroseconds);
-                    // A guest that set COL_IS_CONST legitimately returns a ColumnConst; structureEquals
-                    // only holds between two ColumnConst instances, so compare the unwrapped nested
-                    // column against expected_col instead of rejecting every valid const result.
-                    const IColumn * result_for_check = result.get();
-                    if (const auto * result_const = typeid_cast<const ColumnConst *>(result_for_check))
-                        result_for_check = &result_const->getDataColumn();
-                    if (!result_for_check->structureEquals(*expected_col))
-                        throw Exception(ErrorCodes::WASM_ERROR,
-                            "COLUMNAR_V1: returned column structure {} does not match declared type {}",
-                            result->dumpStructure(),
-                            user_defined_function->getResultType()->getName());
-                    // A ColumnConst batch result must be materialized before it's accumulated:
-                    // ColumnConst::insertRangeFrom only bumps the row count, it doesn't copy in
-                    // the source's actual value, so concatenating a later (possibly different)
-                    // batch into a ColumnConst accumulator would silently keep repeating the
-                    // first batch's value for every row appended afterwards.
-                    result = IColumn::mutate(result->convertToFullColumnIfConst());
-                    if (result_column->empty())
-                        result_column = result->assumeMutable();
-                    else
-                        result_column->insertRangeFrom(*result, 0, result->size());
+                    auto stop_token = interrupt_source.get_token();
+                    auto expected_col = user_defined_function->getResultType()->createColumn();
+                    MutableColumnPtr result_column = user_defined_function->getResultType()->createColumn();
+
+                    auto flush_columnar_batch = [&](size_t batch_start, size_t end_idx)
+                    {
+                        if (end_idx <= batch_start)
+                            return;
+                        size_t batch_size = end_idx - batch_start;
+                        /// The batch is serialized straight out of `args` at `batch_start`; only a
+                        /// column whose layout cannot be read from a row offset is sliced, and that
+                        /// happens per column inside the layout pass.
+                        auto result = cv1->executeColumnar(
+                            compartment_ptr, args, batch_size, context, stop_token, batch_start);
+                        ProfileEventTimeIncrement<Microseconds> timer_assembly(ProfileEvents::WasmResultAssemblyMicroseconds);
+                        // A guest that set COL_IS_CONST legitimately returns a ColumnConst; structureEquals
+                        // only holds between two ColumnConst instances, so compare the unwrapped nested
+                        // column against expected_col instead of rejecting every valid const result.
+                        const IColumn * result_for_check = result.get();
+                        if (const auto * result_const = typeid_cast<const ColumnConst *>(result_for_check))
+                            result_for_check = &result_const->getDataColumn();
+                        if (!result_for_check->structureEquals(*expected_col))
+                            throw Exception(ErrorCodes::WASM_ERROR,
+                                "COLUMNAR_V1: returned column structure {} does not match declared type {}",
+                                result->dumpStructure(),
+                                user_defined_function->getResultType()->getName());
+                        // A ColumnConst batch result must be materialized before it's accumulated:
+                        // ColumnConst::insertRangeFrom only bumps the row count, it doesn't copy in
+                        // the source's actual value, so concatenating a later (possibly different)
+                        // batch into a ColumnConst accumulator would silently keep repeating the
+                        // first batch's value for every row appended afterwards.
+                        result = IColumn::mutate(result->convertToFullColumnIfConst());
+                        if (result_column->empty())
+                            result_column = result->assumeMutable();
+                        else
+                            result_column->insertRangeFrom(*result, 0, result->size());
+                    };
+
+                    const size_t fixed_block_size = context->getSettingsRef()[Setting::webassembly_udf_max_input_block_size];
+                    if (fixed_block_size > 0)
+                    {
+                        for (size_t start = 0; start < rows; start += fixed_block_size)
+                            flush_columnar_batch(start, std::min(start + fixed_block_size, rows));
+                        return result_column;
+                    }
+
+                    // Sized against the same budget as the buffered path below, and by the same walk,
+                    // so that both ABIs hand the guest calls of comparable size. What differs is only
+                    // how a candidate is measured: this frame is built here rather than by an output
+                    // format, so the walk is given the layout pass that sizes the real allocation.
+                    const std::optional<size_t> budget = getInputBudget(compartment_ptr, fixed_block_size);
+                    if (!budget)
+                    {
+                        flush_columnar_batch(0, rows);
+                        return result_column;
+                    }
+
+                    const BatchMeasurer measure_columnar
+                        = [cv1](const ColumnsWithTypeAndName & batch_cols, size_t start_idx, size_t length,
+                                const std::vector<size_t> & declared_positions) // STYLE_CHECK_ALLOW_STD_CONTAINERS
+                        { return cv1->measureColumnarBytes(batch_cols, start_idx, length, declared_positions); };
+
+                    size_t batch_start = 0;
+                    while (batch_start < rows)
+                    {
+                        const size_t batch_rows
+                            = chooseBatchRows(args, batch_start, rows - batch_start, *budget, measure_columnar);
+                        flush_columnar_batch(batch_start, batch_start + batch_rows);
+                        batch_start += batch_rows;
+                    }
+                    return result_column;
+            
                 };
 
-                const size_t fixed_block_size = context->getSettingsRef()[Setting::webassembly_udf_max_input_block_size];
-                if (fixed_block_size > 0)
-                {
-                    for (size_t start = 0; start < input_rows_count; start += fixed_block_size)
-                        flush_columnar_batch(start, std::min(start + fixed_block_size, input_rows_count));
-                    return result_column;
-                }
-
-                // Sized against the same budget as the buffered path below, and by the same walk,
-                // so that both ABIs hand the guest calls of comparable size. What differs is only
-                // how a candidate is measured: this frame is built here rather than by an output
-                // format, so the walk is given the layout pass that sizes the real allocation.
-                const std::optional<size_t> budget = getInputBudget(compartment_ptr, fixed_block_size);
-                if (!budget)
-                {
-                    flush_columnar_batch(0, input_rows_count);
-                    return result_column;
-                }
-
-                const BatchMeasurer measure_columnar
-                    = [cv1](const ColumnsWithTypeAndName & batch_cols, size_t start_idx, size_t length,
-                            const std::vector<size_t> & declared_positions) // STYLE_CHECK_ALLOW_STD_CONTAINERS
-                    { return cv1->measureColumnarBytes(batch_cols, start_idx, length, declared_positions); };
-
-                size_t batch_start = 0;
-                while (batch_start < input_rows_count)
-                {
-                    const size_t batch_rows
-                        = chooseBatchRows(arguments, batch_start, input_rows_count - batch_start, *budget, measure_columnar);
-                    flush_columnar_batch(batch_start, batch_start + batch_rows);
-                    batch_start += batch_rows;
-                }
-                return result_column;
+                if (auto prefiltered = tryBboxPrefilter(arguments, input_rows_count, run_columnar))
+                    return prefiltered;
+                return run_columnar(arguments, input_rows_count);
             }
 
             return execute(compartment_ptr, arguments, input_rows_count);
@@ -1393,6 +1404,130 @@ public:
             compartment_entry.expire();
             throw;
         }
+    }
+
+    /// Spatial predicates declare `bbox_disjoint_result`: the answer they give whenever the two
+    /// geometries' bounding boxes (the constant's expanded by `spatial_expand_arg`) are disjoint.
+    /// When one geometry is constant, those rows are answered here from a native bbox scan of
+    /// the WKB and only the remaining candidates are serialized into the guest. Returns nullptr
+    /// when the shortcut does not apply or would not pay (most rows are candidates anyway).
+    template <typename RunColumnar>
+    ColumnPtr tryBboxPrefilter(const ColumnsWithTypeAndName & args, size_t rows, RunColumnar && run_columnar) const
+    {
+        if (rows == 0 || args.size() < 2)
+            return nullptr;
+        const Field disjoint_field = user_defined_function->getSettings().getValue("bbox_disjoint_result");
+        if (disjoint_field.isNull())
+            return nullptr;
+        const Int64 disjoint_result = disjoint_field.safeGet<Int64>();
+        if (disjoint_result != 0 && disjoint_result != 1)
+            return nullptr;
+        if (!WhichDataType(removeNullable(user_defined_function->getResultType())).isUInt8())
+            return nullptr;
+
+        const bool const0 = isColumnConst(*args[0].column);
+        const bool const1 = isColumnConst(*args[1].column);
+        if (const0 == const1)
+            return nullptr;
+        const size_t const_idx = const0 ? 0 : 1;
+        const IColumn * varying_column = args[1 - const_idx].column.get();
+        const NullMap * varying_nulls = nullptr;
+        if (const auto * nullable = typeid_cast<const ColumnNullable *>(varying_column))
+        {
+            varying_column = &nullable->getNestedColumn();
+            varying_nulls = &nullable->getNullMapData();
+        }
+        const auto * varying = typeid_cast<const ColumnString *>(varying_column);
+        const auto * constant = typeid_cast<const ColumnConst *>(args[const_idx].column.get());
+        if (!varying || !constant || !typeid_cast<const ColumnString *>(&constant->getDataColumn()))
+            return nullptr;
+
+        double expand = 0.0;
+        if (const int expand_idx = getSpatialExpandArg(); expand_idx >= 0)
+        {
+            if (static_cast<size_t>(expand_idx) >= args.size() || !isColumnConst(*args[expand_idx].column))
+                return nullptr;
+            expand = args[expand_idx].column->getFloat64(0);
+            if (!(expand >= 0.0))
+                return nullptr;
+        }
+
+        double cminx, cminy, cmaxx, cmaxy;
+        try
+        {
+            const auto cbox = SpatialRTreeJoin::wkbBBox(constant->getDataAt(0));
+            cminx = boost::geometry::get<boost::geometry::min_corner, 0>(cbox) - expand;
+            cminy = boost::geometry::get<boost::geometry::min_corner, 1>(cbox) - expand;
+            cmaxx = boost::geometry::get<boost::geometry::max_corner, 0>(cbox) + expand;
+            cmaxy = boost::geometry::get<boost::geometry::max_corner, 1>(cbox) + expand;
+        }
+        catch (...)
+        {
+            /// A constant the scanner cannot read is left to the guest, which reports it properly.
+            return nullptr;
+        }
+
+        IColumn::Filter candidate(rows);
+        size_t num_candidates = 0;
+        for (size_t i = 0; i < rows; ++i)
+        {
+            bool is_candidate = true;
+            if (varying_nulls && (*varying_nulls)[i])
+            {
+                /// NULL semantics belong to the guest.
+                candidate[i] = 1;
+                ++num_candidates;
+                continue;
+            }
+            try
+            {
+                const auto rbox = SpatialRTreeJoin::wkbBBox(varying->getDataAt(i));
+                /// Written so that NaN coordinates (empty geometries) stay candidates: only a
+                /// provably separated pair is answered on the host.
+                is_candidate = !(boost::geometry::get<boost::geometry::max_corner, 0>(rbox) < cminx
+                    || boost::geometry::get<boost::geometry::min_corner, 0>(rbox) > cmaxx
+                    || boost::geometry::get<boost::geometry::max_corner, 1>(rbox) < cminy
+                    || boost::geometry::get<boost::geometry::min_corner, 1>(rbox) > cmaxy);
+            }
+            catch (...)
+            {
+                /// Malformed or unsupported WKB goes to the guest so its own error surfaces.
+                is_candidate = true;
+            }
+            candidate[i] = is_candidate;
+            num_candidates += is_candidate;
+        }
+
+        if (num_candidates * 2 > rows)
+            return nullptr;
+
+        const Field disjoint_value = static_cast<UInt64>(disjoint_result);
+        if (num_candidates == 0)
+        {
+            auto result = user_defined_function->getResultType()->createColumn();
+            result->reserve(rows);
+            for (size_t i = 0; i < rows; ++i)
+                result->insert(disjoint_value);
+            return result;
+        }
+
+        ColumnsWithTypeAndName filtered = args;
+        for (auto & col : filtered)
+            col.column = col.column->filter(candidate, num_candidates);
+        ColumnPtr sub = run_columnar(filtered, num_candidates)->convertToFullColumnIfConst();
+        if (sub->size() != num_candidates)
+            return nullptr;
+
+        auto result = sub->cloneEmpty();
+        result->reserve(rows);
+        for (size_t i = 0, j = 0; i < rows; ++i)
+        {
+            if (candidate[i])
+                result->insertFrom(*sub, j++);
+            else
+                result->insert(disjoint_value);
+        }
+        return result;
     }
 
     ColumnPtr executeImplDryRun(const ColumnsWithTypeAndName & arguments, const DataTypePtr & result_type, size_t input_rows_count) const override
@@ -3072,6 +3207,11 @@ struct WebAssemblyFunctionSettingsConstraits : public IHints<>
         /// argument. SpatialRTreeJoin expands the R-tree query bbox by this amount.
         /// -1 (default) means no expansion.
         {"spatial_expand_arg", SettingInt64{}.withDefault(-1)},
+        /// For a two-geometry predicate: the UInt8 it returns whenever the two bounding boxes are
+        /// disjoint (after expanding by `spatial_expand_arg`). When one geometry argument is
+        /// constant, rows whose bbox misses the constant's are answered with this value on the
+        /// host and never shipped to the guest. -1 (default) disables the shortcut.
+        {"bbox_disjoint_result", SettingInt64{}.withDefault(-1)},
         /// Registers the WASM function as an aggregate function: arguments are received
         /// as Array(T) accumulating all rows in the group instead of per-row scalars.
         {"is_aggregate", SettingBool{}.withDefault(false)},
