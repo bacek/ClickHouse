@@ -1395,7 +1395,11 @@ public:
                 return run_columnar(arguments, input_rows_count);
             }
 
-            return execute(compartment_ptr, arguments, input_rows_count);
+            auto run_buffered = [&](const ColumnsWithTypeAndName & args, size_t rows) -> ColumnPtr
+            { return execute(compartment_ptr, args, rows); };
+            if (auto prefiltered = tryBboxPrefilter(arguments, input_rows_count, run_buffered))
+                return prefiltered;
+            return run_buffered(arguments, input_rows_count);
         }
         catch (...)
         {
@@ -1411,8 +1415,8 @@ public:
     /// When one geometry is constant, those rows are answered here from a native bbox scan of
     /// the WKB and only the remaining candidates are serialized into the guest. Returns nullptr
     /// when the shortcut does not apply or would not pay (most rows are candidates anyway).
-    template <typename RunColumnar>
-    ColumnPtr tryBboxPrefilter(const ColumnsWithTypeAndName & args, size_t rows, RunColumnar && run_columnar) const
+    template <typename RunGuest>
+    ColumnPtr tryBboxPrefilter(const ColumnsWithTypeAndName & args, size_t rows, RunGuest && run_guest) const
     {
         if (rows == 0 || args.size() < 2)
             return nullptr;
@@ -1514,7 +1518,7 @@ public:
         ColumnsWithTypeAndName filtered = args;
         for (auto & col : filtered)
             col.column = col.column->filter(candidate, num_candidates);
-        ColumnPtr sub = run_columnar(filtered, num_candidates)->convertToFullColumnIfConst();
+        ColumnPtr sub = run_guest(filtered, num_candidates)->convertToFullColumnIfConst();
         if (sub->size() != num_candidates)
             return nullptr;
 
