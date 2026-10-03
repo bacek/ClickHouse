@@ -4,6 +4,7 @@
 #include <bit>
 #include <cmath>
 #include <cstring>
+#include <functional>
 #include <limits>
 #include <thread>
 
@@ -547,9 +548,7 @@ void SpatialRTreeJoin::runPostBuildPhase()
     /// so no locking is needed here or in joinBlock() when reading sub_trees.
     ///
     /// Splitting into K chunks and building K trees in parallel eliminates the long
-    /// single-CPU period that precedes parallel probe when the right side is large (e.g.
-    /// 60M trip points).  Each sub-tree covers a contiguous slice of the spatially-unsorted
-    /// pending_entries, so query overhead is O(K × log(N/K)) instead of O(log N).
+    /// single-CPU period that precedes parallel probe when the right side is large.
     ///
     /// For small right sides (≤ 200K entries) the build is already fast and the per-lookup
     /// cost of querying K trees instead of 1 dominates; use a single tree in that case.
@@ -565,21 +564,58 @@ void SpatialRTreeJoin::runPostBuildPhase()
         : std::max(size_t{1}, std::min(static_cast<size_t>(std::thread::hardware_concurrency()), n));
     sub_trees.resize(num_parts);
 
-    const size_t chunk = (n + num_parts - 1) / num_parts;
-    std::vector<std::thread> threads;
-    threads.reserve(num_parts);
-    for (size_t t = 0; t < num_parts; ++t)
+    /// Up to kMaxPartitionedEntries, partition entries into spatially disjoint slices
+    /// (kd bisection on box centres, alternating axes), so each sub-tree covers its own
+    /// region: a probe is rejected at the root of every tree it cannot touch instead of
+    /// descending into all of them. Above it, the serial top-level nth_element costs more
+    /// than probing saves, so slices stay contiguous in arrival order.
+    static constexpr size_t kMaxPartitionedEntries = 10'000'000;
+    auto build_slice = [this](size_t part, size_t begin, size_t end)
     {
-        const size_t begin = t * chunk;
-        const size_t end   = std::min(begin + chunk, n);
-        threads.emplace_back([this, begin, end, t]
-        {
-            sub_trees[t] = RTree(pending_entries.begin() + begin,
-                                  pending_entries.begin() + end);
-        });
+        sub_trees[part] = RTree(pending_entries.begin() + begin, pending_entries.begin() + end);
+    };
+
+    if (n > kMaxPartitionedEntries)
+    {
+        const size_t chunk = (n + num_parts - 1) / num_parts;
+        std::vector<std::thread> threads;
+        threads.reserve(num_parts);
+        for (size_t t = 0; t < num_parts; ++t)
+            threads.emplace_back(build_slice, t, t * chunk, std::min(t * chunk + chunk, n));
+        for (auto & th : threads)
+            th.join();
     }
-    for (auto & th : threads)
-        th.join();
+    else
+    {
+        auto centre = [](const BGBox & box, int axis)
+        {
+            /// NaN would break nth_element's strict weak ordering; such boxes are never hit anyway.
+            const double c = axis == 0
+                ? boost::geometry::get<boost::geometry::min_corner, 0>(box) + boost::geometry::get<boost::geometry::max_corner, 0>(box)
+                : boost::geometry::get<boost::geometry::min_corner, 1>(box) + boost::geometry::get<boost::geometry::max_corner, 1>(box);
+            return std::isnan(c) ? std::numeric_limits<double>::infinity() : c;
+        };
+        /// Each leaf of the bisection builds its sub-tree on the thread that produced it.
+        std::function<void(size_t, size_t, size_t, size_t, int)> partition_and_build
+            = [&](size_t begin, size_t end, size_t first_part, size_t parts, int axis)
+        {
+            if (parts == 1)
+            {
+                build_slice(first_part, begin, end);
+                return;
+            }
+            const size_t left_parts = parts / 2;
+            const size_t mid = begin + (end - begin) * left_parts / parts;
+            std::nth_element(
+                pending_entries.begin() + begin, pending_entries.begin() + mid, pending_entries.begin() + end,
+                [&](const auto & a, const auto & b) { return centre(a.first, axis) < centre(b.first, axis); });
+            std::thread left([&, begin, mid, first_part, left_parts, axis]
+                             { partition_and_build(begin, mid, first_part, left_parts, 1 - axis); });
+            partition_and_build(mid, end, first_part + left_parts, parts - left_parts, 1 - axis);
+            left.join();
+        };
+        partition_and_build(0, n, 0, num_parts, 0);
+    }
 
     pending_entries.clear();
     pending_entries.shrink_to_fit();
