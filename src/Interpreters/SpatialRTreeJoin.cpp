@@ -700,6 +700,26 @@ JoinResultPtr SpatialRTreeJoin::joinBlock(Block left_block)
         col_sources.push_back({left_block.has(col_def.name), col_def.name});
     }
 
+    /// Column pointers resolved once: the per-candidate loops below would otherwise look every
+    /// column up by name for every row they copy.
+    std::unordered_map<String, std::vector<const IColumn *>> right_columns_by_name;
+    for (const auto & rcd : *right_header)
+    {
+        auto & per_block = right_columns_by_name[rcd.name];
+        per_block.reserve(right_blocks.size());
+        for (const auto & rb : right_blocks)
+            per_block.push_back(rb.has(rcd.name) ? rb.getByName(rcd.name).column.get() : nullptr);
+    }
+    std::vector<const IColumn *> out_left_columns(n_out_cols, nullptr);
+    std::vector<const std::vector<const IColumn *> *> out_right_columns(n_out_cols, nullptr);
+    for (size_t i = 0; i < n_out_cols; ++i)
+    {
+        if (col_sources[i].from_left)
+            out_left_columns[i] = left_block.getByName(col_sources[i].name).column.get();
+        else
+            out_right_columns[i] = &right_columns_by_name.at(col_sources[i].name);
+    }
+
     MutableColumns mutable_cols(n_out_cols);
     for (size_t i = 0; i < n_out_cols; ++i)
         mutable_cols[i] = IColumn::mutate(output.getByPosition(i).column);
@@ -709,6 +729,12 @@ JoinResultPtr SpatialRTreeJoin::joinBlock(Block left_block)
     /// byte writes.  Multiple probe threads may race to set the same byte to 1, but since
     /// all writers write the same value the race is benign.  getNonJoinedBlocks() reads
     /// the bitmap only after all joinBlock() calls have returned (pipeline barrier).
+
+    /// Only the columns the spatial predicate reads are copied into its input block; the rest
+    /// of a candidate row is materialised once, at output, and only if it matched.
+    NameSet predicate_required;
+    for (const auto & name : table_join->getMixedJoinExpression()->getRequiredColumns())
+        predicate_required.insert(name);
 
     NameSet pre_filter_required;
     if (pre_filter_expr)
@@ -779,15 +805,35 @@ JoinResultPtr SpatialRTreeJoin::joinBlock(Block left_block)
 
         const size_t n = cands.size();
 
-        // Count unique right rows to decide which side becomes ColumnConst.
-        std::unordered_map<uint64_t, std::vector<size_t>> right_groups;
-        right_groups.reserve(std::min(n, static_cast<size_t>(4096)));
+        // Candidates are appended in ascending left_row order, so each left row's candidates form one
+        // contiguous run. When runs are long (few left rows, many hits each), grouping by left is the
+        // obvious choice and the per-candidate hash of right rows below would only cost time.
+        size_t left_runs = 0;
+        bool left_sorted = true;
         for (size_t ci = 0; ci < n; ++ci)
         {
-            uint64_t key = static_cast<uint64_t>(cands[ci].block_idx) * 0x100000000ULL + cands[ci].row_idx;
-            right_groups[key].push_back(ci);
+            if (ci == 0 || cands[ci].left_row != cands[ci - 1].left_row)
+            {
+                ++left_runs;
+                if (ci != 0 && cands[ci].left_row < cands[ci - 1].left_row)
+                    left_sorted = false;
+            }
         }
-        const bool group_by_right = right_groups.size() <= left_rows;
+        static constexpr size_t kMinAverageLeftRun = 4;
+        const bool group_by_left_runs = left_sorted && left_runs * kMinAverageLeftRun <= n;
+
+        // Count unique right rows to decide which side becomes ColumnConst.
+        std::unordered_map<uint64_t, std::vector<size_t>> right_groups;
+        if (!group_by_left_runs)
+        {
+            right_groups.reserve(std::min(n, static_cast<size_t>(4096)));
+            for (size_t ci = 0; ci < n; ++ci)
+            {
+                uint64_t key = static_cast<uint64_t>(cands[ci].block_idx) * 0x100000000ULL + cands[ci].row_idx;
+                right_groups[key].push_back(ci);
+            }
+        }
+        const bool group_by_right = !group_by_left_runs && right_groups.size() <= left_rows;
 
         IColumn::Filter mask(n, 0);
 
@@ -802,6 +848,8 @@ JoinResultPtr SpatialRTreeJoin::joinBlock(Block left_block)
                 Block pred_block;
                 for (const auto & src_col : left_block)
                 {
+                    if (!predicate_required.contains(src_col.name))
+                        continue;
                     auto data = src_col.type->createColumn();
                     data->reserve(k);
                     for (size_t ci : indices)
@@ -810,7 +858,7 @@ JoinResultPtr SpatialRTreeJoin::joinBlock(Block left_block)
                 }
                 for (const auto & rcd : *right_header)
                 {
-                    if (pred_block.has(rcd.name))
+                    if (pred_block.has(rcd.name) || !predicate_required.contains(rcd.name))
                         continue;
                     ColumnPtr single = rb.getByName(rcd.name).column->cut(c0.row_idx, 1);
                     pred_block.insert({ColumnConst::create(std::move(single), k), rcd.type, rcd.name});
@@ -828,10 +876,25 @@ JoinResultPtr SpatialRTreeJoin::joinBlock(Block left_block)
         }
         else
         {
-            std::unordered_map<size_t, std::vector<size_t>> left_groups;
-            left_groups.reserve(left_rows);
-            for (size_t ci = 0; ci < n; ++ci)
-                left_groups[cands[ci].left_row].push_back(ci);
+            std::vector<std::pair<size_t, std::vector<size_t>>> left_groups;
+            if (group_by_left_runs)
+            {
+                left_groups.reserve(left_runs);
+                for (size_t ci = 0; ci < n; ++ci)
+                {
+                    if (ci == 0 || cands[ci].left_row != cands[ci - 1].left_row)
+                        left_groups.emplace_back(cands[ci].left_row, std::vector<size_t>{});
+                    left_groups.back().second.push_back(ci);
+                }
+            }
+            else
+            {
+                std::unordered_map<size_t, std::vector<size_t>> by_left_row;
+                by_left_row.reserve(left_rows);
+                for (size_t ci = 0; ci < n; ++ci)
+                    by_left_row[cands[ci].left_row].push_back(ci);
+                left_groups.assign(std::make_move_iterator(by_left_row.begin()), std::make_move_iterator(by_left_row.end()));
+            }
 
             for (const auto & [left_row, indices] : left_groups)
             {
@@ -839,19 +902,20 @@ JoinResultPtr SpatialRTreeJoin::joinBlock(Block left_block)
                 Block pred_block;
                 for (const auto & src_col : left_block)
                 {
+                    if (!predicate_required.contains(src_col.name))
+                        continue;
                     ColumnPtr single = src_col.column->cut(left_row, 1);
                     pred_block.insert({ColumnConst::create(std::move(single), k), src_col.type, src_col.name});
                 }
                 for (const auto & rcd : *right_header)
                 {
-                    if (pred_block.has(rcd.name))
+                    if (pred_block.has(rcd.name) || !predicate_required.contains(rcd.name))
                         continue;
                     auto data = rcd.type->createColumn();
                     data->reserve(k);
+                    const auto & source = right_columns_by_name.at(rcd.name);
                     for (size_t ci : indices)
-                        data->insertFrom(
-                            *right_blocks[cands[ci].block_idx].getByName(rcd.name).column,
-                            cands[ci].row_idx);
+                        data->insertFrom(*source[cands[ci].block_idx], cands[ci].row_idx);
                     pred_block.insert({std::move(data), rcd.type, rcd.name});
                 }
                 {
@@ -877,11 +941,10 @@ JoinResultPtr SpatialRTreeJoin::joinBlock(Block left_block)
                 __atomic_store_n(&right_matched_per_block[c.block_idx][c.row_idx], '\1', __ATOMIC_RELAXED);
             for (size_t i = 0; i < n_out_cols; ++i)
             {
-                if (col_sources[i].from_left)
-                    mutable_cols[i]->insertFrom(*left_block.getByName(col_sources[i].name).column, c.left_row);
+                if (out_left_columns[i])
+                    mutable_cols[i]->insertFrom(*out_left_columns[i], c.left_row);
                 else
-                    mutable_cols[i]->insertFrom(
-                        *right_blocks[c.block_idx].getByName(col_sources[i].name).column, c.row_idx);
+                    mutable_cols[i]->insertFrom(*(*out_right_columns[i])[c.block_idx], c.row_idx);
             }
         }
 
