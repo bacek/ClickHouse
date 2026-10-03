@@ -1016,10 +1016,11 @@ JoinResultPtr SpatialRTreeJoin::joinBlock(Block left_block)
                 {
                     if (!pre_filter_required.contains(rcd.name) || pre_block.has(rcd.name))
                         continue;
+                    const auto & src_columns = right_columns_by_name.at(rcd.name);
                     auto col = rcd.type->createColumn();
                     col->reserve(k);
                     for (size_t j = h; j < chunk_end; ++j)
-                        col->insertFrom(*right_blocks[row_hits[j].second.block_idx].getByName(rcd.name).column, row_hits[j].second.row_idx);
+                        col->insertFrom(*src_columns[row_hits[j].second.block_idx], row_hits[j].second.row_idx);
                     pre_block.insert({std::move(col), rcd.type, rcd.name});
                 }
                 pre_filter_expr->execute(pre_block);
@@ -1036,21 +1037,24 @@ JoinResultPtr SpatialRTreeJoin::joinBlock(Block left_block)
             Block pred_block;
             for (const auto & src_col : left_block)
             {
+                if (!predicate_required.contains(src_col.name))
+                    continue;
                 ColumnPtr single = src_col.column->cut(li, 1);
                 pred_block.insert({ColumnConst::create(std::move(single), eff_k), src_col.type, src_col.name});
             }
             for (const auto & rcd : *right_header)
             {
-                if (pred_block.has(rcd.name))
+                if (pred_block.has(rcd.name) || !predicate_required.contains(rcd.name))
                     continue;
+                const auto & src_columns = right_columns_by_name.at(rcd.name);
                 auto col = rcd.type->createColumn();
                 col->reserve(eff_k);
                 if (pre_filter_expr)
                     for (size_t idx : surviving)
-                        col->insertFrom(*right_blocks[row_hits[idx].second.block_idx].getByName(rcd.name).column, row_hits[idx].second.row_idx);
+                        col->insertFrom(*src_columns[row_hits[idx].second.block_idx], row_hits[idx].second.row_idx);
                 else
                     for (size_t j = h; j < chunk_end; ++j)
-                        col->insertFrom(*right_blocks[row_hits[j].second.block_idx].getByName(rcd.name).column, row_hits[j].second.row_idx);
+                        col->insertFrom(*src_columns[row_hits[j].second.block_idx], row_hits[j].second.row_idx);
                 pred_block.insert({std::move(col), rcd.type, rcd.name});
             }
             {
@@ -1073,9 +1077,9 @@ JoinResultPtr SpatialRTreeJoin::joinBlock(Block left_block)
                 for (size_t ci = 0; ci < n_out_cols; ++ci)
                 {
                     if (col_sources[ci].from_left)
-                        mutable_cols[ci]->insertFrom(*left_block.getByName(col_sources[ci].name).column, li);
+                        mutable_cols[ci]->insertFrom(*out_left_columns[ci], li);
                     else
-                        mutable_cols[ci]->insertFrom(*right_blocks[pos.block_idx].getByName(col_sources[ci].name).column, pos.row_idx);
+                        mutable_cols[ci]->insertFrom(*(*out_right_columns[ci])[pos.block_idx], pos.row_idx);
                 }
             }
         }
