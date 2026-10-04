@@ -642,8 +642,15 @@ void gatherRightRows(IColumn & dst, const std::vector<const IColumn *> & sources
     auto * dst_string = typeid_cast<ColumnString *>(&dst);
     if (!dst_string)
     {
+        static constexpr size_t kValueAhead = 8;
+        const bool prefetch = dst.isFixedAndContiguous();
         for (size_t j = 0; j < count; ++j)
         {
+            if (prefetch && j + kValueAhead < count)
+            {
+                const auto ahead = position(j + kValueAhead);
+                __builtin_prefetch(sources[ahead.block_idx]->getDataAt(ahead.row_idx).data());
+            }
             const auto pos = position(j);
             dst.insertFrom(*sources[pos.block_idx], pos.row_idx);
         }
@@ -1346,22 +1353,29 @@ JoinResultPtr SpatialRTreeJoin::joinBlock(Block left_block)
             });
         }
 
+        std::vector<UInt32> matched;
+        matched.reserve(n);
         for (size_t ci = 0; ci < n; ++ci)
         {
             if (!mask[ci])
                 continue;
+            matched.push_back(static_cast<UInt32>(ci));
             const auto & c = cands[ci];
             if (is_left_join)
                 left_matched[c.left_row] = true;
             if (is_right_join)
                 __atomic_store_n(&right_matched_per_block[c.block_idx][c.row_idx], '\1', __ATOMIC_RELAXED);
-            for (size_t i = 0; i < n_out_cols; ++i)
+        }
+        for (size_t i = 0; i < n_out_cols; ++i)
+        {
+            if (out_left_columns[i])
             {
-                if (out_left_columns[i])
-                    mutable_cols[i]->insertFrom(*out_left_columns[i], c.left_row);
-                else
-                    mutable_cols[i]->insertFrom(*(*out_right_columns[i])[c.block_idx], c.row_idx);
+                for (UInt32 ci : matched)
+                    mutable_cols[i]->insertFrom(*out_left_columns[i], cands[ci].left_row);
             }
+            else
+                gatherRightRows(*mutable_cols[i], *out_right_columns[i], matched.size(),
+                    [&](size_t j) -> const Candidate & { return cands[matched[j]]; });
         }
 
         cands.clear();
@@ -1454,22 +1468,25 @@ JoinResultPtr SpatialRTreeJoin::joinBlock(Block left_block)
                 mask[pre_filter_expr ? surviving[j] : (h + j)] = fc.getBool(j) ? 1 : 0;
         });
 
+        std::vector<UInt32> matched;
         for (size_t hit_idx = 0; hit_idx < row_hits.size(); ++hit_idx)
         {
             if (!mask[hit_idx])
                 continue;
+            matched.push_back(static_cast<UInt32>(hit_idx));
             const RightPos & pos = row_hits[hit_idx];
-            if (is_left_join)
-                left_matched[li] = true;
             if (is_right_join)
                 __atomic_store_n(&right_matched_per_block[pos.block_idx][pos.row_idx], '\1', __ATOMIC_RELAXED);
-            for (size_t ci = 0; ci < n_out_cols; ++ci)
-            {
-                if (col_sources[ci].from_left)
-                    mutable_cols[ci]->insertFrom(*out_left_columns[ci], li);
-                else
-                    mutable_cols[ci]->insertFrom(*(*out_right_columns[ci])[pos.block_idx], pos.row_idx);
-            }
+        }
+        if (is_left_join && !matched.empty())
+            left_matched[li] = true;
+        for (size_t ci = 0; ci < n_out_cols; ++ci)
+        {
+            if (col_sources[ci].from_left)
+                mutable_cols[ci]->insertManyFrom(*out_left_columns[ci], li, matched.size());
+            else
+                gatherRightRows(*mutable_cols[ci], *out_right_columns[ci], matched.size(),
+                    [&](size_t j) { return row_hits[matched[j]]; });
         }
     };
 
