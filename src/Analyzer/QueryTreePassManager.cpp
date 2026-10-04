@@ -29,7 +29,6 @@
 #include <Analyzer/Passes/CountDistinctPass.h>
 #include <Analyzer/Passes/CrossToInnerJoinPass.h>
 #include <Analyzer/Passes/SpatialPredicateJoinPass.h>
-#include <Analyzer/Passes/SpatialJoinFusePass.h>
 #include <Analyzer/Passes/DisableParallelReplicasPass.h>
 #include <Analyzer/Passes/FunctionToSubcolumnsPass.h>
 #include <Analyzer/Passes/FuseFunctionsPass.h>
@@ -79,7 +78,6 @@ namespace ErrorCodes
 
 namespace Setting
 {
-    extern const SettingsBool query_plan_fuse_spatial_joins;
 }
 
 namespace
@@ -356,8 +354,6 @@ void addQueryTreePasses(QueryTreePassManager & manager, bool only_analyze)
 
     manager.addPass(std::make_unique<CrossToInnerJoinPass>());
     manager.addPass(std::make_unique<SpatialPredicateJoinPass>());
-    if (manager.getContext()->getSettingsRef()[Setting::query_plan_fuse_spatial_joins])
-        manager.addPass(std::make_unique<SpatialJoinFusePass>());
     manager.addPass(std::make_unique<ShardNumColumnToFunctionPass>());
 
     manager.addPass(std::make_unique<OptimizeTrivialGroupByLimitPass>());
