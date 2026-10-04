@@ -633,11 +633,34 @@ UInt32 hilbertIndex(UInt32 x, UInt32 y)
     return (i1 << 1) | i0;
 }
 
+/// Radix-sorts (key << 32 | payload) words by the 32-bit key only: half the passes of a
+/// full 64-bit sort. Little-endian: the key is the upper half of the word.
+struct HilbertOrderTraits
+{
+    using Element = UInt64;
+    using Result = Element;
+    using Key = UInt32;
+    using CountType = UInt32;
+    using KeyBits = UInt32;
+
+    static constexpr size_t PART_SIZE_BITS = 8;
+
+    using Transform = RadixSortIdentityTransform<KeyBits>;
+
+    static Key & extractKey(Element & elem) { return reinterpret_cast<UInt32 *>(&elem)[1]; }
+    static Result & extractResult(Element & elem) { return elem; }
+
+};
+
 }
 
 SpatialRTreeJoin::RTree::RTree(std::span<const std::vector<Entry>> parts)
 {
+    size_t total = 0;
+    for (const auto & part : parts)
+        total += part.size();
     std::vector<const Entry *> sources;
+    sources.reserve(total);
     for (const auto & part : parts)
         for (const auto & entry : part)
             sources.push_back(&entry);
@@ -677,7 +700,7 @@ SpatialRTreeJoin::RTree::RTree(std::span<const std::vector<Entry>> parts)
         const UInt32 gy = grid((r.min_y + r.max_y) / 2, extent.min_y, scale_y);
         order[i] = (UInt64{hilbertIndex(gx, gy)} << 32) | i;
     }
-    RadixSort<RadixSortUIntTraits<UInt64>>::executeLSD(order.data(), n);
+    RadixSort<HilbertOrderTraits>::executeLSD(order.data(), n);
     entries.reserve(n);
     static constexpr size_t kPrefetchDistance = 16;
     for (size_t i = 0; i < n; ++i)
