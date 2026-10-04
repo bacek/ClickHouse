@@ -633,6 +633,47 @@ UInt32 hilbertIndex(UInt32 x, UInt32 y)
     return (i1 << 1) | i0;
 }
 
+/// Appends rows of the right-side blocks to `dst`; `position(j)` names the block and row of
+/// the j-th row. Probe hits land on random rows of a large right side, so for strings the
+/// offsets and bytes of upcoming rows are prefetched instead of missing cache one row at a time.
+template <typename Position>
+void gatherRightRows(IColumn & dst, const std::vector<const IColumn *> & sources, size_t count, Position && position)
+{
+    auto * dst_string = typeid_cast<ColumnString *>(&dst);
+    if (!dst_string)
+    {
+        for (size_t j = 0; j < count; ++j)
+        {
+            const auto pos = position(j);
+            dst.insertFrom(*sources[pos.block_idx], pos.row_idx);
+        }
+        return;
+    }
+
+    static constexpr size_t kOffsetsAhead = 16;
+    static constexpr size_t kBytesAhead = 8;
+    auto source_string = [&](size_t block_idx) -> const ColumnString &
+    {
+        return assert_cast<const ColumnString &>(*sources[block_idx]);
+    };
+    for (size_t j = 0; j < count; ++j)
+    {
+        if (j + kOffsetsAhead < count)
+        {
+            const auto ahead = position(j + kOffsetsAhead);
+            __builtin_prefetch(&source_string(ahead.block_idx).getOffsets()[ahead.row_idx]);
+        }
+        if (j + kBytesAhead < count)
+        {
+            const auto ahead = position(j + kBytesAhead);
+            __builtin_prefetch(source_string(ahead.block_idx).getDataAt(ahead.row_idx).data());
+        }
+        const auto pos = position(j);
+        const std::string_view value = source_string(pos.block_idx).getDataAt(pos.row_idx);
+        dst_string->insertData(value.data(), value.size());
+    }
+}
+
 /// Radix-sorts (key << 32 | payload) words by the 32-bit key only: half the passes of a
 /// full 64-bit sort. Little-endian: the key is the upper half of the word.
 struct HilbertOrderTraits
@@ -1290,8 +1331,7 @@ JoinResultPtr SpatialRTreeJoin::joinBlock(Block left_block)
                     auto data = rcd.type->createColumn();
                     data->reserve(k);
                     const auto & source = right_columns_by_name.at(rcd.name);
-                    for (size_t j = slice.begin; j < slice.end; ++j)
-                        data->insertFrom(*source[cands[indices[j]].block_idx], cands[indices[j]].row_idx);
+                    gatherRightRows(*data, source, k, [&](size_t j) -> const Candidate & { return cands[indices[slice.begin + j]]; });
                     pred_block.insert({std::move(data), rcd.type, rcd.name});
                 }
                 {
@@ -1368,8 +1408,7 @@ JoinResultPtr SpatialRTreeJoin::joinBlock(Block left_block)
                     const auto & src_columns = right_columns_by_name.at(rcd.name);
                     auto col = rcd.type->createColumn();
                     col->reserve(k);
-                    for (size_t j = h; j < chunk_end; ++j)
-                        col->insertFrom(*src_columns[row_hits[j].block_idx], row_hits[j].row_idx);
+                    gatherRightRows(*col, src_columns, k, [&](size_t j) { return row_hits[h + j]; });
                     pre_block.insert({std::move(col), rcd.type, rcd.name});
                 }
                 pre_filter_expr->execute(pre_block);
@@ -1399,11 +1438,9 @@ JoinResultPtr SpatialRTreeJoin::joinBlock(Block left_block)
                 auto col = rcd.type->createColumn();
                 col->reserve(eff_k);
                 if (pre_filter_expr)
-                    for (size_t idx : surviving)
-                        col->insertFrom(*src_columns[row_hits[idx].block_idx], row_hits[idx].row_idx);
+                    gatherRightRows(*col, src_columns, eff_k, [&](size_t j) { return row_hits[surviving[j]]; });
                 else
-                    for (size_t j = h; j < chunk_end; ++j)
-                        col->insertFrom(*src_columns[row_hits[j].block_idx], row_hits[j].row_idx);
+                    gatherRightRows(*col, src_columns, eff_k, [&](size_t j) { return row_hits[h + j]; });
                 pred_block.insert({std::move(col), rcd.type, rcd.name});
             }
             {
