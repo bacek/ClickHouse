@@ -671,9 +671,11 @@ SpatialRTreeJoin::RTree::RTree(std::span<const std::vector<Entry>> parts)
     Rect extent{
         std::numeric_limits<double>::infinity(), std::numeric_limits<double>::infinity(),
         -std::numeric_limits<double>::infinity(), -std::numeric_limits<double>::infinity()};
+    points_only = true;
     for (const auto * entry : sources)
     {
         const Rect r = Rect::of(entry->first);
+        points_only = points_only && r.min_x == r.max_x && r.min_y == r.max_y;
         extent.min_x = std::min(extent.min_x, r.min_x);
         extent.min_y = std::min(extent.min_y, r.min_y);
         extent.max_x = std::max(extent.max_x, r.max_x);
@@ -701,13 +703,22 @@ SpatialRTreeJoin::RTree::RTree(std::span<const std::vector<Entry>> parts)
         order[i] = (UInt64{hilbertIndex(gx, gy)} << 32) | i;
     }
     RadixSort<HilbertOrderTraits>::executeLSD(order.data(), n);
-    entries.reserve(n);
+    positions.reserve(n);
+    if (points_only)
+        leaf_points.reserve(n);
+    else
+        leaf_rects.reserve(n);
     static constexpr size_t kPrefetchDistance = 16;
     for (size_t i = 0; i < n; ++i)
     {
         if (i + kPrefetchDistance < n)
             __builtin_prefetch(sources[static_cast<UInt32>(order[i + kPrefetchDistance])]);
-        entries.push_back(*sources[static_cast<UInt32>(order[i])]);
+        const Entry & entry = *sources[static_cast<UInt32>(order[i])];
+        positions.push_back(entry.second);
+        if (points_only)
+            leaf_points.push_back({entry.first.min_corner().x(), entry.first.min_corner().y()});
+        else
+            leaf_rects.push_back(Rect::of(entry.first));
     }
 
     /// Bottom-up node boxes: each node covers kNodeSize consecutive children.
@@ -715,7 +726,11 @@ SpatialRTreeJoin::RTree::RTree(std::span<const std::vector<Entry>> parts)
     size_t child_count = n;
     auto child_rect = [&](size_t level, size_t i)
     {
-        return level == 0 ? Rect::of(entries[i].first) : nodes[level_offsets[level - 1] + i];
+        if (level != 0)
+            return nodes[level_offsets[level - 1] + i];
+        if (points_only)
+            return Rect{leaf_points[i].x, leaf_points[i].y, leaf_points[i].x, leaf_points[i].y};
+        return leaf_rects[i];
     };
     for (size_t level = 0;; ++level)
     {
@@ -1317,7 +1332,7 @@ JoinResultPtr SpatialRTreeJoin::joinBlock(Block left_block)
     /// Left row is ColumnConst per batch (PreparedGeometry for left geometry).
     /// Batches are independent predicate calls, so they run on the shared pool;
     /// matches are emitted afterwards in hit order.
-    auto processLargeRow = [&](size_t li, std::vector<std::pair<BGBox, RightPos>> & row_hits)
+    auto processLargeRow = [&](size_t li, std::vector<RightPos> & row_hits)
     {
         struct Batch { size_t begin; size_t end; };
         std::vector<Batch> batches;
@@ -1354,7 +1369,7 @@ JoinResultPtr SpatialRTreeJoin::joinBlock(Block left_block)
                     auto col = rcd.type->createColumn();
                     col->reserve(k);
                     for (size_t j = h; j < chunk_end; ++j)
-                        col->insertFrom(*src_columns[row_hits[j].second.block_idx], row_hits[j].second.row_idx);
+                        col->insertFrom(*src_columns[row_hits[j].block_idx], row_hits[j].row_idx);
                     pre_block.insert({std::move(col), rcd.type, rcd.name});
                 }
                 pre_filter_expr->execute(pre_block);
@@ -1385,10 +1400,10 @@ JoinResultPtr SpatialRTreeJoin::joinBlock(Block left_block)
                 col->reserve(eff_k);
                 if (pre_filter_expr)
                     for (size_t idx : surviving)
-                        col->insertFrom(*src_columns[row_hits[idx].second.block_idx], row_hits[idx].second.row_idx);
+                        col->insertFrom(*src_columns[row_hits[idx].block_idx], row_hits[idx].row_idx);
                 else
                     for (size_t j = h; j < chunk_end; ++j)
-                        col->insertFrom(*src_columns[row_hits[j].second.block_idx], row_hits[j].second.row_idx);
+                        col->insertFrom(*src_columns[row_hits[j].block_idx], row_hits[j].row_idx);
                 pred_block.insert({std::move(col), rcd.type, rcd.name});
             }
             {
@@ -1406,7 +1421,7 @@ JoinResultPtr SpatialRTreeJoin::joinBlock(Block left_block)
         {
             if (!mask[hit_idx])
                 continue;
-            const RightPos & pos = row_hits[hit_idx].second;
+            const RightPos & pos = row_hits[hit_idx];
             if (is_left_join)
                 left_matched[li] = true;
             if (is_right_join)
@@ -1425,7 +1440,7 @@ JoinResultPtr SpatialRTreeJoin::joinBlock(Block left_block)
 
     /// Per-left-row hit buffer.  Populated lazily one entry at a time so we can
     /// detect and handle large-hit-count rows before materialising them fully.
-    std::vector<std::pair<BGBox, RightPos>> row_buf;
+    std::vector<RightPos> row_buf;
     row_buf.reserve(kChunkSize);
 
     for (size_t li = 0; li < left_rows; ++li)
@@ -1448,7 +1463,7 @@ JoinResultPtr SpatialRTreeJoin::joinBlock(Block left_block)
 
         for (const auto & sub_tree : sub_trees)
         {
-            sub_tree.query(bbox, [&](const RTree::Entry & hit)
+            sub_tree.query(bbox, [&](const RightPos & hit)
             {
                 row_buf.push_back(hit);
 
@@ -1482,7 +1497,7 @@ JoinResultPtr SpatialRTreeJoin::joinBlock(Block left_block)
             /// Normal row: commit its hits to the shared candidate buffer so
             /// evaluateAndEmit can group across many left rows, calling WASM
             /// once per unique right (or left) geometry value.
-            for (const auto & [box, pos] : row_buf)
+            for (const auto & pos : row_buf)
                 candidates.push_back({li, pos.block_idx, pos.row_idx});
 
             if (candidates.size() >= kMaxCandidates)

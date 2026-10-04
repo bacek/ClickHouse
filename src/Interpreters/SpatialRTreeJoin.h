@@ -137,7 +137,7 @@ protected:
 
     /// Static R-tree bulk-loaded in Hilbert order of the entry centres and stored as flat
     /// arrays (one sort per tree instead of recursive STR partitioning). Query-only after
-    /// construction; `query` reports every entry whose box intersects the probe box,
+    /// construction; `query` reports the position of every entry whose box intersects the probe box,
     /// boundaries inclusive.
     class RTree
     {
@@ -148,12 +148,12 @@ protected:
         /// Builds over the concatenation of `parts`, which may be released afterwards.
         explicit RTree(std::span<const std::vector<Entry>> parts);
 
-        size_t size() const { return entries.size(); }
+        size_t size() const { return positions.size(); }
 
         template <typename OnHit>
         void query(const BGBox & box, OnHit && on_hit) const
         {
-            if (entries.empty())
+            if (positions.empty())
                 return;
             const Rect q = Rect::of(box);
             const size_t root_level = level_offsets.size() - 2;
@@ -170,10 +170,22 @@ protected:
                 const size_t first = size_t{index} * kNodeSize;
                 if (level == 0)
                 {
-                    const size_t last = std::min(first + kNodeSize, entries.size());
-                    for (size_t i = first; i < last; ++i)
-                        if (Rect::of(entries[i].first).intersects(q))
-                            on_hit(entries[i]);
+                    const size_t last = std::min(first + kNodeSize, positions.size());
+                    if (points_only)
+                    {
+                        for (size_t i = first; i < last; ++i)
+                        {
+                            const Point & p = leaf_points[i];
+                            if (q.min_x <= p.x && p.x <= q.max_x && q.min_y <= p.y && p.y <= q.max_y)
+                                on_hit(positions[i]);
+                        }
+                    }
+                    else
+                    {
+                        for (size_t i = first; i < last; ++i)
+                            if (leaf_rects[i].intersects(q))
+                                on_hit(positions[i]);
+                    }
                     continue;
                 }
                 const size_t child_begin = level_offsets[level - 1];
@@ -204,9 +216,20 @@ protected:
             }
         };
 
+        struct Point
+        {
+            double x;
+            double y;
+        };
+
         static constexpr size_t kNodeSize = 16;
 
-        std::vector<Entry> entries;   /// Hilbert-sorted
+        /// Leaves in Hilbert order. When every entry is a point only its coordinates are kept,
+        /// otherwise its box; the matching right-side position is in `positions`.
+        std::vector<RightPos> positions;
+        std::vector<Point> leaf_points;
+        std::vector<Rect> leaf_rects;
+        bool points_only = false;
         std::vector<Rect> nodes;      /// all node levels, leaf parents first
         std::vector<size_t> level_offsets; /// level l occupies nodes[level_offsets[l], level_offsets[l + 1])
     };
