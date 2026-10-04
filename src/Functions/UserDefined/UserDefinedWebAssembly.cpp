@@ -735,7 +735,7 @@ public:
         const ColumnsWithTypeAndName & cols,
         size_t start_idx,
         size_t length,
-        const std::vector<size_t> & declared_positions = {}) const // STYLE_CHECK_ALLOW_STD_CONTAINERS
+        const VectorWithMemoryTracking<size_t> & declared_positions = {}) const
     {
         /// The walk probes several candidate batches per call, and a candidate that is priced by
         /// cutting a copy pays a full materialization that the call itself only pays once. For
@@ -866,7 +866,7 @@ private:
     uint64_t buildColumnarLayout(
         const ColumnsWithTypeAndName & cols,
         size_t input_rows_count,
-        const std::vector<size_t> & declared_positions, // STYLE_CHECK_ALLOW_STD_CONTAINERS
+        const VectorWithMemoryTracking<size_t> & declared_positions,
         std::vector<ColDescriptor> & descs, // STYLE_CHECK_ALLOW_STD_CONTAINERS
         std::vector<const IColumn *> & inner_cols, // STYLE_CHECK_ALLOW_STD_CONTAINERS
         std::vector<bool> & is_nullable_flags, // STYLE_CHECK_ALLOW_STD_CONTAINERS
@@ -1375,7 +1375,7 @@ public:
 
                     const BatchMeasurer measure_columnar
                         = [cv1](const ColumnsWithTypeAndName & batch_cols, size_t start_idx, size_t length,
-                                const std::vector<size_t> & declared_positions) // STYLE_CHECK_ALLOW_STD_CONTAINERS
+                                const VectorWithMemoryTracking<size_t> & declared_positions)
                         { return cv1->measureColumnarBytes(batch_cols, start_idx, length, declared_positions); };
 
                     size_t batch_start = 0;
@@ -1612,7 +1612,7 @@ private:
     /// costs is not, because an ABI that builds its own buffer does not put on the wire what an
     /// output format would write. Such an ABI hands its own layout pass in here.
     using BatchMeasurer = std::function<size_t(
-        const ColumnsWithTypeAndName &, size_t, size_t, const std::vector<size_t> &)>; // STYLE_CHECK_ALLOW_STD_CONTAINERS
+        const ColumnsWithTypeAndName &, size_t, size_t, const VectorWithMemoryTracking<size_t> &)>;
 
     /// The exact number of bytes one call carrying `[start, start + length)` puts on the wire.
     ///
@@ -1632,7 +1632,7 @@ private:
         const ColumnsWithTypeAndName & arguments,
         size_t start_idx,
         size_t length,
-        const std::vector<size_t> & declared_positions = {}) const
+        const VectorWithMemoryTracking<size_t> & declared_positions = {}) const
     {
         auto block = getArgumentsBlock(arguments, start_idx, length, declared_positions);
         NullWriteBuffer measure_buf;
@@ -1662,7 +1662,7 @@ private:
         const ColumnsWithTypeAndName & arguments, size_t start_idx, const BatchMeasurer & measure) const
     {
         ColumnsWithTypeAndName const_arguments;
-        std::vector<size_t> declared_positions;
+        VectorWithMemoryTracking<size_t> declared_positions;
         for (size_t i = 0; i < arguments.size(); ++i)
         {
             if (arguments[i].column && isColumnConst(*arguments[i].column))
@@ -1924,7 +1924,7 @@ private:
             /// one huge row among many tiny ones would still share a call with its neighbours.
             const BatchMeasurer measure_wire = [&](
                 const ColumnsWithTypeAndName & batch_cols, size_t start_idx, size_t length,
-                const std::vector<size_t> & declared_positions) // STYLE_CHECK_ALLOW_STD_CONTAINERS
+                const VectorWithMemoryTracking<size_t> & declared_positions)
             {
                 /// `prepared_block` holds every argument in declared order, so it can only answer
                 /// for that same list - `chooseBatchRows` also measures subsets of the arguments
@@ -1956,7 +1956,7 @@ private:
         const ColumnsWithTypeAndName & arguments,
         size_t start_idx,
         size_t length,
-        const std::vector<size_t> & declared_positions = {}) const
+        const VectorWithMemoryTracking<size_t> & declared_positions = {}) const
     {
         const auto & declared_arguments = user_defined_function->getArguments();
         Block arguments_block;
