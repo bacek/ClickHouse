@@ -238,6 +238,9 @@
     M(UDFDriverInvokerThreads, "Number of threads in thread pools servicing pipes of executable UDF driver commands.") \
     M(UDFDriverInvokerThreadsActive, "Number of active threads in thread pools servicing pipes of executable UDF driver commands.") \
     M(UDFDriverInvokerThreadsScheduled, "Number of queued or active jobs in thread pools servicing pipes of executable UDF driver commands.") \
+    M(SpatialJoinThreads, "Number of threads in the thread pool that evaluates spatial join predicates in parallel.") \
+    M(SpatialJoinThreadsActive, "Number of active threads in the thread pool that evaluates spatial join predicates in parallel.") \
+    M(SpatialJoinThreadsScheduled, "Number of queued or active jobs in the thread pool that evaluates spatial join predicates in parallel.") \
     \
     M(DiskPlainRewritableAzureDirectoryMapSize, "Number of local-to-remote path entries in the 'plain_rewritable' in-memory map for AzureObjectStorage.") \
     M(DiskPlainRewritableAzureFileCount, "Number of file entries in the 'plain_rewritable' in-memory map for AzureObjectStorage.") \

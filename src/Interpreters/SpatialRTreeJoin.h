@@ -1,10 +1,13 @@
 #pragma once
 
+#include <span>
+
 #include <Core/Block.h>
 #include <Interpreters/ExpressionActions.h>
 #include <Interpreters/IJoin.h>
 #include <Interpreters/TableJoin.h>
 #include <mutex>
+#include <Common/ThreadPool_fwd.h>
 
 /// Warning in boost::geometry during template strategy substitution.
 #pragma clang diagnostic push
@@ -47,6 +50,7 @@ class SpatialRTreeJoin : public IJoin
 {
 public:
     SpatialRTreeJoin(std::shared_ptr<TableJoin> table_join_, SharedHeader right_header_, double bbox_expand_ = 0.0);
+    ~SpatialRTreeJoin() override;
 
     std::string getName() const override { return "SpatialRTreeJoin"; }
     std::string getAlgorithm() const override { return "SPATIAL_RTREE"; }
@@ -131,9 +135,81 @@ protected:
         UInt32 row_idx;
     };
 
-    using RTree = boost::geometry::index::rtree<
-        std::pair<BGBox, RightPos>,
-        boost::geometry::index::quadratic<16>>;
+    /// Static R-tree bulk-loaded in Hilbert order of the entry centres and stored as flat
+    /// arrays (one sort per tree instead of recursive STR partitioning). Query-only after
+    /// construction; `query` reports every entry whose box intersects the probe box,
+    /// boundaries inclusive.
+    class RTree
+    {
+    public:
+        using Entry = std::pair<BGBox, RightPos>;
+
+        RTree() = default;
+        /// Builds over the concatenation of `parts`, which may be released afterwards.
+        explicit RTree(std::span<const std::vector<Entry>> parts);
+
+        size_t size() const { return entries.size(); }
+
+        template <typename OnHit>
+        void query(const BGBox & box, OnHit && on_hit) const
+        {
+            if (entries.empty())
+                return;
+            const Rect q = Rect::of(box);
+            const size_t root_level = level_offsets.size() - 2;
+            if (!nodes[level_offsets[root_level]].intersects(q))
+                return;
+
+            /// (level, index within level) of nodes still to visit; depth × fan-out bounds the size.
+            std::pair<UInt32, UInt32> stack[kNodeSize * 16];
+            size_t top = 0;
+            stack[top++] = {static_cast<UInt32>(root_level), 0};
+            while (top)
+            {
+                const auto [level, index] = stack[--top];
+                const size_t first = size_t{index} * kNodeSize;
+                if (level == 0)
+                {
+                    const size_t last = std::min(first + kNodeSize, entries.size());
+                    for (size_t i = first; i < last; ++i)
+                        if (Rect::of(entries[i].first).intersects(q))
+                            on_hit(entries[i]);
+                    continue;
+                }
+                const size_t child_begin = level_offsets[level - 1];
+                const size_t child_count = level_offsets[level] - child_begin;
+                const size_t last = std::min(first + kNodeSize, child_count);
+                for (size_t i = first; i < last; ++i)
+                    if (nodes[child_begin + i].intersects(q))
+                        stack[top++] = {level - 1, static_cast<UInt32>(i)};
+            }
+        }
+
+    private:
+        struct Rect
+        {
+            double min_x;
+            double min_y;
+            double max_x;
+            double max_y;
+
+            static Rect of(const BGBox & b)
+            {
+                return {b.min_corner().x(), b.min_corner().y(), b.max_corner().x(), b.max_corner().y()};
+            }
+
+            bool intersects(const Rect & o) const
+            {
+                return min_x <= o.max_x && o.min_x <= max_x && min_y <= o.max_y && o.min_y <= max_y;
+            }
+        };
+
+        static constexpr size_t kNodeSize = 16;
+
+        std::vector<Entry> entries;   /// Hilbert-sorted
+        std::vector<Rect> nodes;      /// all node levels, leaf parents first
+        std::vector<size_t> level_offsets; /// level l occupies nodes[level_offsets[l], level_offsets[l + 1])
+    };
 
 
     const Block & getRightBlock(size_t idx) const { return right_blocks[idx]; }
@@ -166,6 +242,10 @@ private:
     std::vector<Block> right_blocks;
 
     /// Entries buffered during build phase; consumed by runPostBuildPhase().
+    /// Per-block entries as addBlockToJoin() produced them; concatenated into
+    /// pending_entries in parallel by runPostBuildPhase(), so ingest never copies
+    /// the whole right side under build_mutex while the vector grows.
+    std::vector<std::vector<std::pair<BGBox, RightPos>>> pending_chunks;
     std::vector<std::pair<BGBox, RightPos>> pending_entries;
 
     /// Sub-trees built in parallel by runPostBuildPhase() — one per CPU core.
@@ -187,6 +267,18 @@ private:
 
     size_t total_right_rows = 0;
     size_t total_right_bytes = 0;
+
+    /// Evaluates independent predicate groups of one large probe batch in parallel; created on first use.
+    std::unique_ptr<ThreadPool> group_pool;
+    std::once_flag group_pool_once;
+    /// joinBlock() calls currently running; few of them means the probe is in its tail.
+    std::atomic<size_t> active_probes = 0;
+    ThreadPool & getGroupPool();
+    /// Concatenate pending_chunks into pending_entries (parallel copy).
+    void gatherPendingChunks();
+    /// Pack one sub-tree per run of chunks, without gathering (large right sides).
+    void buildSubTreesFromChunks(size_t total_entries);
+    void allocateRightMatched();
 
     Block left_sample; /// stored by initialize()
 

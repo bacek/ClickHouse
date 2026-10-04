@@ -6,11 +6,17 @@
 #include <cstring>
 #include <functional>
 #include <limits>
+#include <optional>
 #include <thread>
 
+#include <base/scope_guard.h>
+#include <Common/RadixSort.h>
 #include <Columns/ColumnConst.h>
 #include <Columns/ColumnString.h>
+#include <Common/CurrentMetrics.h>
 #include <Common/Exception.h>
+#include <Common/ThreadPool.h>
+#include <Common/threadPoolCallbackRunner.h>
 #include <Common/logger_useful.h>
 #include <Common/Stopwatch.h>
 #include <DataTypes/DataTypeLowCardinality.h>
@@ -20,6 +26,13 @@
 #include <IO/ReadHelpers.h>
 
 #include <boost/geometry/algorithms/intersects.hpp>
+
+namespace CurrentMetrics
+{
+    extern const Metric SpatialJoinThreads;
+    extern const Metric SpatialJoinThreadsActive;
+    extern const Metric SpatialJoinThreadsScheduled;
+}
 
 namespace DB
 {
@@ -414,14 +427,10 @@ bool SpatialRTreeJoin::addBlockToJoin(const Block & block, bool /*check_limits*/
             RightPos{static_cast<UInt32>(block_idx), static_cast<UInt32>(row)}};
     }
 
-    /// Step 3: bulk-append to shared pending_entries under lock.
-    /// The insert may reallocate pending_entries — safe because local_entries is stable.
+    /// Step 3: hand the entries over under lock; only the chunk pointer moves.
     {
         std::lock_guard lock(build_mutex);
-        pending_entries.insert(
-            pending_entries.end(),
-            std::make_move_iterator(local_entries.begin()),
-            std::make_move_iterator(local_entries.end()));
+        pending_chunks.push_back(std::move(local_entries));
     }
 
     return true;
@@ -541,6 +550,174 @@ bool SpatialRTreeJoin::gridMayHit(const BGBox & box) const
     return false;
 }
 
+void SpatialRTreeJoin::gatherPendingChunks()
+{
+    size_t total = pending_entries.size();
+    std::vector<size_t> offsets;
+    offsets.reserve(pending_chunks.size());
+    for (const auto & chunk : pending_chunks)
+    {
+        offsets.push_back(total);
+        total += chunk.size();
+    }
+    pending_entries.resize(total);
+
+    const size_t num_threads = std::min<size_t>(
+        std::max<size_t>(std::thread::hardware_concurrency(), 1), pending_chunks.size());
+    std::atomic<size_t> next = 0;
+    auto copy_chunks = [&]
+    {
+        for (size_t i = next++; i < pending_chunks.size(); i = next++)
+        {
+            std::copy(pending_chunks[i].begin(), pending_chunks[i].end(), pending_entries.begin() + offsets[i]);
+            std::vector<std::pair<BGBox, RightPos>>().swap(pending_chunks[i]);
+        }
+    };
+    std::vector<std::thread> threads;
+    for (size_t t = 1; t < num_threads; ++t)
+        threads.emplace_back(copy_chunks);
+    copy_chunks();
+    for (auto & thread : threads)
+        thread.join();
+    pending_chunks.clear();
+}
+
+namespace
+{
+
+/// Position of (x, y) along a Hilbert curve over a 2^16 x 2^16 grid.
+UInt32 hilbertIndex(UInt32 x, UInt32 y)
+{
+    UInt32 a = x ^ y;
+    UInt32 b = 0xFFFF ^ a;
+    UInt32 c = 0xFFFF ^ (x | y);
+    UInt32 d = x & (y ^ 0xFFFF);
+
+    UInt32 A = a | (b >> 1);
+    UInt32 B = (a >> 1) ^ a;
+    UInt32 C = ((c >> 1) ^ (b & (d >> 1))) ^ c;
+    UInt32 D = ((a & (c >> 1)) ^ (d >> 1)) ^ d;
+
+    a = A; b = B; c = C; d = D;
+    A = ((a & (a >> 2)) ^ (b & (b >> 2)));
+    B = ((a & (b >> 2)) ^ (b & ((a ^ b) >> 2)));
+    C ^= ((a & (c >> 2)) ^ (b & (d >> 2)));
+    D ^= ((b & (c >> 2)) ^ ((a ^ b) & (d >> 2)));
+
+    a = A; b = B; c = C; d = D;
+    A = ((a & (a >> 4)) ^ (b & (b >> 4)));
+    B = ((a & (b >> 4)) ^ (b & ((a ^ b) >> 4)));
+    C ^= ((a & (c >> 4)) ^ (b & (d >> 4)));
+    D ^= ((b & (c >> 4)) ^ ((a ^ b) & (d >> 4)));
+
+    a = A; b = B; c = C; d = D;
+    C ^= ((a & (c >> 8)) ^ (b & (d >> 8)));
+    D ^= ((b & (c >> 8)) ^ ((a ^ b) & (d >> 8)));
+
+    a = C ^ (C >> 1);
+    b = D ^ (D >> 1);
+
+    UInt32 i0 = x ^ y;
+    UInt32 i1 = b | (0xFFFF ^ (i0 | a));
+
+    i0 = (i0 | (i0 << 8)) & 0x00FF00FF;
+    i0 = (i0 | (i0 << 4)) & 0x0F0F0F0F;
+    i0 = (i0 | (i0 << 2)) & 0x33333333;
+    i0 = (i0 | (i0 << 1)) & 0x55555555;
+
+    i1 = (i1 | (i1 << 8)) & 0x00FF00FF;
+    i1 = (i1 | (i1 << 4)) & 0x0F0F0F0F;
+    i1 = (i1 | (i1 << 2)) & 0x33333333;
+    i1 = (i1 | (i1 << 1)) & 0x55555555;
+
+    return (i1 << 1) | i0;
+}
+
+}
+
+SpatialRTreeJoin::RTree::RTree(std::span<const std::vector<Entry>> parts)
+{
+    std::vector<const Entry *> sources;
+    for (const auto & part : parts)
+        for (const auto & entry : part)
+            sources.push_back(&entry);
+    const size_t n = sources.size();
+    if (n == 0)
+        return;
+
+    Rect extent{
+        std::numeric_limits<double>::infinity(), std::numeric_limits<double>::infinity(),
+        -std::numeric_limits<double>::infinity(), -std::numeric_limits<double>::infinity()};
+    for (const auto * entry : sources)
+    {
+        const Rect r = Rect::of(entry->first);
+        extent.min_x = std::min(extent.min_x, r.min_x);
+        extent.min_y = std::min(extent.min_y, r.min_y);
+        extent.max_x = std::max(extent.max_x, r.max_x);
+        extent.max_y = std::max(extent.max_y, r.max_y);
+    }
+
+    /// Sort by the Hilbert position of each box centre. Non-finite boxes (never hit by a
+    /// finite probe) get key 0; the order only affects locality, never correctness.
+    const double width = extent.max_x - extent.min_x;
+    const double height = extent.max_y - extent.min_y;
+    const double scale_x = width > 0 && std::isfinite(width) ? 65535.0 / width : 0.0;
+    const double scale_y = height > 0 && std::isfinite(height) ? 65535.0 / height : 0.0;
+    auto grid = [](double v, double origin, double scale) -> UInt32
+    {
+        const double g = (v - origin) * scale;
+        return g >= 0 && g <= 65535.0 ? static_cast<UInt32>(g) : 0;
+    };
+    /// Hilbert key in the high half, entry index in the low half: one radix sort of plain integers.
+    std::vector<UInt64> order(n);
+    for (size_t i = 0; i < n; ++i)
+    {
+        const Rect r = Rect::of(sources[i]->first);
+        const UInt32 gx = grid((r.min_x + r.max_x) / 2, extent.min_x, scale_x);
+        const UInt32 gy = grid((r.min_y + r.max_y) / 2, extent.min_y, scale_y);
+        order[i] = (UInt64{hilbertIndex(gx, gy)} << 32) | i;
+    }
+    RadixSort<RadixSortUIntTraits<UInt64>>::executeLSD(order.data(), n);
+    entries.reserve(n);
+    static constexpr size_t kPrefetchDistance = 16;
+    for (size_t i = 0; i < n; ++i)
+    {
+        if (i + kPrefetchDistance < n)
+            __builtin_prefetch(sources[static_cast<UInt32>(order[i + kPrefetchDistance])]);
+        entries.push_back(*sources[static_cast<UInt32>(order[i])]);
+    }
+
+    /// Bottom-up node boxes: each node covers kNodeSize consecutive children.
+    level_offsets.push_back(0);
+    size_t child_count = n;
+    auto child_rect = [&](size_t level, size_t i)
+    {
+        return level == 0 ? Rect::of(entries[i].first) : nodes[level_offsets[level - 1] + i];
+    };
+    for (size_t level = 0;; ++level)
+    {
+        const size_t node_count = (child_count + kNodeSize - 1) / kNodeSize;
+        for (size_t node = 0; node < node_count; ++node)
+        {
+            Rect r = child_rect(level, node * kNodeSize);
+            const size_t last = std::min(node * kNodeSize + kNodeSize, child_count);
+            for (size_t i = node * kNodeSize + 1; i < last; ++i)
+            {
+                const Rect c = child_rect(level, i);
+                r.min_x = std::min(r.min_x, c.min_x);
+                r.min_y = std::min(r.min_y, c.min_y);
+                r.max_x = std::max(r.max_x, c.max_x);
+                r.max_y = std::max(r.max_y, c.max_y);
+            }
+            nodes.push_back(r);
+        }
+        level_offsets.push_back(nodes.size());
+        if (node_count == 1)
+            break;
+        child_count = node_count;
+    }
+}
+
 void SpatialRTreeJoin::runPostBuildPhase()
 {
     /// Bulk-load sub-trees in parallel using the packing (STR) algorithm.
@@ -552,6 +729,19 @@ void SpatialRTreeJoin::runPostBuildPhase()
     ///
     /// For small right sides (≤ 200K entries) the build is already fast and the per-lookup
     /// cost of querying K trees instead of 1 dominates; use a single tree in that case.
+    Stopwatch sw_build;
+    static constexpr size_t kMaxPartitionedEntries = 1'000'000;
+    size_t chunked_entries = 0;
+    for (const auto & chunk : pending_chunks)
+        chunked_entries += chunk.size();
+    if (pending_entries.empty() && chunked_entries > kMaxPartitionedEntries)
+    {
+        buildSubTreesFromChunks(chunked_entries);
+        LOG_TRACE(getLogger("SpatialRTreeJoin"), "runPostBuildPhase: entries={} trees={} build={:.3f}s",
+            chunked_entries, sub_trees.size(), sw_build.elapsedSeconds());
+        return;
+    }
+    gatherPendingChunks();
     const size_t n = pending_entries.size();
     if (n == 0)
         return;
@@ -569,10 +759,10 @@ void SpatialRTreeJoin::runPostBuildPhase()
     /// region: a probe is rejected at the root of every tree it cannot touch instead of
     /// descending into all of them. Above it, the serial top-level nth_element costs more
     /// than probing saves, so slices stay contiguous in arrival order.
-    static constexpr size_t kMaxPartitionedEntries = 1'000'000;
     auto build_slice = [this](size_t part, size_t begin, size_t end)
     {
-        sub_trees[part] = RTree(pending_entries.begin() + begin, pending_entries.begin() + end);
+        const std::vector<RTree::Entry> slice(pending_entries.begin() + begin, pending_entries.begin() + end);
+        sub_trees[part] = RTree(std::span(&slice, 1));
     };
 
     if (n > kMaxPartitionedEntries)
@@ -619,7 +809,14 @@ void SpatialRTreeJoin::runPostBuildPhase()
 
     pending_entries.clear();
     pending_entries.shrink_to_fit();
+    LOG_TRACE(getLogger("SpatialRTreeJoin"), "runPostBuildPhase: entries={} trees={} build={:.3f}s",
+        n, sub_trees.size(), sw_build.elapsedSeconds());
 
+    allocateRightMatched();
+}
+
+void SpatialRTreeJoin::allocateRightMatched()
+{
     /// For RIGHT JOIN: allocate per-block matched byte arrays (all 0 = unmatched).
     if (table_join->kind() == JoinKind::Right)
     {
@@ -629,8 +826,51 @@ void SpatialRTreeJoin::runPostBuildPhase()
     }
 }
 
+void SpatialRTreeJoin::buildSubTreesFromChunks(size_t total_entries)
+{
+    /// Arrival-order slices need no global ordering, so each sub-tree is packed straight
+    /// from its own run of chunks; the whole right side is never gathered into one vector.
+    grid_cells.clear();
+    const size_t num_parts = std::min<size_t>(
+        std::max<size_t>(std::thread::hardware_concurrency(), 1), pending_chunks.size());
+    sub_trees.resize(num_parts);
+
+    std::vector<size_t> first_chunk(num_parts + 1, pending_chunks.size());
+    first_chunk[0] = 0;
+    size_t part = 0;
+    size_t seen = 0;
+    for (size_t i = 0; i < pending_chunks.size() && part + 1 < num_parts; ++i)
+    {
+        seen += pending_chunks[i].size();
+        if (seen >= total_entries * (part + 1) / num_parts)
+            first_chunk[++part] = i + 1;
+    }
+    for (size_t p = part + 1; p < num_parts; ++p)
+        first_chunk[p] = pending_chunks.size();
+
+    auto build_part = [&](size_t p)
+    {
+        const std::span<const std::vector<std::pair<BGBox, RightPos>>> chunks(
+            pending_chunks.data() + first_chunk[p], first_chunk[p + 1] - first_chunk[p]);
+        sub_trees[p] = RTree(chunks);
+        for (size_t i = first_chunk[p]; i < first_chunk[p + 1]; ++i)
+            std::vector<std::pair<BGBox, RightPos>>().swap(pending_chunks[i]);
+    };
+    std::vector<std::thread> threads;
+    threads.reserve(num_parts);
+    for (size_t p = 1; p < num_parts; ++p)
+        threads.emplace_back(build_part, p);
+    build_part(0);
+    for (auto & thread : threads)
+        thread.join();
+    pending_chunks.clear();
+    allocateRightMatched();
+}
+
 JoinResultPtr SpatialRTreeJoin::joinBlock(Block left_block)
 {
+    ++active_probes;
+    SCOPE_EXIT({ --active_probes; });
     const size_t left_rows = left_block.rows();
     const bool is_left_join  = table_join->kind() == JoinKind::Left;
     const bool is_right_join = table_join->kind() == JoinKind::Right;
@@ -778,12 +1018,13 @@ JoinResultPtr SpatialRTreeJoin::joinBlock(Block left_block)
             pre_filter_required.insert(col);
 
     static constexpr size_t kChunkSize     = 65536;       // WASM batch size for large-row streaming
+    static constexpr size_t kLargeRowBatch = 16 * kChunkSize; // large-row hits buffered per parallel flush
     static constexpr size_t kLargeHit      = 4'000'000;   // per-row hit limit before streaming mode
     static constexpr size_t kMaxCandidates = 8'000'000;   // shared buffer overflow guard
 
     Stopwatch sw_join;
-    UInt64 ns_join_wasm = 0;
-    size_t join_wasm_calls = 0;
+    std::atomic<UInt64> ns_join_wasm = 0;
+    std::atomic<size_t> join_wasm_calls = 0;
 
     struct Candidate { size_t left_row; UInt32 block_idx; UInt32 row_idx; };
     std::vector<Candidate> candidates;
@@ -826,6 +1067,44 @@ JoinResultPtr SpatialRTreeJoin::joinBlock(Block left_block)
             if (fc.getBool(i))
                 cands[j++] = cands[i];
         cands.resize(j);
+    };
+
+    /// Runs `evaluate` for every task. Tasks are independent predicate calls writing disjoint
+    /// slots of the mask. With `parallel` set they are spread over a shared pool from the start;
+    /// otherwise the calling thread works through them alone, but recruits pool threads as soon
+    /// as most other probe streams have finished, so the last busy stream is not left alone.
+    auto runTasks = [&](const auto & tasks, bool parallel, auto && evaluate)
+    {
+        static constexpr size_t kMaxParallelTasks = 8;
+        const size_t hardware_threads = std::max<size_t>(std::thread::hardware_concurrency(), 2);
+        std::atomic<size_t> next = 0;
+        auto worker = [&tasks, &evaluate, &next]
+        {
+            for (size_t i = next++; i < tasks.size(); i = next++)
+                evaluate(tasks[i]);
+        };
+        std::optional<ThreadPoolCallbackRunnerLocal<void>> runner;
+        auto recruit = [&]
+        {
+            const size_t remaining = tasks.size() - std::min(next.load(), tasks.size());
+            const size_t helpers = std::min(kMaxParallelTasks, remaining) - (remaining > 0 ? 1 : 0);
+            if (helpers == 0)
+                return;
+            runner.emplace(getGroupPool(), ThreadName::SPATIAL_JOIN);
+            for (size_t t = 0; t < helpers; ++t)
+                runner->enqueueAndKeepTrack(worker);
+        };
+        const size_t recruit_below = hardware_threads / 4;
+        if (parallel)
+            recruit();
+        for (size_t i = next++; i < tasks.size(); i = next++)
+        {
+            evaluate(tasks[i]);
+            if (!runner && active_probes.load(std::memory_order_relaxed) <= recruit_below)
+                recruit();
+        }
+        if (runner)
+            runner->waitForAllToFinishAndRethrowFirstError();
     };
 
     /// Evaluate spatial predicate on cands and emit matched rows.
@@ -875,8 +1154,13 @@ JoinResultPtr SpatialRTreeJoin::joinBlock(Block left_block)
 
         if (group_by_right)
         {
+            std::vector<const std::vector<size_t> *> groups;
+            groups.reserve(right_groups.size());
             for (const auto & [key, indices] : right_groups)
+                groups.push_back(&indices);
+            runTasks(groups, /*parallel=*/ false, [&](const std::vector<size_t> * group)
             {
+                const auto & indices = *group;
                 const size_t k = indices.size();
                 const auto & c0 = cands[indices[0]];
                 const Block & rb = right_blocks[c0.block_idx];
@@ -908,7 +1192,7 @@ JoinResultPtr SpatialRTreeJoin::joinBlock(Block left_block)
                 const auto & fc = *pred_block.getByName(filter_col_name).column;
                 for (size_t j = 0; j < k; ++j)
                     mask[indices[j]] = fc.getBool(j) ? 1 : 0;
-            }
+            });
         }
         else
         {
@@ -932,9 +1216,27 @@ JoinResultPtr SpatialRTreeJoin::joinBlock(Block left_block)
                 left_groups.assign(std::make_move_iterator(by_left_row.begin()), std::make_move_iterator(by_left_row.end()));
             }
 
+            /// A left geometry whose box covers a dense part of the right side can collect
+            /// millions of candidates; evaluated as one call it pins its probe stream long
+            /// after the others have finished. Such groups are cut into slices that run on
+            /// the pool, so the work of a single heavy row is shared by idle threads.
+            static constexpr size_t kSliceRows = 32'768;
+            static constexpr size_t kParallelGroupRows = 2 * kSliceRows;
+            struct Slice { size_t left_row; const std::vector<size_t> * indices; size_t begin; size_t end; };
+            std::vector<Slice> slices;
+            slices.reserve(left_groups.size());
+            bool has_heavy_group = false;
             for (const auto & [left_row, indices] : left_groups)
             {
-                const size_t k = indices.size();
+                has_heavy_group |= indices.size() >= kParallelGroupRows;
+                for (size_t begin = 0; begin < indices.size(); begin += kSliceRows)
+                    slices.push_back({left_row, &indices, begin, std::min(begin + kSliceRows, indices.size())});
+            }
+            runTasks(slices, has_heavy_group, [&](const Slice & slice)
+            {
+                const size_t left_row = slice.left_row;
+                const auto & indices = *slice.indices;
+                const size_t k = slice.end - slice.begin;
                 Block pred_block;
                 for (const auto & src_col : left_block)
                 {
@@ -950,8 +1252,8 @@ JoinResultPtr SpatialRTreeJoin::joinBlock(Block left_block)
                     auto data = rcd.type->createColumn();
                     data->reserve(k);
                     const auto & source = right_columns_by_name.at(rcd.name);
-                    for (size_t ci : indices)
-                        data->insertFrom(*source[cands[ci].block_idx], cands[ci].row_idx);
+                    for (size_t j = slice.begin; j < slice.end; ++j)
+                        data->insertFrom(*source[cands[indices[j]].block_idx], cands[indices[j]].row_idx);
                     pred_block.insert({std::move(data), rcd.type, rcd.name});
                 }
                 {
@@ -962,8 +1264,8 @@ JoinResultPtr SpatialRTreeJoin::joinBlock(Block left_block)
                 }
                 const auto & fc = *pred_block.getByName(filter_col_name).column;
                 for (size_t j = 0; j < k; ++j)
-                    mask[indices[j]] = fc.getBool(j) ? 1 : 0;
-            }
+                    mask[indices[slice.begin + j]] = fc.getBool(j) ? 1 : 0;
+            });
         }
 
         for (size_t ci = 0; ci < n; ++ci)
@@ -990,11 +1292,20 @@ JoinResultPtr SpatialRTreeJoin::joinBlock(Block left_block)
     /// Process a single left row's hit list in kChunkSize-sized batches.
     /// Used when one left row has ≥ kLargeHit R-tree results (large-row mode).
     /// Left row is ColumnConst per batch (PreparedGeometry for left geometry).
+    /// Batches are independent predicate calls, so they run on the shared pool;
+    /// matches are emitted afterwards in hit order.
     auto processLargeRow = [&](size_t li, std::vector<std::pair<BGBox, RightPos>> & row_hits)
     {
+        struct Batch { size_t begin; size_t end; };
+        std::vector<Batch> batches;
         for (size_t h = 0; h < row_hits.size(); h += kChunkSize)
+            batches.push_back({h, std::min(h + kChunkSize, row_hits.size())});
+
+        std::vector<UInt8> mask(row_hits.size(), 0);
+        runTasks(batches, batches.size() > 1, [&](const Batch & batch)
         {
-            const size_t chunk_end = std::min(h + kChunkSize, row_hits.size());
+            const size_t h = batch.begin;
+            const size_t chunk_end = batch.end;
             const size_t k = chunk_end - h;
 
             // Pre-filter
@@ -1030,7 +1341,7 @@ JoinResultPtr SpatialRTreeJoin::joinBlock(Block left_block)
                     if (pfc.getBool(j))
                         surviving.push_back(h + j);
                 if (surviving.empty())
-                    continue;
+                    return;
             }
 
             const size_t eff_k = pre_filter_expr ? surviving.size() : k;
@@ -1065,22 +1376,24 @@ JoinResultPtr SpatialRTreeJoin::joinBlock(Block left_block)
             }
             const auto & fc = *pred_block.getByName(filter_col_name).column;
             for (size_t j = 0; j < eff_k; ++j)
+                mask[pre_filter_expr ? surviving[j] : (h + j)] = fc.getBool(j) ? 1 : 0;
+        });
+
+        for (size_t hit_idx = 0; hit_idx < row_hits.size(); ++hit_idx)
+        {
+            if (!mask[hit_idx])
+                continue;
+            const RightPos & pos = row_hits[hit_idx].second;
+            if (is_left_join)
+                left_matched[li] = true;
+            if (is_right_join)
+                __atomic_store_n(&right_matched_per_block[pos.block_idx][pos.row_idx], '\1', __ATOMIC_RELAXED);
+            for (size_t ci = 0; ci < n_out_cols; ++ci)
             {
-                if (!fc.getBool(j))
-                    continue;
-                const size_t hit_idx = pre_filter_expr ? surviving[j] : (h + j);
-                const RightPos & pos = row_hits[hit_idx].second;
-                if (is_left_join)
-                    left_matched[li] = true;
-                if (is_right_join)
-                    __atomic_store_n(&right_matched_per_block[pos.block_idx][pos.row_idx], '\1', __ATOMIC_RELAXED);
-                for (size_t ci = 0; ci < n_out_cols; ++ci)
-                {
-                    if (col_sources[ci].from_left)
-                        mutable_cols[ci]->insertFrom(*out_left_columns[ci], li);
-                    else
-                        mutable_cols[ci]->insertFrom(*(*out_right_columns[ci])[pos.block_idx], pos.row_idx);
-                }
+                if (col_sources[ci].from_left)
+                    mutable_cols[ci]->insertFrom(*out_left_columns[ci], li);
+                else
+                    mutable_cols[ci]->insertFrom(*(*out_right_columns[ci])[pos.block_idx], pos.row_idx);
             }
         }
     };
@@ -1112,10 +1425,9 @@ JoinResultPtr SpatialRTreeJoin::joinBlock(Block left_block)
 
         for (const auto & sub_tree : sub_trees)
         {
-            for (auto qit = sub_tree.qbegin(boost::geometry::index::intersects(bbox));
-                 qit != sub_tree.qend(); ++qit)
+            sub_tree.query(bbox, [&](const RTree::Entry & hit)
             {
-                row_buf.push_back(*qit);
+                row_buf.push_back(hit);
 
                 if (!is_large && row_buf.size() >= kLargeHit)
                 {
@@ -1129,12 +1441,12 @@ JoinResultPtr SpatialRTreeJoin::joinBlock(Block left_block)
                     is_large = true;
                 }
 
-                if (is_large && row_buf.size() >= kChunkSize)
+                if (is_large && row_buf.size() >= kLargeRowBatch)
                 {
                     processLargeRow(li, row_buf);
                     row_buf.clear();
                 }
-            }
+            });
         }
 
         if (is_large)
@@ -1158,8 +1470,8 @@ JoinResultPtr SpatialRTreeJoin::joinBlock(Block left_block)
 
     LOG_TRACE(getLogger("SpatialRTreeJoin"),
         "joinBlock: total={:.3f}s wasm={:.3f}s wasm_calls={} left_rows={}",
-        sw_join.elapsedSeconds(), static_cast<double>(ns_join_wasm) / 1e9,
-        join_wasm_calls, left_rows);
+        sw_join.elapsedSeconds(), static_cast<double>(ns_join_wasm.load()) / 1e9,
+        join_wasm_calls.load(), left_rows);
 
     for (size_t i = 0; i < n_out_cols; ++i)
         output.getByPosition(i).column = std::move(mutable_cols[i]);
@@ -1168,6 +1480,21 @@ JoinResultPtr SpatialRTreeJoin::joinBlock(Block left_block)
         appendUnmatched(output, left_matched);
 
     return IJoinResult::createFromBlock(std::move(output));
+}
+
+SpatialRTreeJoin::~SpatialRTreeJoin() = default;
+
+ThreadPool & SpatialRTreeJoin::getGroupPool()
+{
+    std::call_once(group_pool_once, [this]
+    {
+        group_pool = std::make_unique<ThreadPool>(
+            CurrentMetrics::SpatialJoinThreads,
+            CurrentMetrics::SpatialJoinThreadsActive,
+            CurrentMetrics::SpatialJoinThreadsScheduled,
+            std::thread::hardware_concurrency());
+    });
+    return *group_pool;
 }
 
 // ── Right-join non-joined blocks ──────────────────────────────────────────────
