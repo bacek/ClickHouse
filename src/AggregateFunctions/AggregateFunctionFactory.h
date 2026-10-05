@@ -44,6 +44,11 @@ struct AggregateFunctionWithProperties
     AggregateFunctionCreator window_creator;
     FunctionDocumentation documentation;
     AggregateFunctionProperties properties;
+    /// Optional. A function registered at runtime (a WebAssembly user-defined aggregate) can be
+    /// dropped, but the factory map has no locking, so its entry cannot be erased while queries read
+    /// it. Such an entry stays and reports here whether it is currently defined; when this returns
+    /// false, every lookup treats the name as unknown.
+    std::function<bool()> is_available;
 
     AggregateFunctionWithProperties() = default;
     AggregateFunctionWithProperties(const AggregateFunctionWithProperties &) = default;
@@ -98,6 +103,12 @@ public:
     std::optional<AggregateFunctionProperties> tryGetProperties(String name, NullsAction action) const;
 
     bool isAggregateFunctionName(const String & name) const;
+
+    /// Hides IFactoryWithAliases::hasNameOrAlias: an entry whose `is_available` returns false is not a name.
+    bool hasNameOrAlias(const String & name) const;
+
+    /// Leaves out entries whose `is_available` returns false, so they are not suggested as hints.
+    VectorWithMemoryTracking<String> getAllRegisteredNames() const override;
 
     FunctionDocumentation getDocumentation(const String & name) const;
 

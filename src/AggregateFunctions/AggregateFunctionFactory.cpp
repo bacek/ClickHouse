@@ -225,6 +225,38 @@ std::optional<String> AggregateFunctionFactory::getAssociatedNameUnderCombinator
 }
 
 
+namespace
+{
+    bool isAvailable(const AggregateFunctionWithProperties & value)
+    {
+        return !value.is_available || value.is_available();
+    }
+
+    template <typename Map>
+    bool containsAvailable(const Map & map, const String & name)
+    {
+        auto it = map.find(name);
+        return it != map.end() && isAvailable(it->second);
+    }
+}
+
+bool AggregateFunctionFactory::hasNameOrAlias(const String & name) const
+{
+    return containsAvailable(aggregate_functions, name) || containsAvailable(case_insensitive_aggregate_functions, name)
+        || isAlias(name);
+}
+
+VectorWithMemoryTracking<String> AggregateFunctionFactory::getAllRegisteredNames() const
+{
+    auto result = IFactoryWithAliases::getAllRegisteredNames();
+    std::erase_if(result, [this](const String & name)
+    {
+        auto it = aggregate_functions.find(name);
+        return it != aggregate_functions.end() && !isAvailable(it->second);
+    });
+    return result;
+}
+
 AggregateFunctionPtr AggregateFunctionFactory::getImpl(
     const String & name_param,
     NullsAction action,
@@ -240,7 +272,7 @@ AggregateFunctionPtr AggregateFunctionFactory::getImpl(
     Value found;
 
     /// Find by exact match.
-    if (auto it = aggregate_functions.find(name); it != aggregate_functions.end())
+    if (auto it = aggregate_functions.find(name); it != aggregate_functions.end() && isAvailable(it->second))
     {
         found = it->second;
     }
@@ -248,7 +280,8 @@ AggregateFunctionPtr AggregateFunctionFactory::getImpl(
     if (!found.creator)
     {
         case_insensitive_name = Poco::toLower(name);
-        if (auto jt = case_insensitive_aggregate_functions.find(case_insensitive_name); jt != case_insensitive_aggregate_functions.end())
+        if (auto jt = case_insensitive_aggregate_functions.find(case_insensitive_name);
+            jt != case_insensitive_aggregate_functions.end() && isAvailable(jt->second))
         {
             found = jt->second;
             is_case_insensitive = true;
@@ -391,7 +424,7 @@ std::optional<AggregateFunctionProperties> AggregateFunctionFactory::tryGetPrope
         bool is_case_insensitive = false;
 
         /// Find by exact match.
-        if (auto it = aggregate_functions.find(name); it != aggregate_functions.end())
+        if (auto it = aggregate_functions.find(name); it != aggregate_functions.end() && isAvailable(it->second))
         {
             found = it->second;
         }
@@ -399,7 +432,8 @@ std::optional<AggregateFunctionProperties> AggregateFunctionFactory::tryGetPrope
         if (!found.creator)
         {
             lower_case_name = Poco::toLower(name);
-            if (auto jt = case_insensitive_aggregate_functions.find(lower_case_name); jt != case_insensitive_aggregate_functions.end())
+            if (auto jt = case_insensitive_aggregate_functions.find(lower_case_name);
+                jt != case_insensitive_aggregate_functions.end() && isAvailable(jt->second))
             {
                 is_case_insensitive = true;
                 found = jt->second;
@@ -437,11 +471,11 @@ bool AggregateFunctionFactory::isAggregateFunctionName(const String & name_) con
     if (name_.size() > MAX_AGGREGATE_FUNCTION_NAME_LENGTH)
         throw Exception(ErrorCodes::TOO_LARGE_STRING_SIZE, "Too long name of aggregate function, maximum: {}", MAX_AGGREGATE_FUNCTION_NAME_LENGTH);
 
-    if (aggregate_functions.contains(name_) || isAlias(name_))
+    if (containsAvailable(aggregate_functions, name_) || isAlias(name_))
         return true;
 
     String name_lowercase = Poco::toLower(name_);
-    if (case_insensitive_aggregate_functions.contains(name_lowercase) || isAlias(name_lowercase))
+    if (containsAvailable(case_insensitive_aggregate_functions, name_lowercase) || isAlias(name_lowercase))
         return true;
 
     String name = name_;
@@ -450,8 +484,8 @@ bool AggregateFunctionFactory::isAggregateFunctionName(const String & name_) con
         name = name.substr(0, name.size() - combinator->getName().size());
         name_lowercase = name_lowercase.substr(0, name_lowercase.size() - combinator->getName().size());
 
-        if (aggregate_functions.contains(name) || isAlias(name) || case_insensitive_aggregate_functions.contains(name_lowercase)
-            || isAlias(name_lowercase))
+        if (containsAvailable(aggregate_functions, name) || isAlias(name)
+            || containsAvailable(case_insensitive_aggregate_functions, name_lowercase) || isAlias(name_lowercase))
             return true;
     }
     return false;

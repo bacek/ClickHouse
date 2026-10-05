@@ -77,16 +77,19 @@ DROP FUNCTION wasm_udaf_count;
 -- After DROP, functions must no longer appear
 SELECT count() FROM system.functions WHERE name IN ('wasm_udaf_sum', 'wasm_udaf_count');
 
--- A call to a dropped aggregate reports an unknown aggregate function
-SELECT wasm_udaf_sum(x) FROM (SELECT 1.0::Float64 AS x); -- { serverError UNKNOWN_AGGREGATE_FUNCTION }
+-- A dropped aggregate is unknown everywhere, although its AggregateFunctionFactory entry stays
+SELECT wasm_udaf_sum(x) FROM (SELECT 1.0::Float64 AS x); -- { serverError UNKNOWN_FUNCTION }
+SELECT count() FROM system.functions WHERE name = 'wasm_udaf_sum';
 
--- The name stays reserved for an aggregate: it cannot come back as a scalar function...
+-- Its name can come back as a scalar function, and a scalar call with GROUP BY is not an aggregate
 CREATE FUNCTION wasm_udaf_sum
     LANGUAGE WASM ABI BUFFERED_V1 FROM 'udaf_test' :: 'sum_f64'
-    ARGUMENTS (x Float64) RETURNS Float64
-    SETTINGS serialization_format = 'RowBinary'; -- { serverError BAD_ARGUMENTS }
+    ARGUMENTS (x Float64, y Float64) RETURNS Float64
+    SETTINGS serialization_format = 'RowBinary';
+SELECT is_aggregate FROM system.functions WHERE name = 'wasm_udaf_sum';
+DROP FUNCTION wasm_udaf_sum;
 
--- ...but it can come back as an aggregate
+-- ...and as an aggregate again
 CREATE FUNCTION wasm_udaf_sum
     LANGUAGE WASM ABI BUFFERED_V1 FROM 'udaf_test' :: 'sum_f64'
     ARGUMENTS (x Float64) RETURNS Float64

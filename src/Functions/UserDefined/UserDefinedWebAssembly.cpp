@@ -2611,15 +2611,6 @@ UserDefinedWebAssemblyFunctionFactory::prepareFunction(ASTPtr create_function_qu
     /// (see `isAggregate`), so one name cannot mix the two kinds across its overloads.
     {
         std::shared_lock lock(registry_mutex);
-        /// The analyzer classifies a call as aggregate by looking the name up in
-        /// AggregateFunctionFactory, and that registration cannot be withdrawn, so a name once
-        /// used for a WASM aggregate cannot become a scalar function until the server restarts.
-        if (!is_aggregate && aggregate_names.contains(function_def.function_name))
-            throw Exception(
-                ErrorCodes::BAD_ARGUMENTS,
-                "WebAssembly function '{}' was registered as an aggregate function in this server process; "
-                "its name cannot be reused for a scalar function until the server restarts",
-                function_def.function_name);
         if (auto it = registry.find(function_def.function_name); it != registry.end())
         {
             for (const auto & entry : it->second)
@@ -2704,9 +2695,11 @@ void UserDefinedWebAssemblyFunctionFactory::registerAggregateName(
                  ctx = CurrentThread::get().tryGetQueryContext();
              return UserDefinedWebAssemblyFunctionFactory::instance().getAggregate(sql_name, accumulator_arg_types, ctx);
          }};
-    AggregateFunctionFactory::instance().registerFunction(
-        sql_name,
-        AggregateFunctionWithProperties{wasm_aggregate_creator, FunctionDocumentation{}, AggregateFunctionProperties{}});
+    AggregateFunctionWithProperties value{wasm_aggregate_creator, FunctionDocumentation{}, AggregateFunctionProperties{}};
+    /// After DROP FUNCTION the name must behave as unknown to every aggregate lookup, including the
+    /// analyzer's name-only checks, so that it can be reused for a scalar function.
+    value.is_available = [sql_name] { return UserDefinedWebAssemblyFunctionFactory::instance().isAggregate(sql_name); };
+    AggregateFunctionFactory::instance().registerFunction(sql_name, std::move(value));
 }
 
 bool UserDefinedWebAssemblyFunctionFactory::ownsAggregateName(const String & function_name) const
