@@ -2770,16 +2770,25 @@ void UserDefinedWebAssemblyFunctionFactory::checkWebAssemblyIsAvailable(const Co
 
 FunctionOverloadResolverPtr UserDefinedWebAssemblyFunctionFactory::get(const String & function_name, ContextPtr context)
 {
+    if (auto resolver = tryGet(function_name, context))
+        return resolver;
+
+    std::shared_lock lock(registry_mutex);
+    throw Exception(
+        ErrorCodes::RESOURCE_NOT_FOUND,
+        "WebAssembly function '{}' not found in [{}]",
+        function_name,
+        fmt::join(registry | std::views::transform([](const auto & pair) { return pair.first; }), ", "));
+}
+
+FunctionOverloadResolverPtr UserDefinedWebAssemblyFunctionFactory::tryGet(const String & function_name, ContextPtr context)
+{
     std::vector<std::shared_ptr<FunctionUserDefinedWasm>> overload_fns;
     {
         std::shared_lock lock(registry_mutex);
         auto it = registry.find(function_name);
         if (it == registry.end() || it->second.empty())
-            throw Exception(
-                ErrorCodes::RESOURCE_NOT_FOUND,
-                "WebAssembly function '{}' not found in [{}]",
-                function_name,
-                fmt::join(registry | std::views::transform([](const auto & pair) { return pair.first; }), ", "));
+            return nullptr;
         for (const auto & entry : it->second)
             overload_fns.push_back(std::make_shared<FunctionUserDefinedWasm>(function_name, entry.function, context));
     }
@@ -2787,21 +2796,6 @@ FunctionOverloadResolverPtr UserDefinedWebAssemblyFunctionFactory::get(const Str
     if (overload_fns.size() == 1)
         return std::make_unique<FunctionToOverloadResolverAdaptor>(std::move(overload_fns.front()));
     return std::make_unique<WasmOverloadResolver>(function_name, std::move(overload_fns), std::move(context));
-}
-
-FunctionOverloadResolverPtr UserDefinedWebAssemblyFunctionFactory::tryGet(const String & function_name, ContextPtr context)
-{
-    std::shared_ptr<UserDefinedWebAssemblyFunction> wasm_func = nullptr;
-    {
-        std::shared_lock lock(registry_mutex);
-        auto it = registry.find(function_name);
-        if (it == registry.end())
-            return nullptr;
-        wasm_func = it->second.front().function;
-    }
-
-    auto executable_function = std::make_shared<FunctionUserDefinedWasm>(function_name, std::move(wasm_func), std::move(context));
-    return std::make_unique<FunctionToOverloadResolverAdaptor>(std::move(executable_function));
 }
 
 bool UserDefinedWebAssemblyFunctionFactory::isAggregate(const String & function_name) const
