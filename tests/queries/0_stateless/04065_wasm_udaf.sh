@@ -65,12 +65,36 @@ WHERE name IN ('wasm_udaf_sum', 'wasm_udaf_count')
 GROUP BY name
 HAVING cnt > 1;
 
+-- One name cannot mix aggregate and scalar overloads
+CREATE FUNCTION wasm_udaf_sum
+    LANGUAGE WASM ABI BUFFERED_V1 FROM 'udaf_test' :: 'sum_f64'
+    ARGUMENTS (x Float64, y Float64) RETURNS Float64
+    SETTINGS serialization_format = 'RowBinary'; -- { serverError BAD_ARGUMENTS }
+
 DROP FUNCTION wasm_udaf_sum;
 DROP FUNCTION wasm_udaf_count;
-DELETE FROM system.webassembly_modules WHERE name = 'udaf_test';
 
 -- After DROP, functions must no longer appear
 SELECT count() FROM system.functions WHERE name IN ('wasm_udaf_sum', 'wasm_udaf_count');
+
+-- A call to a dropped aggregate reports an unknown aggregate function
+SELECT wasm_udaf_sum(x) FROM (SELECT 1.0::Float64 AS x); -- { serverError UNKNOWN_AGGREGATE_FUNCTION }
+
+-- The name stays reserved for an aggregate: it cannot come back as a scalar function...
+CREATE FUNCTION wasm_udaf_sum
+    LANGUAGE WASM ABI BUFFERED_V1 FROM 'udaf_test' :: 'sum_f64'
+    ARGUMENTS (x Float64) RETURNS Float64
+    SETTINGS serialization_format = 'RowBinary'; -- { serverError BAD_ARGUMENTS }
+
+-- ...but it can come back as an aggregate
+CREATE FUNCTION wasm_udaf_sum
+    LANGUAGE WASM ABI BUFFERED_V1 FROM 'udaf_test' :: 'sum_f64'
+    ARGUMENTS (x Float64) RETURNS Float64
+    SETTINGS is_aggregate = 1, serialization_format = 'RowBinary';
+SELECT wasm_udaf_sum(x) FROM (SELECT arrayJoin([4.0, 5.0]::Array(Float64)) AS x);
+
+DROP FUNCTION wasm_udaf_sum;
+DELETE FROM system.webassembly_modules WHERE name = 'udaf_test';
 EOF
 
 # ---- MsgPack serialization format ----

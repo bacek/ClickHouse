@@ -214,8 +214,17 @@ static void checkCanBeRegistered(const ContextPtr & context, const String & func
     if (UserDefinedExecutableFunctionFactory::instance().has(function_name, context)) /// NOLINT(readability-static-accessed-through-instance)
         throw Exception(ErrorCodes::FUNCTION_ALREADY_EXISTS, "User defined executable function '{}' already exists", function_name);
 
-    if (throw_if_exists && UserDefinedWebAssemblyFunctionFactory::instance().has(function_name)) /// NOLINT(readability-static-accessed-through-instance)
-        throw Exception(ErrorCodes::FUNCTION_ALREADY_EXISTS, "User defined wasm function '{}' already exists", function_name);
+    /// A WASM function name can hold several overloads, so only the same signature is a duplicate.
+    if (throw_if_exists)
+    {
+        const auto & wasm_factory = UserDefinedWebAssemblyFunctionFactory::instance();
+        const auto * create_wasm_query = typeid_cast<const ASTCreateWasmFunctionQuery *>(&create_function_query);
+        const bool exists = create_wasm_query
+            ? wasm_factory.hasOverload(function_name, create_wasm_query->validateAndGetDefinition().argument_types)
+            : wasm_factory.has(function_name);
+        if (exists)
+            throw Exception(ErrorCodes::FUNCTION_ALREADY_EXISTS, "User defined wasm function '{}' already exists", function_name);
+    }
 
     if (const auto * create_sql_function_query = typeid_cast<const ASTCreateSQLFunctionQuery *>(&create_function_query))
         validateSQLFunctionShape(*create_sql_function_query->function_core);
@@ -307,8 +316,9 @@ bool UserDefinedSQLFunctionFactory::unregisterFunction(
     }
 
     /// If deleted function is a WASM function, remove it from WASM function factory as well
-    /// After that wasm modules can be safely dropped as well, since no functions refer to them
-    UserDefinedWebAssemblyFunctionFactory::instance().dropIfExists(function_name);
+    /// After that wasm modules can be safely dropped as well, since no functions refer to them.
+    /// A signature drops only that overload; the others stay callable.
+    UserDefinedWebAssemblyFunctionFactory::instance().dropIfExists(function_name, argument_type_names);
 
     return true;
 }

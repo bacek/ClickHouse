@@ -107,6 +107,7 @@ extern const int ILLEGAL_TYPE_OF_ARGUMENT;
 extern const int LOGICAL_ERROR;
 extern const int NUMBER_OF_ARGUMENTS_DOESNT_MATCH;
 extern const int RESOURCE_NOT_FOUND;
+extern const int UNKNOWN_AGGREGATE_FUNCTION;
 extern const int TOO_LARGE_STRING_SIZE;
 extern const int WASM_ERROR;
 }
@@ -2451,10 +2452,13 @@ public:
     {}
 
     String getName() const override { return name; }
-    bool isVariadic() const override { return false; }
+    /// Overloads may differ in arity. A fixed count would make `IFunctionOverloadResolver::build`
+    /// reject every call that does not match the first overload before `getReturnTypeImpl` gets to
+    /// pick by type, so the resolver is variadic whenever the arities differ.
+    bool isVariadic() const override { return !hasUniformArity(); }
     size_t getNumberOfArguments() const override
     {
-        return overloads.empty() ? 0 : overloads.front()->getNumberOfArguments();
+        return hasUniformArity() && !overloads.empty() ? overloads.front()->getNumberOfArguments() : 0;
     }
 
     bool isDeterministic() const override
@@ -2517,6 +2521,12 @@ public:
     }
 
 private:
+    bool hasUniformArity() const
+    {
+        return std::ranges::all_of(overloads, [&](const auto & fn)
+            { return fn->getNumberOfArguments() == overloads.front()->getNumberOfArguments(); });
+    }
+
     String name;
     std::vector<std::shared_ptr<FunctionUserDefinedWasm>> overloads;
     ContextPtr context;
@@ -2596,6 +2606,35 @@ UserDefinedWebAssemblyFunctionFactory::prepareFunction(ASTPtr create_function_qu
         function_def.abi_version,
         function_def.settings,
         function_def.is_deterministic);
+
+    /// A name resolves to an aggregate or to a scalar function before argument types are known
+    /// (see `isAggregate`), so one name cannot mix the two kinds across its overloads.
+    {
+        std::shared_lock lock(registry_mutex);
+        /// The analyzer classifies a call as aggregate by looking the name up in
+        /// AggregateFunctionFactory, and that registration cannot be withdrawn, so a name once
+        /// used for a WASM aggregate cannot become a scalar function until the server restarts.
+        if (!is_aggregate && aggregate_names.contains(function_def.function_name))
+            throw Exception(
+                ErrorCodes::BAD_ARGUMENTS,
+                "WebAssembly function '{}' was registered as an aggregate function in this server process; "
+                "its name cannot be reused for a scalar function until the server restarts",
+                function_def.function_name);
+        if (auto it = registry.find(function_def.function_name); it != registry.end())
+        {
+            for (const auto & entry : it->second)
+            {
+                if (entry.is_aggregate != is_aggregate
+                    && !typesMatchOverload(function_def.argument_types, entry.original_arg_types))
+                    throw Exception(
+                        ErrorCodes::BAD_ARGUMENTS,
+                        "WebAssembly function '{}' already has {} overloads; an overload cannot be {}",
+                        function_def.function_name,
+                        entry.is_aggregate ? "aggregate" : "scalar",
+                        is_aggregate ? "an aggregate" : "a scalar function");
+            }
+        }
+    }
 
     return RegisteredFunction{
         function_def.function_name,
@@ -2787,10 +2826,12 @@ AggregateFunctionPtr UserDefinedWebAssemblyFunctionFactory::getAggregate(
     {
         std::shared_lock lock(registry_mutex);
         auto it = registry.find(function_name);
+        /// The AggregateFunctionFactory registration outlives DROP FUNCTION (see ownsAggregateName),
+        /// so a call to a dropped aggregate lands here.
         if (it == registry.end() || it->second.empty())
             throw Exception(
-                ErrorCodes::RESOURCE_NOT_FOUND,
-                "WebAssembly aggregate function '{}' not found",
+                ErrorCodes::UNKNOWN_AGGREGATE_FUNCTION,
+                "WebAssembly aggregate function '{}' does not exist",
                 function_name);
 
         const RegistryEntry * match = nullptr;
@@ -2805,12 +2846,14 @@ AggregateFunctionPtr UserDefinedWebAssemblyFunctionFactory::getAggregate(
             }
         }
         if (!match)
-            match = &it->second.front(); // fallback: first aggregate entry
-        if (!match->is_aggregate)
+        {
+            auto get_names = std::views::transform([](const auto & t) { return t->getName(); });
             throw Exception(
-                ErrorCodes::BAD_ARGUMENTS,
-                "WebAssembly function '{}' is not an aggregate function",
-                function_name);
+                ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT,
+                "No matching aggregate overload of '{}' for argument types ({})",
+                function_name,
+                fmt::join(arg_types | get_names, ", "));
+        }
         wasm_func = match->function;
         original_arg_types = match->accumulator_arg_types;
     }
