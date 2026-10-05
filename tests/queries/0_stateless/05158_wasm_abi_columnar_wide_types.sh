@@ -129,12 +129,12 @@ ${CLICKHOUSE_CLIENT} --allow_experimental_analyzer=1 --query "
 CREATE OR REPLACE FUNCTION wide_lc_nullable
     LANGUAGE WASM ABI COLUMNAR_V1 FROM 'columnar_wide_abi' :: 'hex_lc_col'
     ARGUMENTS (s LowCardinality(Nullable(String))) RETURNS String DETERMINISTIC;" 2>&1 \
-    | grep -o 'does not support LowCardinality(Nullable(T)) arguments'
+    | grep -o -m1 'does not support LowCardinality(Nullable(T)) arguments' | head -1
 ${CLICKHOUSE_CLIENT} --allow_experimental_analyzer=1 --query "
 CREATE OR REPLACE FUNCTION wide_lc_result
     LANGUAGE WASM ABI COLUMNAR_V1 FROM 'columnar_wide_abi' :: 'hex_lc_col'
     ARGUMENTS (s LowCardinality(String)) RETURNS LowCardinality(String) DETERMINISTIC;" 2>&1 \
-    | grep -o 'does not support a LowCardinality result type'
+    | grep -o -m1 'does not support a LowCardinality result type' | head -1
 
 ${CLICKHOUSE_CLIENT} --query "
 DELETE FROM system.webassembly_modules WHERE name = 'columnar_wide_abi';"

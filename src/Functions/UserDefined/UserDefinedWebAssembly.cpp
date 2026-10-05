@@ -800,11 +800,12 @@ public:
         }
 
         /// Mirror buildColDescriptor's branch order before the fixed-width fallback: everything
-        /// it dispatches elsewhere (Variant, LowCardinality, Array, Tuple, and anything that is
-        /// not fixed-width) has no cheap range size here.
+        /// it dispatches elsewhere (Variant, LowCardinality, Array, Map, Tuple, and anything that
+        /// is not fixed-width) has no cheap range size here.
         if (typeid_cast<const ColumnVariant *>(col)
             || typeid_cast<const ColumnLowCardinality *>(col)
             || typeid_cast<const ColumnArray *>(col)
+            || typeid_cast<const ColumnMap *>(col)
             || typeid_cast<const ColumnTuple *>(col)
             || typeid_cast<const ColumnConst *>(col))
             return std::nullopt;
@@ -1155,6 +1156,22 @@ public:
     }
     bool isSuitableForShortCircuitArgumentsExecution(const DataTypesWithConstInfo & /* arguments */) const override { return false; }
     size_t getNumberOfArguments() const override { return user_defined_function->getArguments().size(); }
+
+    /// A COLUMNAR_V1 function that declares a Nullable(T) parameter wants to see the NULLs
+    /// itself (its frame carries the null map). The default implementation would return NULL
+    /// for those rows without calling the function at all.
+    bool useDefaultImplementationForNulls() const override
+    {
+        return !(isColumnarV1() && declaresArgument([](const DataTypePtr & type) { return type->isNullable(); }));
+    }
+
+    /// A declared Variant parameter takes the Variant column whole (COL_VARIANT). The default
+    /// implementation would instead call the function once per alternative with that
+    /// alternative's type, which no declared Variant parameter accepts.
+    bool useDefaultImplementationForVariant() const override
+    {
+        return !(isColumnarV1() && declaresArgument([](const DataTypePtr & type) { return typeid_cast<const DataTypeVariant *>(type.get()) != nullptr; }));
+    }
 
     DataTypePtr getReturnTypeImpl(const DataTypes & arguments) const override
     {
@@ -1553,6 +1570,18 @@ public:
     }
 
 private:
+    bool isColumnarV1() const
+    {
+        return dynamic_cast<const UserDefinedWebAssemblyFunctionColumnarV1 *>(user_defined_function.get()) != nullptr;
+    }
+
+    template <typename Predicate>
+    bool declaresArgument(Predicate && predicate) const
+    {
+        const auto & declared = user_defined_function->getArguments();
+        return std::any_of(declared.begin(), declared.end(), predicate);
+    }
+
     /// The size one call's serialized input is grown up to, empty when the input is not split by
     /// its size. A batch is never taken below a single row: splitting only decides how many rows
     /// share a call, so a row too large for the guest's memory fails inside its allocator, and no
